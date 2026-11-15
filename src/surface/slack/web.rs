@@ -56,7 +56,12 @@ impl Web {
             }
             let v: Value = resp.json().await.with_context(|| format!("slack {method}: bad JSON"))?;
             if v["ok"].as_bool() != Some(true) {
-                let err = v["error"].as_str().unwrap_or("unknown_error");
+                let mut err = v["error"].as_str().unwrap_or("unknown_error").to_string();
+                // `invalid_blocks` and kin say what is wrong only here.
+                if let Some(details) = v["response_metadata"]["messages"].as_array() {
+                    let details: Vec<&str> = details.iter().filter_map(Value::as_str).collect();
+                    err = format!("{err}: {}", details.join("; "));
+                }
                 match v["needed"].as_str() {
                     Some(needed) => bail!("slack {method}: {err} (needs scope {needed})"),
                     None => bail!("slack {method}: {err}"),

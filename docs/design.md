@@ -55,7 +55,23 @@ was skipped and why. `pending` holds the message and the picks it was delivered 
 that explanation reads a separate `explained` flag, set when it posts and cleared by any
 wake, so an agent's `send` that woke nobody never silences the explanation a person's
 next message is owed. On a thread's first message that post is the picker: who is
-running, with model and activity.
+running, with model and activity, and the line "reply `to: <ref>`", which is the base
+form because an agent can't click.
+
+**The picker's menu** is the same post's second form. The surface trait's `post` may carry
+one `Menu` (groups of options plus a button label); the core builds it, one group per
+person and project, each option's value a ref and its label the short ID, label, model
+and activity. Slack fits it to its limits (75-character labels, 100 groups and options,
+150-character values; an option whose ref is longer is left out and stays in the text).
+On Slack the menu is a `multi_static_select` as the section's accessory, because Slack
+refuses a multi-select inside an `actions` block, and "Wake" is a button in the `actions`
+block under it. Picking in the menu sends nothing the daemon uses. The Wake click carries
+the selection in the payload's `state`, and becomes the `choose` action: a choice exactly
+like a `to:` line from whoever clicked (they must be in the directory and not
+`agent = "always"`), delivered for the waiting message, or the thread's first one. The
+bot then edits the picker post: the menu and button go, and a line says who chose what.
+Refs the sources no longer list are named in a reply and left out. A click in a paused
+thread takes the choice and wakes nobody, as a `to:` line does.
 
 **A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
@@ -187,5 +203,5 @@ reports "waiting".
 
 ## Not built yet
 
-The picker's menu, the Amp source, and joining several machines. Refs already start
+The Amp source, and joining several machines. Refs already start
 with the machine name, and the client already talks to the daemon in JSON.

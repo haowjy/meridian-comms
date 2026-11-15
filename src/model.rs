@@ -197,6 +197,27 @@ pub struct PostRequest {
     pub conversation: String,
     pub thread: Option<String>,
     pub text: String,
+    pub menu: Option<Menu>,
+}
+
+/// A menu of grouped options and one button that submits the selection, as
+/// `choose`. A surface fits it to its own limits and drops what it can't show.
+#[derive(Debug, Clone)]
+pub struct Menu {
+    pub groups: Vec<MenuGroup>,
+    pub button: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuGroup {
+    pub label: String,
+    pub options: Vec<MenuOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuOption {
+    pub value: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone)]

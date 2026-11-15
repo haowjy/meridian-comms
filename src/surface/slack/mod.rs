@@ -11,8 +11,22 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::Surface;
-use crate::model::{Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
+use crate::model::{Menu, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
 use web::{Token, Web};
+
+/// Ids of the picker's blocks and elements; the click reads the menu's choice
+/// back from `state` by them.
+const MENU_BLOCK: &str = "picker";
+const MENU: &str = "pick";
+const BUTTON: &str = "choose";
+
+// Slack's limits for a section's text, a select's groups, a group's options,
+// and an option's label and value.
+const SECTION_TEXT: usize = 3000;
+const MAX_GROUPS: usize = 100;
+const MAX_OPTIONS: usize = 100;
+const MAX_LABEL: usize = 75;
+const MAX_VALUE: usize = 150;
 
 pub struct Slack {
     web: Web,
@@ -107,6 +121,43 @@ impl Slack {
     }
 }
 
+/// `s` cut to `max` characters, ending in `…` if it was cut.
+fn fit(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max - 1).chain(['…']).collect()
+}
+
+fn plain(s: &str, max: usize) -> Value {
+    json!({"type": "plain_text", "text": fit(s, max), "emoji": false})
+}
+
+/// The menu as a select element. Slack takes a multi-select as a section's accessory
+/// but not inside an `actions` block. Options whose value is too long are left out
+/// (they stay in the text), and so are groups left empty by that.
+fn menu_select(menu: &Menu) -> Option<Value> {
+    let groups: Vec<Value> = menu
+        .groups
+        .iter()
+        .filter_map(|g| {
+            let options: Vec<Value> = g
+                .options
+                .iter()
+                .filter(|o| o.value.chars().count() <= MAX_VALUE)
+                .take(MAX_OPTIONS)
+                .map(|o| json!({"text": plain(&o.label, MAX_LABEL), "value": o.value}))
+                .collect();
+            (!options.is_empty()).then(|| json!({"label": plain(&g.label, MAX_LABEL), "options": options}))
+        })
+        .take(MAX_GROUPS)
+        .collect();
+    (!groups.is_empty()).then(|| {
+        json!({"type": "multi_static_select", "action_id": MENU, "option_groups": groups,
+               "placeholder": plain("Sessions to wake", MAX_LABEL)})
+    })
+}
+
 fn ts_time(ts: &str) -> DateTime<Utc> {
     let (s, us) = ts.split_once('.').unwrap_or((ts, "0"));
     let micros: u32 = us.parse().unwrap_or(0);
@@ -126,6 +177,17 @@ impl Surface for Slack {
         let mut body = json!({
             "channel": req.conversation, "text": text, "unfurl_links": false, "unfurl_media": false,
         });
+        if let Some(menu) = &req.menu
+            && let Some(select) = menu_select(menu)
+        {
+            body["blocks"] = json!([
+                {"type": "section", "block_id": MENU_BLOCK, "text": {"type": "mrkdwn", "text": fit(&text, SECTION_TEXT)},
+                 "accessory": select},
+                {"type": "actions", "elements": [
+                    {"type": "button", "action_id": BUTTON, "style": "primary", "text": plain(&menu.button, MAX_LABEL)}
+                ]},
+            ]);
+        }
         if let Some(t) = &req.thread {
             body["thread_ts"] = json!(t);
         }
@@ -146,6 +208,31 @@ impl Surface for Slack {
             ],
         });
         self.web.json("chat.postMessage", &body).await.map(|_| ())
+    }
+
+    async fn annotate(&self, conversation: &str, thread: &str, post: &str, note: &str) -> Result<()> {
+        let p = [
+            ("channel", conversation.to_string()),
+            ("ts", thread.to_string()),
+            ("oldest", post.to_string()),
+            ("latest", post.to_string()),
+            ("inclusive", "true".to_string()),
+            ("limit", "1".to_string()),
+        ];
+        let v = self.web.form(Token::Bot, "conversations.replies", &p).await?;
+        let msg = v["messages"].as_array().and_then(|m| m.iter().find(|m| m["ts"] == post));
+        let msg = msg.context("the post is gone")?;
+        let mut blocks: Vec<Value> = msg["blocks"].as_array().cloned().unwrap_or_default();
+        blocks.retain(|b| b["type"] != "actions");
+        for b in &mut blocks {
+            if let Some(b) = b.as_object_mut() {
+                b.remove("accessory");
+            }
+        }
+        blocks.push(json!({"type": "context", "elements": [{"type": "mrkdwn", "text": fit(note, SECTION_TEXT)}]}));
+        let text = format!("{}\n{note}", msg["text"].as_str().unwrap_or_default());
+        let body = json!({"channel": conversation, "ts": post, "text": text, "blocks": blocks});
+        self.web.json("chat.update", &body).await.map(|_| ())
     }
 
     fn link(&self, conversation: &str, id: &str, thread: &str) -> String {

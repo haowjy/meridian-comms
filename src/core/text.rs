@@ -70,6 +70,18 @@ pub fn candidate_line(c: &Candidate, now: DateTime<Utc>) -> String {
     format!("{} {}", parts.join(" "), facts.join(" · "))
 }
 
+/// An option in a menu: short ID, label, model and activity. A surface cuts it to fit.
+pub fn option_label(c: &Candidate, now: DateTime<Utc>) -> String {
+    let short = c.id.as_deref().unwrap_or(&c.ref_);
+    let facts: Vec<String> = [c.label.as_deref(), c.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(clean)
+        .chain([activity(c.activity.as_ref(), now)])
+        .collect();
+    format!("{} · {}", clean(short), facts.join(" · "))
+}
+
 pub fn label(c: &Candidate) -> String {
     match &c.label {
         Some(l) => format!("`{}` ({})", c.ref_, clean(l)),

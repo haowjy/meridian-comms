@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 
 use super::{Core, Listing, text};
-use crate::model::{Candidate, Notice, NoticeKind, WakeRequest, WakeResult};
+use crate::model::{Candidate, Menu, MenuGroup, MenuOption, Notice, NoticeKind, WakeRequest, WakeResult};
 use crate::state::{Pending, Pick, ThreadState};
 
 /// The message being delivered, as notices describe it. `text` and `link` are
@@ -273,6 +273,36 @@ impl Core {
         if let Some(w) = st.woken.get_mut(person) {
             w.retain(|r| scope.contains(r));
         }
+    }
+
+    /// The picker's menu: the listed sessions of `person`, one group per project
+    /// (or per source group when the listing has no project), each option's value
+    /// its ref. `None` when there is nothing to choose.
+    pub(super) fn menu(&self, person: &str, listing: &Listing) -> Option<Menu> {
+        let now = Utc::now();
+        let mut groups: Vec<MenuGroup> = vec![];
+        for (_, c) in listing.for_person(person) {
+            let place = c.project.as_deref().or(c.group.as_deref());
+            let label = match place {
+                Some(p) => format!("{} · {}", self.cfg.display(person), text::clean(p)),
+                None => self.cfg.display(person),
+            };
+            let option = MenuOption {
+                value: c.ref_.clone(),
+                label: text::option_label(c, now),
+            };
+            match groups.iter_mut().find(|g| g.label == label) {
+                Some(g) => g.options.push(option),
+                None => groups.push(MenuGroup {
+                    label,
+                    options: vec![option],
+                }),
+            }
+        }
+        (!groups.is_empty()).then(|| Menu {
+            groups,
+            button: "Wake".into(),
+        })
     }
 
     /// The bot's post when nobody was woken (the picker, on a thread's first

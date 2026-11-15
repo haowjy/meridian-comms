@@ -16,8 +16,11 @@ pub trait Surface: Send + Sync {
     /// event is acknowledged to the product before it is sent here. The
     /// surface never sends the bot's own posts, edits or deletions.
     async fn run(&self, events: mpsc::Sender<SurfaceEvent>);
-    /// Posts as the bot. Never retried by the core.
+    /// Posts as the bot, with the post's menu if the surface has menus. Never retried by the core.
     async fn post(&self, req: PostRequest) -> Result<Posted>;
+    /// Replaces the menu and buttons of the bot's post `post` with `note`,
+    /// keeping its text.
+    async fn annotate(&self, conversation: &str, thread: &str, post: &str, note: &str) -> Result<()>;
     /// Shows on message `id` that sessions were woken for it.
     async fn acknowledge(&self, conversation: &str, id: &str) -> Result<()>;
     /// Tells a paused thread that it is paused after `limit` messages, and how

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{Slack, web::Token};
+use super::{BUTTON, MENU, MENU_BLOCK, Slack, web::Token};
 use crate::model::{Action, Sender, SurfaceEvent};
 
 /// Slack pings about every 30 s; no frame for this long means a dead link.
@@ -108,6 +108,22 @@ fn action(p: &Value) -> Option<Action> {
         return None;
     }
     let a = p["actions"].get(0)?;
+    let name = a["action_id"].as_str()?;
+    // The menu's own selection event carries nothing the button doesn't: the
+    // button click reads the selection from `state`.
+    if name == MENU {
+        return None;
+    }
+    let values = if name == BUTTON {
+        let chosen = p["state"]["values"][MENU_BLOCK][MENU]["selected_options"].as_array();
+        chosen
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o["value"].as_str().map(String::from))
+            .collect()
+    } else {
+        a["value"].as_str().map(|v| vec![v.to_string()]).unwrap_or_default()
+    };
     let post = p["message"]["ts"].as_str()?;
     Some(Action {
         conversation: p["channel"]["id"].as_str()?.to_string(),
@@ -117,7 +133,7 @@ fn action(p: &Value) -> Option<Action> {
             id: p["user"]["id"].as_str()?.to_string(),
             app: false,
         },
-        name: a["action_id"].as_str()?.to_string(),
-        values: a["value"].as_str().map(|v| vec![v.to_string()]).unwrap_or_default(),
+        name: name.to_string(),
+        values,
     })
 }

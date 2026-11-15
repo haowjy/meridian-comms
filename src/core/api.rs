@@ -231,6 +231,7 @@ impl Core {
                     conversation: conv.clone(),
                     thread: requested.as_ref().map(|m| m.thread.clone()),
                     text: format!("From {}{to_part}:\n{body}", who.label()),
+                    menu: None,
                 };
                 let posted = self.surface.post(req).await?;
                 if requested.is_none() {

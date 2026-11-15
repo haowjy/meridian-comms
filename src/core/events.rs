@@ -8,10 +8,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::future::join_all;
 
+use super::Listing;
 use super::deliver::{How, Incoming};
 use super::{Core, ThreadKey, text};
 use crate::config::AgentMark;
-use crate::model::{Action, ListRequest, Msg, PostRequest, SurfaceEvent};
+use crate::model::{Action, ListRequest, Menu, Msg, PostRequest, SurfaceEvent};
 use crate::state::{Pick, ThreadState};
 
 /// The loop limit: this many messages in a row that woke someone and may be
@@ -206,7 +207,7 @@ impl Core {
         }
 
         // One listing per event: Meridian's costs 1.4 s and 300 MB.
-        let mut refs: Vec<String> = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
+        let mut refs = self.known_refs(&st);
         refs.extend(words.iter().flatten().cloned());
         let listing = self
             .list(&ListRequest {
@@ -250,7 +251,8 @@ impl Core {
                     listing.why_not(bad),
                     self.explain(&owner, project.as_deref(), &listing, &[], &[], true)
                 );
-                self.say(&m.conversation, &m.thread, msg).await;
+                let menu = self.menu(&owner, &listing);
+                self.say_with(&m.conversation, &m.thread, msg, menu).await;
                 return Ok(Flow::Done);
             }
         }
@@ -290,11 +292,13 @@ impl Core {
             if first || !st.explained {
                 st.explained = true;
                 let text = self.explain(&owner, project.as_deref(), &listing, &[], &out.left_out, first);
-                self.say(&m.conversation, &m.thread, text).await;
+                let menu = first.then(|| self.menu(&owner, &listing)).flatten();
+                self.say_with(&m.conversation, &m.thread, text, menu).await;
             }
         } else if first {
             let text = self.explain(&owner, project.as_deref(), &listing, &out.woken, &out.left_out, true);
-            self.say(&m.conversation, &m.thread, text).await;
+            let menu = self.menu(&owner, &listing);
+            self.say_with(&m.conversation, &m.thread, text, menu).await;
         } else if let Err(e) = self.surface.acknowledge(&m.conversation, &m.id).await {
             tracing::warn!("acknowledging {} failed: {e:#}", m.id);
         }
@@ -314,10 +318,15 @@ impl Core {
 
     /// A post by the bot in a thread; a failure is logged, never fatal.
     pub(super) async fn say(&self, conversation: &str, thread: &str, text: String) {
+        self.say_with(conversation, thread, text, None).await;
+    }
+
+    async fn say_with(&self, conversation: &str, thread: &str, text: String, menu: Option<Menu>) {
         let req = PostRequest {
             conversation: conversation.into(),
             thread: Some(thread.into()),
             text,
+            menu,
         };
         if let Err(e) = self.surface.post(req).await {
             tracing::warn!("bot post failed: {e:#}");
@@ -325,74 +334,145 @@ impl Core {
     }
 
     async fn handle_action(&self, a: &Action) -> Result<()> {
-        if a.name != "continue" {
+        if !matches!(a.name.as_str(), "continue" | "choose") {
             return Ok(());
         }
         let _guard = self.lock(&a.conversation, &a.thread).await;
         // A person in the directory who is not an agent's account.
-        match self.cfg.person_by_slack(&a.sender.id) {
-            Some((_, p)) if p.agent != AgentMark::Always => {}
+        let who = match self.cfg.person_by_slack(&a.sender.id) {
+            Some((name, p)) if p.agent != AgentMark::Always => self.cfg.display(name),
             _ => return Ok(()),
-        }
+        };
         let Some(mut st) = self.store.load_thread(&a.conversation, &a.thread)? else {
             return Ok(());
         };
-        let was_paused = st.paused;
-        st.streak = 0;
-        st.paused = false;
-        if let (true, Some(p)) = (was_paused, st.pending.clone()) {
-            let thread = self
-                .surface
-                .thread(&a.conversation, &p.message, None)
-                .await
-                .context("cannot read the waiting message")?;
-            if let Some(msg) = thread.iter().find(|m| m.id == p.message) {
-                let author = self
-                    .cfg
-                    .person_by_slack(&msg.sender.id)
-                    .map(|(n, _)| self.cfg.display(n))
-                    .unwrap_or_default();
-                let inc = Incoming {
-                    conversation: a.conversation.clone(),
-                    thread: a.thread.clone(),
-                    id: msg.id.clone(),
-                    from: author,
-                    sent: msg.time,
-                    text: msg.text.clone(),
-                    link: self.surface.link(&a.conversation, &msg.id, &a.thread),
-                };
-                let project = self.cfg.channel(&a.conversation).and_then(|c| c.project.clone());
+        let project = self.cfg.channel(&a.conversation).and_then(|c| c.project.clone());
+        if a.name == "continue" {
+            let was_paused = st.paused;
+            st.streak = 0;
+            st.paused = false;
+            if let (true, Some(p)) = (was_paused, st.pending.clone()) {
                 let persons: Vec<String> = p.picks.keys().cloned().collect();
-                let mut refs: Vec<String> = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
+                let mut refs = self.known_refs(&st);
                 refs.extend(p.picks.values().flat_map(|k| match k {
                     Pick::Refs(r) => r.clone(),
                     Pick::Rule => vec![],
                 }));
                 let listing = self.list_for(&persons, project.clone(), refs).await;
                 let picks: Vec<(String, Pick)> = p.picks.into_iter().collect();
-                let out = self
-                    .deliver(
-                        &mut st,
-                        &picks,
-                        &listing,
-                        &inc,
-                        How {
-                            author: None,
-                            agent_like: false,
-                            pointer: false,
-                        },
-                    )
-                    .await;
-                if out.woken.is_empty() {
-                    st.explained = true;
-                    let text = self.explain(&persons[0], project.as_deref(), &listing, &[], &out.left_out, false);
-                    self.say(&a.conversation, &a.thread, text).await;
-                } else if let Err(e) = self.surface.acknowledge(&a.conversation, &p.message).await {
-                    tracing::warn!("acknowledging {} failed: {e:#}", p.message);
-                }
+                self.replay(&mut st, a, &p.message, picks, &listing, project.as_deref()).await?;
+            }
+            return self.store.save_thread(&st);
+        }
+
+        // The picker's menu: a choice, as a `to:` line from whoever clicked. It is
+        // delivered for the message that waits, or else the thread's first one.
+        tracing::info!("{who} chose {} session(s) in {}/{}", a.values.len(), a.conversation, a.thread);
+        let mut refs = self.known_refs(&st);
+        refs.extend(a.values.iter().cloned());
+        let listing = self
+            .list(&ListRequest {
+                person: Some(self.cfg.owner.clone()),
+                project: project.clone(),
+                refs,
+            })
+            .await;
+        let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut gone = vec![];
+        for v in &a.values {
+            match listing.resolve(v) {
+                Some((_, c)) => chosen.entry(c.person.clone()).or_default().push(c.ref_.clone()),
+                None => gone.push(format!("`{}`", text::clean(v))),
             }
         }
-        self.store.save_thread(&st)
+        if !gone.is_empty() {
+            let why = if listing.failed { "not checkable" } else { "no longer running" };
+            self.say(
+                &a.conversation,
+                &a.thread,
+                format!("{} ({why}): left out of the choice.", gone.join(", ")),
+            )
+            .await;
+        }
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        let message = st.pending.as_ref().map_or(a.thread.clone(), |p| p.message.clone());
+        let named: Vec<String> = chosen.values().flatten().map(|r| format!("`{r}`")).collect();
+        let picks: Vec<(String, Pick)> = chosen.into_iter().map(|(p, r)| (p, Pick::Refs(r))).collect();
+        st.streak = 0;
+        self.replay(&mut st, a, &message, picks, &listing, project.as_deref()).await?;
+        self.store.save_thread(&st)?;
+        let note = format!("Chosen by {who}: {}", named.join(", "));
+        if let Err(e) = self.surface.annotate(&a.conversation, &a.thread, &a.post, &note).await {
+            tracing::warn!("cannot update the picker post {}: {e:#}", a.post);
+        }
+        Ok(())
+    }
+
+    /// Every ref the thread has scoped or woken.
+    fn known_refs(&self, st: &ThreadState) -> Vec<String> {
+        st.scope.values().chain(st.woken.values()).flatten().cloned().collect()
+    }
+
+    /// Delivers thread message `message` to `picks` for a click, and reports as
+    /// the message path does: a post when nobody was woken, a 👀 when someone was.
+    /// A paused thread takes the choice and wakes nobody; Continue releases it.
+    async fn replay(
+        &self,
+        st: &mut ThreadState,
+        a: &Action,
+        message: &str,
+        picks: Vec<(String, Pick)>,
+        listing: &Listing,
+        project: Option<&str>,
+    ) -> Result<()> {
+        let thread = self
+            .surface
+            .thread(&a.conversation, message, None)
+            .await
+            .context("cannot read the waiting message")?;
+        let Some(msg) = thread.iter().find(|m| m.id == message) else {
+            return Ok(());
+        };
+        let author = self
+            .cfg
+            .person_by_slack(&msg.sender.id)
+            .map(|(n, _)| self.cfg.display(n))
+            .unwrap_or_default();
+        let inc = Incoming {
+            conversation: a.conversation.clone(),
+            thread: a.thread.clone(),
+            id: msg.id.clone(),
+            from: author,
+            sent: msg.time,
+            text: msg.text.clone(),
+            link: self.surface.link(&a.conversation, &msg.id, &a.thread),
+        };
+        let paused = st.paused;
+        let out = self
+            .deliver(
+                st,
+                &picks,
+                listing,
+                &inc,
+                How {
+                    author: None,
+                    agent_like: false,
+                    pointer: false,
+                },
+            )
+            .await;
+        if paused {
+            // The pause notice already said the message waits for Continue.
+        } else if out.woken.is_empty() {
+            st.explained = true;
+            let text = self.explain(&picks[0].0, project, listing, &[], &out.left_out, false);
+            self.say(&a.conversation, &a.thread, text).await;
+        } else if let Err(e) = self.surface.acknowledge(&a.conversation, message).await {
+            tracing::warn!("acknowledging {message} failed: {e:#}");
+        }
+        Ok(())
     }
 
     /// On start and on every reconnect: handles the messages missed while the
