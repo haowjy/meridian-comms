@@ -304,7 +304,7 @@ impl Core {
         Ok(SendOut {
             retry: (!out.failed.is_empty()).then(|| format!("meridian-comms send {message} --to {}", out.failed.join(" --to "))),
             message,
-            link: Some(inc.link).filter(|_| text.is_some()),
+            link: text.is_some().then_some(inc.link),
             posted: text.is_some(),
             woken: out.woken,
             not_woken,
