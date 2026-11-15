@@ -62,8 +62,6 @@ struct Idle {
     warm_until: Option<DateTime<Utc>>,
     #[serde(default)]
     ttl_estimated: bool,
-    #[serde(default)]
-    waiting_on_user: bool,
 }
 
 impl Meridian {
@@ -113,11 +111,7 @@ impl Meridian {
         let p = &self.projects[project];
         let default = row.agent.is_some() && row.agent == p.default.clone().or_else(|| self.default.clone());
         let activity = row.idle.map(|i| Activity {
-            state: if i.waiting_on_user {
-                ActivityState::Waiting
-            } else {
-                ActivityState::Idle
-            },
+            state: ActivityState::Idle,
             since: i.since,
             warm_until: i.warm_until,
             note: i.ttl_estimated.then(|| "cache expiry estimated".to_string()),

@@ -68,8 +68,8 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>) -> Result<bool>
         match v["type"].as_str() {
             Some("hello") => {
                 hello = true;
-                // Two live connections would each get every event; a second
-                // daemon on this bot would split them between daemons.
+                // Slack splits events between the connections of one app, so a
+                // second daemon on this bot would take some of them.
                 let n = v["num_connections"].as_u64().unwrap_or(1);
                 if n > 1 {
                     tracing::warn!("slack reports {n} connections open for this app: another daemon may hold it");
