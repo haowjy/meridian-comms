@@ -19,11 +19,15 @@ pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("meridian-comms")
 }
 
-/// `$XDG_RUNTIME_DIR/meridian-comms.sock`; without that variable, a socket in a
-/// per-user directory under the state directory, which the daemon makes 0700.
+/// `/run/user/<uid>/meridian-comms.sock` where that directory exists, else a
+/// socket under the state directory, which the daemon makes 0700. Derived from
+/// the uid, never from `XDG_RUNTIME_DIR`: a session started without that
+/// variable must find the daemon's socket.
 pub fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(v) if !v.is_empty() => PathBuf::from(v).join("meridian-comms.sock"),
-        _ => state_dir().join("run").join("meridian-comms.sock"),
+    let run = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    if run.is_dir() {
+        run.join("meridian-comms.sock")
+    } else {
+        state_dir().join("run").join("meridian-comms.sock")
     }
 }
