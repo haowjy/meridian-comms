@@ -64,6 +64,42 @@ the sender from it.
 context. Nothing wakes by guessing, and a message nobody was woken for waits until
 someone pulls it or chooses.
 
+## Config
+
+`~/.config/meridian-comms/config.toml`, mode 0600. The Slack tokens sit beside it in
+`slack.env` ([slack-setup.md](slack-setup.md)). The daemon refuses to start if either
+file can be read by anyone but the owner.
+
+```toml
+owner = "jimmy"                  # the person whose agents this daemon wakes
+machine = "desk"                 # optional; default: the hostname. Starts every ref.
+
+[surface.slack.channels.C0123ABCD]   # the channel's Slack ID
+name = "meridian-cli"                # the name in message refs
+project = "meridian-cli"             # optional; none means every project
+post = false                         # sessions may open threads here (needed with no project)
+external = false                     # set true to allow a channel shared with another org
+
+[people.jimmy]
+slack = "U0123ABCD"                  # Slack member ID
+agent = "maybe"                      # no | maybe | always: may an agent post as this person?
+[people.alice]
+slack = "U0456EFGH"
+note = "cofounder, works in Amp"     # shown in notices
+agent = "maybe"
+
+[sources.meridian]
+# default = "product-lead"           # optional: primaries of this agent wake with no choice
+[sources.meridian.projects.meridian-cli]
+root = "/path/to/meridian-cli"
+# default = "tech-lead"              # optional, this project only
+```
+
+A channel the config doesn't list is ignored. A message counts only if its sender is
+under `[people]`. `agent` feeds the [loop limit](#loop-limit): a message from a person
+marked `maybe` or `always` counts toward the pause, and Continue from an `always` person
+is ignored.
+
 ## Loop limit
 
 `streak` counts messages in a row that woke someone and may be from agents: a
