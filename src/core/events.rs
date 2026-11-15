@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::future::join_all;
 
 use super::deliver::{How, Incoming};
-use super::{Core, ThreadKey};
+use super::{Core, ThreadKey, text};
 use crate::config::AgentMark;
 use crate::model::{Action, ListRequest, Msg, PostRequest, SurfaceEvent};
 use crate::state::{Pick, ThreadState};
@@ -21,13 +21,25 @@ const RECOVERY_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub enum Job {
     Msg(Msg),
+    /// A message put back after a source did not answer.
+    Retry(Msg),
     Action(Action),
 }
+
+/// What handling a message came to.
+enum Flow {
+    Done,
+    /// A `to:` line names something no answering source resolves while a source
+    /// is down, so it may not be a choice or may not be text yet. Waits for a retry.
+    SourceDown(String),
+}
+
+const SOURCE_RETRY: Duration = Duration::from_secs(30);
 
 impl Job {
     fn key(&self) -> ThreadKey {
         match self {
-            Job::Msg(m) => (m.conversation.clone(), m.thread.clone()),
+            Job::Msg(m) | Job::Retry(m) => (m.conversation.clone(), m.thread.clone()),
             Job::Action(a) => (a.conversation.clone(), a.thread.clone()),
         }
     }
@@ -112,34 +124,61 @@ impl Core {
         }
     }
 
-    async fn handle(&self, job: Job) {
-        match job {
-            Job::Msg(m) => match self.handle_message(&m).await {
-                // An event that failed stays in flight: the cursor stops
-                // before it, and the next recovery handles it again.
-                Err(e) => tracing::error!("message {} in {}: {e:#}", m.id, m.conversation),
-                Ok(()) => self.finish(&m),
-            },
+    async fn handle(self: &Arc<Self>, job: Job) {
+        let (m, retry) = match job {
+            Job::Msg(m) => (m, false),
+            Job::Retry(m) => (m, true),
             Job::Action(a) => {
                 if let Err(e) = self.handle_action(&a).await {
                     tracing::error!("action {} in {}: {e:#}", a.name, a.conversation);
+                }
+                return;
+            }
+        };
+        let key = (m.conversation.clone(), m.id.clone());
+        let result = self.handle_message(&m).await;
+        if !matches!(result, Ok(Flow::SourceDown(_))) {
+            self.awaiting.lock().unwrap().remove(&key);
+        }
+        match result {
+            // An event that failed stays in flight: the cursor stops
+            // before it, and the next recovery handles it again.
+            Err(e) => tracing::error!("message {} in {}: {e:#}", m.id, m.conversation),
+            Ok(Flow::Done) => self.finish(&m),
+            Ok(Flow::SourceDown(word)) => {
+                // One retry loop per message, however often it is delivered.
+                let first = self.awaiting.lock().unwrap().insert(key);
+                if first {
+                    let text = format!(
+                        "A session source did not answer, so I can't tell whether `{}` names a session. I'll try again every {} s.",
+                        text::clean(&word),
+                        SOURCE_RETRY.as_secs()
+                    );
+                    self.say(&m.conversation, &m.thread, text).await;
+                }
+                if first || retry {
+                    let core = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(SOURCE_RETRY).await;
+                        core.enqueue(Job::Retry(m));
+                    });
                 }
             }
         }
     }
 
-    async fn handle_message(&self, m: &Msg) -> Result<()> {
+    async fn handle_message(&self, m: &Msg) -> Result<Flow> {
         let _guard = self.lock(&m.conversation, &m.thread).await;
         let Some((person, pcfg)) = self.cfg.person_by_slack(&m.sender.id) else {
-            return Ok(());
+            return Ok(Flow::Done);
         };
         let mut st = match self.store.load_thread(&m.conversation, &m.thread)? {
             Some(s) => s,
             None if m.addressed => ThreadState::new(&m.conversation, &m.thread),
-            None => return Ok(()),
+            None => return Ok(Flow::Done),
         };
         if st.is_handled(&m.id) {
-            return Ok(());
+            return Ok(Flow::Done);
         }
         let project = self.cfg.channel(&m.conversation).and_then(|c| c.project.clone());
         let owner = self.cfg.owner.clone();
@@ -155,8 +194,18 @@ impl Core {
             link: self.surface.link(&m.conversation, &m.id, &m.thread),
         };
 
+        // A `to:` line that waited for a source is not applied once a later message
+        // has been handled: it would undo what that message did.
+        let words = to_words(&m.text).filter(|w| !w.is_empty());
+        if words.is_some() && st.handled.iter().any(|h| h.as_str() > m.id.as_str()) {
+            st.mark_handled(&m.id);
+            self.store.save_thread(&st)?;
+            let text = "Your `to:` choice was not applied: a later message in this thread was handled while it waited, and applying it now would undo that. Send it again if you still want it.".to_string();
+            self.say(&m.conversation, &m.thread, text).await;
+            return Ok(Flow::Done);
+        }
+
         // One listing per event: Meridian's costs 1.4 s and 300 MB.
-        let words = to_words(&m.text);
         let mut refs: Vec<String> = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
         refs.extend(words.iter().flatten().cloned());
         let listing = self
@@ -172,6 +221,7 @@ impl Core {
         let mut all = false;
         if let Some(words) = &words {
             let mut used = 0;
+            let mut unresolved = None;
             for w in words {
                 if w.eq_ignore_ascii_case("all") {
                     all = true;
@@ -181,16 +231,18 @@ impl Core {
                         e.push(c.ref_.clone());
                     }
                 } else {
+                    unresolved = Some(w);
                     break;
                 }
                 used += 1;
             }
+            // A word nothing answering resolves may belong to the source that is
+            // down: it is neither text nor a miss yet.
+            if let (Some(w), true) = (unresolved, listing.failed) {
+                return Ok(Flow::SourceDown(w.clone()));
+            }
             if used == 0 {
                 let bad = words.first().map(String::as_str).unwrap_or("");
-                // A source that did not answer must not turn a choice into "can't match".
-                if listing.failed {
-                    bail!("a source did not answer, so `to: {bad}` could not be checked");
-                }
                 st.mark_handled(&m.id);
                 self.store.save_thread(&st)?;
                 let msg = format!(
@@ -199,7 +251,7 @@ impl Core {
                     self.explain(&owner, project.as_deref(), &listing, &[], &[], true)
                 );
                 self.say(&m.conversation, &m.thread, msg).await;
-                return Ok(());
+                return Ok(Flow::Done);
             }
         }
 
@@ -247,7 +299,8 @@ impl Core {
             tracing::warn!("acknowledging {} failed: {e:#}", m.id);
         }
         st.mark_handled(&m.id);
-        self.store.save_thread(&st)
+        self.store.save_thread(&st)?;
+        Ok(Flow::Done)
     }
 
     pub(super) async fn pause_if_needed(&self, st: &mut ThreadState) {

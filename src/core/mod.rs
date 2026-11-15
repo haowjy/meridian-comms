@@ -45,6 +45,8 @@ pub struct Core {
     cursor: Cursor,
     /// Channels whose recovery is failing and being retried.
     recovering: Mutex<BTreeSet<String>>,
+    /// Messages (conversation, id) waiting for a source to answer, each with one retry loop.
+    awaiting: Mutex<BTreeSet<ThreadKey>>,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -127,6 +129,7 @@ impl Core {
             queues: Mutex::default(),
             cursor,
             recovering: Mutex::default(),
+            awaiting: Mutex::default(),
         })
     }
 
