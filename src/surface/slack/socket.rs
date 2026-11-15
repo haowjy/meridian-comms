@@ -19,8 +19,9 @@ const SILENCE: Duration = Duration::from_secs(120);
 
 pub async fn run(slack: &Slack, tx: mpsc::Sender<SurfaceEvent>) {
     let mut backoff = Duration::from_secs(1);
+    let mut first = true;
     loop {
-        match session(slack, &tx).await {
+        match session(slack, &tx, &mut first).await {
             Ok(true) => backoff = Duration::from_secs(1),
             Ok(false) => {}
             Err(e) => tracing::warn!("socket mode: {e:#}"),
@@ -34,7 +35,7 @@ pub async fn run(slack: &Slack, tx: mpsc::Sender<SurfaceEvent>) {
 }
 
 /// One connection. `Ok(true)` when it got as far as `hello`.
-async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>) -> Result<bool> {
+async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, first: &mut bool) -> Result<bool> {
     let open = slack.web.form(Token::App, "apps.connections.open", &[]).await?;
     let url = open["url"].as_str().context("apps.connections.open gave no url")?;
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("websocket connect failed")?;
@@ -71,11 +72,19 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>) -> Result<bool>
                 // Slack splits events between the connections of one app, so a
                 // second daemon on this bot would take some of them.
                 let n = v["num_connections"].as_u64().unwrap_or(1);
-                if n > 1 {
-                    tracing::warn!("slack reports {n} connections open for this app: another daemon may hold it");
-                } else {
-                    tracing::info!("socket mode connected");
+                // Only the first connection is checked: Slack's own refresh opens
+                // the new connection before closing the old one, so a reconnect
+                // can see 2. The daemon already connected is never told about a
+                // newcomer, so the newcomer is the one that must refuse.
+                if std::mem::take(first) && n > 1 {
+                    tracing::error!(
+                        "slack reports {n} connections open for this bot: another meridian-comms daemon holds it. \
+                         One bot has exactly one daemon; stop the other one, or give this machine its own bot."
+                    );
+                    let _ = sink.send(Message::Close(None)).await;
+                    std::process::exit(2);
                 }
+                tracing::info!("socket mode connected ({n} connection)");
                 if tx.send(SurfaceEvent::Connected).await.is_err() {
                     return Ok(hello);
                 }

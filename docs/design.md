@@ -169,8 +169,16 @@ handled again at the next recovery. A channel's first run starts at now.
 
 Hand-rolled, no SDK. Socket Mode: `apps.connections.open`, then a websocket of JSON
 envelopes, each acknowledged by `envelope_id` before it is handled. A `disconnect`
-frame or a silent link (120 s) means reconnect; the `hello` frame's `num_connections`
-is logged, and more than one warns. Web API calls: `chat.postMessage`,
+frame or a silent link (120 s) means reconnect.
+
+**One bot, one daemon.** Slack hands each event to any one of an app's connections, so
+a second daemon on the same bot would take some of the events. Each connection's `hello`
+carries `num_connections`, and only the new connection learns the count: the one already
+connected is never told. So the daemon checks its first `hello` after start, and exits
+with status 2 when the count is above 1. It doesn't check on reconnect, because Slack's
+own refresh briefly overlaps the old connection with the new one. After a crash, Slack
+may count the dead connection for a while, so a restart can be refused until Slack
+drops it; run the service with a restart delay. Web API calls: `chat.postMessage`,
 `reactions.add`, `conversations.replies`, `conversations.history`, `auth.test`,
 `conversations.info`; a 429 waits out `Retry-After`. A post replaces `<!` with `&lt;!`
 so text from a session can't ping a channel. A channel shared with another
