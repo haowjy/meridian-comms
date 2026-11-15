@@ -46,17 +46,24 @@ All three ways in (a message in a thread, `send`, the Continue click) go through
 function, `deliver` in `src/core/deliver.rs`. It takes, per person, either the refs chosen
 or "run the rule"; wakes each ref once however many picks name it; records the ref each
 wake *returned* (a source may open a new thread per wake) in `scope` and `woken`; and
-sets `pending` and `streak`. Each one woken gets a notice naming the others, and
+sets `pending` and `streak`. In a paused thread it wakes nobody: the choice still takes the scope, and the message waits as `pending`. Each one woken gets a notice naming the others, and
 carrying the message text and a link for a source that cannot run `read` (the Meridian
 source leaves the text out of its line). When nobody is woken the message
 becomes `pending`, shown by `meridian-comms list`, and the bot says in the thread who
-was skipped and why. On a thread's first message that post is the picker: who is
+was skipped and why. `pending` holds the message and the picks it was delivered with
+(`{person: [refs] | "rule"}`), and Continue replays exactly those. Whether the bot owes
+that explanation reads a separate `explained` flag, set when it posts and cleared by any
+wake, so an agent's `send` that woke nobody never silences the explanation a person's
+next message is owed. On a thread's first message that post is the picker: who is
 running, with model and activity.
 
 **A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
 one listed candidate has it. A choice replaces the scope of the person whose refs it
 names; sessions woken before and no longer in the scope get one "now with" notice.
+A `send --to` with no text is a pointer at an existing message, not a hand-off: the refs
+it wakes join the scope and nobody is released. That is the form of the retry line.
+A `send` that posts text and names refs is a hand-off and replaces the scope.
 A session that `send`s in a thread joins its person's scope, and a choice never drops
 the sender from it.
 
@@ -105,7 +112,7 @@ is ignored.
 `streak` counts messages in a row that woke someone and may be from agents: a
 `send --to`, a message the surface marks as an app's, or one from a person whose entry
 has `agent` set. A message from anyone else resets it. At 12 the thread is `paused`:
-later messages become pending, `send --to` is refused, and the bot posts a Continue
+later messages wait as `pending` with their picks, `send --to` is refused, and the bot posts a Continue
 button. A person in the directory whose `agent` is not `always` may press it. There is
 no typed `continue`: an agent posting under a person's name could type it.
 
@@ -118,6 +125,12 @@ its lock and writes its file as soon as Slack returns the post, before it wakes,
 reply that arrives mid-wake waits its turn and finds the scope. Wakes happen before
 the final write, so a crash repeats a notice and never loses one. `handled` holds the last 50 message IDs,
 so a redelivery is dropped.
+
+A `to:` line that names a word no answering source resolves while a source is down is
+neither text nor a miss yet. The daemon says once in the thread that a source did not
+answer and retries every 30 s (one loop per message, not per delivery). If a later
+message in the thread was handled by then, the choice is dropped with a post saying so
+rather than applied out of order.
 
 A thread file that does not parse is moved to `*.corrupt-<time>` and the thread is
 treated as new. It loses the scope, the waiting message and `handled`; a reply without
