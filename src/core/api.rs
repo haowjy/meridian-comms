@@ -1,11 +1,9 @@
 //! The client's three requests: `read`, `send` and `list`.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use super::deliver::{Delivery, Incoming, Plan};
+use super::deliver::{Author, Incoming, Pick};
 use super::{Core, Listing};
 use crate::config::Channel;
 use crate::model::{CallerKind, IdentifyResult, ListRequest, Msg, PostRequest};
@@ -185,24 +183,22 @@ impl Core {
             }
         }
 
-        let _guard = match &requested {
-            Some(m) => Some(self.lock(&conv, &m.thread).await),
-            None => None,
-        };
+        let mut _held = None;
         let mut st = match &requested {
-            Some(m) => self
-                .store
-                .load_thread(&conv, &m.thread)
-                .unwrap_or_else(|| ThreadState::new(&conv, &m.thread)),
+            Some(m) => {
+                _held = Some(self.lock(&conv, &m.thread).await);
+                self.store
+                    .load_thread(&conv, &m.thread)?
+                    .unwrap_or_else(|| ThreadState::new(&conv, &m.thread))
+            }
             None => ThreadState::new(&conv, ""),
         };
         if !to.is_empty() && st.paused {
             bail!(
-                "this thread is paused after {} messages in a row that may be from agents; a person presses Continue in Slack",
+                "this thread is paused after {} messages in a row that may be from agents; a person presses Continue on the thread",
                 super::events::LOOP_LIMIT
             );
         }
-        let prior: BTreeMap<String, Vec<String>> = st.woken.clone();
 
         let mut listing = Listing::default();
         if !to.is_empty() {
@@ -222,30 +218,27 @@ impl Core {
                 })
                 .await;
             for p in persons.iter().filter(|p| **p != owner) {
-                let l = self
-                    .list(&ListRequest {
+                listing.absorb(
+                    self.list(&ListRequest {
                         person: Some(p.clone()),
                         project: project.clone(),
                         refs: vec![],
                     })
-                    .await;
-                for (i, c) in l.candidates {
-                    if listing.find(&c.ref_).is_none() {
-                        listing.candidates.push((i, c));
-                    }
-                }
-                listing.unreachable.extend(l.unreachable);
+                    .await,
+                );
             }
             for w in &words {
                 if listing.resolve(w).is_none() {
-                    bail!("{w:?} matches no running session: use a ref or short ID from `meridian-comms list`, or @person");
+                    bail!(
+                        "{} Use a ref or short ID from `meridian-comms list`, or @person.",
+                        listing.why_not(w)
+                    );
                 }
             }
         }
 
         // Post.
-        let mut link = None;
-        let (message_id, from, sent) = match (&text, &requested) {
+        let (message_id, from, sent, text_out) = match (&text, &requested) {
             (Some(body), _) => {
                 let to_part = if to.is_empty() {
                     String::new()
@@ -256,14 +249,20 @@ impl Core {
                     conversation: conv.clone(),
                     thread: requested.as_ref().map(|m| m.thread.clone()),
                     text: format!("From {}{to_part}:\n{body}", who.label()),
-                    button: None,
                 };
                 let posted = self.surface.post(req).await?;
-                link = Some(posted.link);
                 if requested.is_none() {
-                    st.thread = posted.id.clone();
+                    // The thread exists now: a reply can arrive while the wakes run. Take
+                    // its lock and write its file before waking, so the reply waits its
+                    // turn and finds the scope.
+                    _held = Some(self.lock(&conv, &posted.id).await);
+                    st = self
+                        .store
+                        .load_thread(&conv, &posted.id)?
+                        .unwrap_or_else(|| ThreadState::new(&conv, &posted.id));
+                    self.store.save_thread(&st)?;
                 }
-                (posted.id, who.label(), Utc::now())
+                (posted.id, who.label(), Utc::now(), body.clone())
             }
             (None, Some(m)) => {
                 let from = self
@@ -271,111 +270,56 @@ impl Core {
                     .person_by_slack(&m.sender.id)
                     .map(|(n, _)| self.cfg.display(n))
                     .unwrap_or_else(|| format!("{}-agents", self.cfg.owner));
-                (m.id.clone(), from, m.time)
+                (m.id.clone(), from, m.time, m.text.clone())
             }
             (None, None) => unreachable!("a channel target requires text"),
         };
-        let thread_message = self.message_ref(&conv, &st.thread);
         let message = self.message_ref(&conv, &message_id);
         let inc = Incoming {
             conversation: conv.clone(),
-            id: message_id.clone(),
+            thread: st.thread.clone(),
+            link: self.surface.link(&conv, &message_id, &st.thread),
+            id: message_id,
             from,
             sent,
+            text: text_out,
         };
 
-        // A session that speaks in a thread joins its scope.
-        let mut changed: Vec<String> = vec![];
-        if let Some(r) = &who.ref_ {
-            let scope = st.scope.entry(who.person.clone()).or_default();
-            if !scope.contains(r) {
-                scope.push(r.clone());
-                changed.push(who.person.clone());
+        // `@person` runs the rule for that person; a ref or short ID is a choice
+        // for the person who owns it. A choice for a person takes the place of
+        // the rule for that person.
+        let mut picks: Vec<(String, Pick)> = vec![];
+        for w in &words {
+            let (_, c) = listing.resolve(w).expect("checked before posting");
+            match picks.iter_mut().find(|(p, _)| *p == c.person) {
+                Some((_, Pick::Refs(refs))) => refs.push(c.ref_.clone()),
+                _ => picks.push((c.person.clone(), Pick::Refs(vec![c.ref_.clone()]))),
             }
         }
-
-        // `--to`: the rule for each `@person`, a wake for each ref.
-        let mut all_woken: Vec<String> = vec![];
-        let mut not_woken: Vec<String> = vec![];
-        let mut delivered: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        if !to.is_empty() {
-            let mut plans: Vec<(String, Plan, Vec<String>)> = vec![];
-            for p in &persons {
-                let (plan, left) = self.plan_rule(&st, &listing, p, who.ref_.as_deref());
-                plans.push((p.clone(), plan, left));
-            }
-            let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for w in &words {
-                let (_, c) = listing.resolve(w).expect("checked before posting");
-                chosen.entry(c.person.clone()).or_default().push(c.ref_.clone());
-            }
-            for (p, refs) in chosen {
-                let (plan, left) = self.plan_choice(&listing, &refs);
-                plans.push((p, plan, left));
-            }
-            for (p, plan, left) in plans {
-                let Delivery { woken, left_out } = self.wake_all(plan, left, &inc).await;
-                not_woken.extend(left_out);
-                if !woken.is_empty() {
-                    let scope = st.scope.entry(p.clone()).or_default();
-                    for r in &woken {
-                        if !scope.contains(r) {
-                            scope.push(r.clone());
-                        }
-                    }
-                    if !changed.contains(&p) {
-                        changed.push(p.clone());
-                    }
-                    all_woken.extend(woken.iter().cloned());
-                    delivered.entry(p).or_default().extend(woken);
-                }
+        for p in &persons {
+            if !picks.iter().any(|(q, _)| q == p) {
+                picks.push((p.clone(), Pick::Rule));
             }
         }
-
-        if !to.is_empty() && all_woken.is_empty() && not_woken.is_empty() {
-            not_woken.push("no session to wake: none is in this thread's scope or marked default. Choose one with --to <ref> (see `meridian-comms list`)".into());
-        }
-
-        // Release what the scope change left behind, then record who was woken.
-        let needs_release = changed
-            .iter()
-            .any(|p| prior.get(p).is_some_and(|w| w.iter().any(|r| !st.scope_of(p).contains(r))));
-        if needs_release && listing.candidates.is_empty() {
-            let refs = prior.values().flatten().cloned().collect();
-            listing = self
-                .list(&ListRequest {
-                    person: Some(owner.clone()),
-                    project: project.clone(),
-                    refs,
-                })
-                .await;
-        }
-        for p in &changed {
-            let old = prior.get(p).cloned().unwrap_or_default();
-            self.release(&mut st, &thread_message, p, &old, &listing).await;
-        }
-        for (p, woken) in delivered {
-            st.woken.insert(p, woken);
-        }
-
-        let mut paused = false;
-        if !to.is_empty() && !all_woken.is_empty() {
-            st.pending = None;
-            st.streak += 1;
-            self.pause_if_needed(&mut st).await;
-            paused = st.paused;
-        }
+        let author = who.ref_.as_deref().map(|r| Author {
+            ref_: r,
+            person: &who.person,
+        });
+        let out = self.deliver(&mut st, &picks, &listing, &inc, author, true).await;
         self.store.save_thread(&st)?;
 
-        let failed = !to.is_empty() && (all_woken.is_empty() || !not_woken.is_empty());
+        let mut not_woken = out.left_out;
+        if !to.is_empty() && out.woken.is_empty() && not_woken.is_empty() {
+            not_woken.push("no session to wake: none is in this thread's scope or marked default. Choose one with --to <ref> (see `meridian-comms list`)".into());
+        }
         Ok(SendOut {
-            retry: failed.then(|| format!("meridian-comms send {message} --to {}", to.join(" --to "))),
+            retry: (!out.failed.is_empty()).then(|| format!("meridian-comms send {message} --to {}", out.failed.join(" --to "))),
             message,
-            link,
+            link: Some(inc.link).filter(|_| text.is_some()),
             posted: text.is_some(),
-            woken: all_woken,
+            woken: out.woken,
             not_woken,
-            paused,
+            paused: st.paused,
         })
     }
 

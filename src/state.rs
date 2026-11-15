@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,7 @@ struct CursorFile {
     channels: BTreeMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }
@@ -98,23 +99,21 @@ impl Store {
         self.dir.join("threads").join(format!("{conversation}-{thread}.json"))
     }
 
-    /// A file that cannot be parsed is moved aside and the thread is treated as
-    /// new. That cannot wake anyone: with no scope a message goes to the
-    /// defaults, and the Meridian source marks none. What is lost is the
-    /// scope, the waiting message and `handled`; a reply without the mention is
-    /// ignored from then on, and the log says where the old file went.
-    pub fn load_thread(&self, conversation: &str, thread: &str) -> Option<ThreadState> {
+    /// `None` is a thread with no file. A file that cannot be parsed is moved
+    /// aside and counts as absent: the scope, the waiting message and `handled`
+    /// are lost, a reply without the mention is ignored from then on, and with
+    /// a default configured a redelivered first message wakes it again. The log
+    /// says where the old file went. Any other read error (permissions, too
+    /// many open files) is an error: the intact file must not be replaced.
+    pub fn load_thread(&self, conversation: &str, thread: &str) -> Result<Option<ThreadState>> {
         let path = self.thread_path(conversation, thread);
         let bytes = match fs::read(&path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                tracing::error!("cannot read {}: {e}; treating the thread as new", path.display());
-                return None;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         match serde_json::from_slice(&bytes) {
-            Ok(s) => Some(s),
+            Ok(s) => Ok(Some(s)),
             Err(e) => {
                 let aside = path.with_extension(format!("json.corrupt-{}", chrono::Utc::now().timestamp()));
                 tracing::error!(
@@ -123,7 +122,7 @@ impl Store {
                     aside.display()
                 );
                 let _ = fs::rename(&path, &aside);
-                None
+                Ok(None)
             }
         }
     }
@@ -133,22 +132,6 @@ impl Store {
             &self.thread_path(&state.conversation, &state.thread),
             &serde_json::to_vec_pretty(state)?,
         )
-    }
-
-    /// Threads whose file changed within `window` of now.
-    pub fn recent_threads(&self, window: Duration) -> Vec<(String, String)> {
-        let cutoff = SystemTime::now() - window;
-        let Ok(rd) = fs::read_dir(self.dir.join("threads")) else {
-            return vec![];
-        };
-        rd.flatten()
-            .filter(|e| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= cutoff))
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let (conv, thread) = name.strip_suffix(".json")?.split_once('-')?;
-                Some((conv.to_string(), thread.to_string()))
-            })
-            .collect()
     }
 
     /// Every thread file that parses, for `list`'s waiting messages.
@@ -183,9 +166,16 @@ impl Store {
     }
 }
 
+/// Each write has its own temp name, so two writes of one file at once cannot
+/// truncate each other's temp file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().context("state path has no parent")?;
-    let tmp = dir.join(format!("{}.tmp", path.file_name().unwrap().to_string_lossy()));
+    let tmp = dir.join(format!(
+        "{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut f = fs::File::create(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;

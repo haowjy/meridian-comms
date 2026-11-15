@@ -4,30 +4,154 @@ use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 
 use super::{Core, Listing, text};
-use crate::model::{Candidate, Notice, NoticeKind, WakeRequest};
-use crate::state::ThreadState;
+use crate::model::{Candidate, Notice, NoticeKind, WakeRequest, WakeResult};
+use crate::state::{Pending, ThreadState};
 
-/// The message being delivered, as notices describe it.
+/// The message being delivered, as notices describe it. `text` and `link` are
+/// for a source that cannot run `read`.
 pub struct Incoming {
     pub conversation: String,
+    pub thread: String,
     pub id: String,
     pub from: String,
     pub sent: DateTime<Utc>,
+    pub text: String,
+    pub link: String,
 }
 
 pub type Plan = Vec<(usize, Candidate)>;
 
+/// What to deliver to one person: the refs chosen, or whatever the rule picks.
+pub enum Pick {
+    Refs(Vec<String>),
+    Rule,
+}
+
+/// A session that speaks in the thread: it joins its person's scope.
+pub struct Author<'a> {
+    pub ref_: &'a str,
+    pub person: &'a str,
+}
+
 #[derive(Default)]
-pub struct Delivery {
+pub struct Outcome {
+    /// Refs as the wakes returned them.
     pub woken: Vec<String>,
     /// One line per candidate or ref that was not woken, with the reason.
     pub left_out: Vec<String>,
+    /// Refs whose wake errored: the only ones worth retrying.
+    pub failed: Vec<String>,
 }
 
 impl Core {
+    /// The one way a message reaches sessions. Per person, `picks` say which
+    /// refs were chosen (which replaces that person's scope) or that the rule
+    /// runs. Each ref is woken once however many picks name it, the scope and
+    /// `woken` record the ref each wake returned, and `pending` and `streak`
+    /// move the same way for every caller. The caller holds the thread's lock
+    /// and saves `st`.
+    pub(super) async fn deliver(
+        &self,
+        st: &mut ThreadState,
+        picks: &[(String, Pick)],
+        listing: &Listing,
+        inc: &Incoming,
+        author: Option<Author<'_>>,
+        agent_like: bool,
+    ) -> Outcome {
+        let mut plan = Plan::new();
+        let mut asked_by: Vec<(String, String)> = vec![]; // ref -> person
+        let mut out = Outcome::default();
+        for (person, pick) in picks {
+            let (p, left) = match pick {
+                Pick::Rule => self.plan_rule(st, listing, person, author.as_ref().map(|a| a.ref_)),
+                Pick::Refs(refs) => self.plan_choice(listing, refs),
+            };
+            out.left_out.extend(left);
+            for (i, c) in p {
+                if !plan.iter().any(|(_, o)| o.ref_ == c.ref_) {
+                    asked_by.push((c.ref_.clone(), person.clone()));
+                    plan.push((i, c));
+                }
+            }
+        }
+
+        let results = self.wake_all(&plan, inc).await;
+        // The ref a wake returned can differ from the one asked (a source that
+        // opens a new thread per wake).
+        let mut returned: Vec<(String, String, String)> = vec![]; // person, asked, returned
+        for ((c, r), (_, person)) in results.into_iter().zip(&asked_by) {
+            if r.woken {
+                out.woken.push(r.ref_.clone());
+                returned.push((person.clone(), c.ref_.clone(), r.ref_));
+            } else {
+                out.failed.push(c.ref_.clone());
+                out.left_out
+                    .push(format!("{}: not woken ({})", text::label(&c), text::clean(&r.detail)));
+            }
+        }
+
+        let mut prior_woken: Vec<(String, Vec<String>)> = vec![];
+        for (person, pick) in picks {
+            let mine = returned.iter().filter(|(p, ..)| p == person);
+            if let Pick::Refs(refs) = pick {
+                prior_woken.push((person.clone(), st.woken_of(person).to_vec()));
+                let mut scope: Vec<String> = vec![];
+                for r in refs {
+                    let r = returned
+                        .iter()
+                        .find(|(p, asked, _)| p == person && asked == r)
+                        .map_or(r, |(.., ret)| ret);
+                    if !scope.contains(r) {
+                        scope.push(r.clone());
+                    }
+                }
+                st.scope.insert(person.clone(), scope);
+            } else {
+                for (_, asked, ret) in mine.clone().filter(|(_, a, r)| a != r) {
+                    let scope = st.scope.entry(person.clone()).or_default();
+                    match scope.iter().position(|s| s == asked) {
+                        Some(pos) => scope[pos] = ret.clone(),
+                        None => scope.push(ret.clone()),
+                    }
+                }
+            }
+            let woken: Vec<String> = mine.map(|(.., ret)| ret.clone()).collect();
+            if !woken.is_empty() {
+                st.woken.insert(person.clone(), woken);
+            }
+        }
+        if let Some(a) = &author {
+            let scope = st.scope.entry(a.person.to_string()).or_default();
+            if !scope.iter().any(|r| r == a.ref_) {
+                scope.push(a.ref_.to_string());
+            }
+        }
+        for (person, prior) in &prior_woken {
+            self.release(st, inc, person, prior, listing).await;
+        }
+
+        if picks.is_empty() {
+            return out;
+        }
+        if out.woken.is_empty() {
+            st.pending = Some(Pending {
+                message: inc.id.clone(),
+                person: picks[0].0.clone(),
+            });
+        } else {
+            st.pending = None;
+            if agent_like {
+                st.streak += 1;
+                self.pause_if_needed(st).await;
+            }
+        }
+        out
+    }
+
     /// The rule: with a scope, the scope's candidates; without, the source's
     /// defaults. Cold candidates are left out.
-    pub(super) fn plan_rule(&self, st: &ThreadState, listing: &Listing, person: &str, author: Option<&str>) -> (Plan, Vec<String>) {
+    fn plan_rule(&self, st: &ThreadState, listing: &Listing, person: &str, author: Option<&str>) -> (Plan, Vec<String>) {
         let now = Utc::now();
         let scope = st.scope_of(person);
         let mut picked: Vec<&(usize, Candidate)> = vec![];
@@ -58,7 +182,7 @@ impl Core {
     }
 
     /// A choice wakes what it names, cold or not.
-    pub(super) fn plan_choice(&self, listing: &Listing, refs: &[String]) -> (Plan, Vec<String>) {
+    fn plan_choice(&self, listing: &Listing, refs: &[String]) -> (Plan, Vec<String>) {
         let mut plan = Plan::new();
         let mut left = vec![];
         for r in refs {
@@ -71,9 +195,9 @@ impl Core {
     }
 
     /// Wakes every planned candidate at once, each notice naming the others.
-    pub(super) async fn wake_all(&self, plan: Plan, left: Vec<String>, inc: &Incoming) -> Delivery {
+    async fn wake_all(&self, plan: &Plan, inc: &Incoming) -> Vec<(Candidate, WakeResult)> {
         let message = self.message_ref(&inc.conversation, &inc.id);
-        let results = join_all(plan.iter().map(|(i, c)| {
+        join_all(plan.iter().map(|(i, c)| {
             let also = plan.iter().filter(|(_, o)| o.ref_ != c.ref_).map(|(_, o)| o.ref_.clone()).collect();
             let req = WakeRequest {
                 ref_: c.ref_.clone(),
@@ -83,31 +207,19 @@ impl Core {
                     from: inc.from.clone(),
                     sent: inc.sent,
                     also,
-                    link: None,
-                    text: None,
+                    link: Some(inc.link.clone()),
+                    text: Some(inc.text.clone()),
                 },
             };
-            async move { (c, self.wake(*i, &req).await) }
+            async move { (c.clone(), self.wake(*i, &req).await) }
         }))
-        .await;
-        let mut d = Delivery {
-            woken: vec![],
-            left_out: left,
-        };
-        for (c, r) in results {
-            if r.woken {
-                d.woken.push(r.ref_);
-            } else {
-                d.left_out
-                    .push(format!("{}: not woken ({})", text::label(c), text::clean(&r.detail)));
-            }
-        }
-        d
+        .await
     }
 
     /// After `scope[person]` changed to something non-empty: each ref woken
     /// earlier that is no longer in it hears once that the thread moved on.
-    pub(super) async fn release(&self, st: &mut ThreadState, thread_message: &str, person: &str, prior: &[String], listing: &Listing) {
+    async fn release(&self, st: &mut ThreadState, inc: &Incoming, person: &str, prior: &[String], listing: &Listing) {
+        let thread_message = self.message_ref(&inc.conversation, &inc.thread);
         let scope = st.scope_of(person).to_vec();
         if scope.is_empty() {
             return;
@@ -118,7 +230,7 @@ impl Core {
                 ref_: c.ref_.clone(),
                 notice: Notice {
                     kind: NoticeKind::Released,
-                    message: thread_message.to_string(),
+                    message: thread_message.clone(),
                     from: "meridian-comms".into(),
                     sent: Utc::now(),
                     also: scope.clone(),
@@ -178,7 +290,7 @@ impl Core {
 }
 
 fn missing(listing: &Listing, r: &str) -> String {
-    if listing.unreachable.iter().any(|u| u == r) {
+    if listing.failed || listing.unreachable.iter().any(|u| u == r) {
         format!("`{r}`: not checkable (unreachable)")
     } else {
         format!("`{r}`: no longer running")

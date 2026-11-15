@@ -1,14 +1,15 @@
 //! Events from the surface: messages, clicks, and reconnects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use futures_util::future::join_all;
 
-use super::deliver::Incoming;
-use super::{Core, Listing, ThreadKey};
+use super::deliver::{Incoming, Pick};
+use super::{Core, ThreadKey};
 use crate::config::AgentMark;
 use crate::model::{Action, ListRequest, Msg, PostRequest, SurfaceEvent};
 use crate::state::{Pending, ThreadState};
@@ -16,7 +17,7 @@ use crate::state::{Pending, ThreadState};
 /// The loop limit: this many messages in a row that woke someone and may be
 /// from agents pause the thread.
 pub const LOOP_LIMIT: u32 = 12;
-const RECOVERY_THREAD_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
+const RECOVERY_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub enum Job {
     Msg(Msg),
@@ -106,9 +107,7 @@ impl Core {
     }
 
     fn finish(&self, m: &Msg) {
-        if let Some(pos) = self.cursor.finish(&m.conversation, &m.id)
-            && let Err(e) = self.store.save_cursor(&pos)
-        {
+        if let Err(e) = self.cursor.finish(&m.conversation, &m.id) {
             tracing::error!("cannot save cursor.json: {e:#}");
         }
     }
@@ -119,13 +118,7 @@ impl Core {
                 // An event that failed stays in flight: the cursor stops
                 // before it, and the next recovery handles it again.
                 Err(e) => tracing::error!("message {} in {}: {e:#}", m.id, m.conversation),
-                Ok(()) => {
-                    if let Some(pos) = self.cursor.finish(&m.conversation, &m.id)
-                        && let Err(e) = self.store.save_cursor(&pos)
-                    {
-                        tracing::error!("cannot save cursor.json: {e:#}");
-                    }
-                }
+                Ok(()) => self.finish(&m),
             },
             Job::Action(a) => {
                 if let Err(e) = self.handle_action(&a).await {
@@ -140,7 +133,7 @@ impl Core {
         let Some((person, pcfg)) = self.cfg.person_by_slack(&m.sender.id) else {
             return Ok(());
         };
-        let mut st = match self.store.load_thread(&m.conversation, &m.thread) {
+        let mut st = match self.store.load_thread(&m.conversation, &m.thread)? {
             Some(s) => s,
             None if m.addressed => ThreadState::new(&m.conversation, &m.thread),
             None => return Ok(()),
@@ -154,11 +147,13 @@ impl Core {
         let agent_like = m.sender.app || pcfg.agent != AgentMark::No;
         let inc = Incoming {
             conversation: m.conversation.clone(),
+            thread: m.thread.clone(),
             id: m.id.clone(),
             from: self.cfg.display(person),
             sent: m.time,
+            text: m.text.clone(),
+            link: self.surface.link(&m.conversation, &m.id, &m.thread),
         };
-        let thread_message = self.message_ref(&m.conversation, &m.thread);
 
         // One listing per event: Meridian's costs 1.4 s and 300 MB.
         let words = to_words(&m.text);
@@ -192,12 +187,16 @@ impl Core {
                 used += 1;
             }
             if used == 0 {
+                let bad = words.first().map(String::as_str).unwrap_or("");
+                // A source that did not answer must not turn a choice into "can't match".
+                if listing.failed {
+                    bail!("a source did not answer, so `to: {bad}` could not be checked");
+                }
                 st.mark_handled(&m.id);
                 self.store.save_thread(&st)?;
-                let bad = words.first().map(String::as_str).unwrap_or("");
                 let msg = format!(
-                    "I can't match `{}` to a running session.\n{}",
-                    super::text::clean(bad),
+                    "I can't match it: {}\n{}",
+                    listing.why_not(bad),
                     self.explain(&owner, project.as_deref(), &listing, &[], &[], true)
                 );
                 self.say(&m.conversation, &m.thread, msg).await;
@@ -208,13 +207,9 @@ impl Core {
         if all {
             st.scope.remove(&owner);
         }
-        for (p, refs) in &chosen {
-            let prior = st.woken_of(p).to_vec();
-            st.scope.insert(p.clone(), refs.clone());
-            self.release(&mut st, &thread_message, p, &prior, &listing).await;
-        }
-
         if st.paused {
+            // The choice stands; the message waits for Continue.
+            st.scope.extend(chosen);
             st.pending = Some(Pending {
                 message: m.id.clone(),
                 person: owner,
@@ -226,94 +221,34 @@ impl Core {
             st.streak = 0;
         }
 
-        let mut woken = vec![];
-        let mut left_out = vec![];
-        if chosen.is_empty() {
-            let (plan, left) = self.plan_rule(&st, &listing, &owner, None);
-            let d = self.wake_all(plan, left, &inc).await;
-            if !d.woken.is_empty() {
-                st.woken.insert(owner.clone(), d.woken.clone());
-            }
-            woken.extend(d.woken);
-            left_out.extend(d.left_out);
+        let picks: Vec<(String, Pick)> = if chosen.is_empty() {
+            vec![(owner.clone(), Pick::Rule)]
         } else {
-            for (p, refs) in &chosen {
-                let (plan, left) = self.plan_choice(&listing, refs);
-                let d = self.wake_all(plan, left, &inc).await;
-                st.woken.insert(p.clone(), d.woken.clone());
-                woken.extend(d.woken);
-                left_out.extend(d.left_out);
-            }
-        }
+            chosen.into_iter().map(|(p, refs)| (p, Pick::Refs(refs))).collect()
+        };
+        let out = self.deliver(&mut st, &picks, &listing, &inc, None, agent_like).await;
 
-        self.after_delivery(
-            &mut st,
-            &inc,
-            &owner,
-            project.as_deref(),
-            &listing,
-            &woken,
-            &left_out,
-            first,
-            prior_pending,
-            agent_like,
-        )
-        .await;
-        st.mark_handled(&m.id);
-        self.store.save_thread(&st)
-    }
-
-    /// What follows a delivery: pending, the streak, and what the bot says.
-    #[allow(clippy::too_many_arguments)]
-    async fn after_delivery(
-        &self,
-        st: &mut ThreadState,
-        inc: &Incoming,
-        person: &str,
-        project: Option<&str>,
-        listing: &Listing,
-        woken: &[String],
-        left_out: &[String],
-        first: bool,
-        prior_pending: bool,
-        agent_like: bool,
-    ) {
-        if woken.is_empty() {
-            st.pending = Some(Pending {
-                message: inc.id.clone(),
-                person: person.to_string(),
-            });
+        if out.woken.is_empty() {
             // The picker on a thread's first message; after that, once per run of
             // waiting messages, so a conversation nobody was woken for stays quiet.
             if first || !prior_pending {
-                let text = self.explain(person, project, listing, &[], left_out, first);
-                self.say(&inc.conversation, &st.thread, text).await;
+                let text = self.explain(&owner, project.as_deref(), &listing, &[], &out.left_out, first);
+                self.say(&m.conversation, &m.thread, text).await;
             }
-            return;
+        } else if first {
+            let text = self.explain(&owner, project.as_deref(), &listing, &out.woken, &out.left_out, true);
+            self.say(&m.conversation, &m.thread, text).await;
+        } else if let Err(e) = self.surface.acknowledge(&m.conversation, &m.id).await {
+            tracing::warn!("acknowledging {} failed: {e:#}", m.id);
         }
-        st.pending = None;
-        if first {
-            let text = self.explain(person, project, listing, woken, left_out, true);
-            self.say(&inc.conversation, &st.thread, text).await;
-        } else if let Err(e) = self.surface.react(&inc.conversation, &inc.id, "eyes").await {
-            tracing::warn!("reaction failed: {e:#}");
-        }
-        if agent_like {
-            st.streak += 1;
-            self.pause_if_needed(st).await;
-        }
+        st.mark_handled(&m.id);
+        self.store.save_thread(&st)
     }
 
     pub(super) async fn pause_if_needed(&self, st: &mut ThreadState) {
         if st.streak >= LOOP_LIMIT && !st.paused {
             st.paused = true;
-            let req = PostRequest {
-                conversation: st.conversation.clone(),
-                thread: Some(st.thread.clone()),
-                text: format!("Paused after {LOOP_LIMIT} messages in a row that may be from agents. Press Continue to go on."),
-                button: Some(("continue".into(), "Continue".into())),
-            };
-            if let Err(e) = self.surface.post(req).await {
+            if let Err(e) = self.surface.notify_pause(&st.conversation, &st.thread, LOOP_LIMIT).await {
                 tracing::error!("cannot post the pause notice: {e:#}");
             }
         }
@@ -325,7 +260,6 @@ impl Core {
             conversation: conversation.into(),
             thread: Some(thread.into()),
             text,
-            button: None,
         };
         if let Err(e) = self.surface.post(req).await {
             tracing::warn!("bot post failed: {e:#}");
@@ -342,7 +276,7 @@ impl Core {
             Some((_, p)) if p.agent != AgentMark::Always => {}
             _ => return Ok(()),
         }
-        let Some(mut st) = self.store.load_thread(&a.conversation, &a.thread) else {
+        let Some(mut st) = self.store.load_thread(&a.conversation, &a.thread)? else {
             return Ok(());
         };
         let was_paused = st.paused;
@@ -362,9 +296,12 @@ impl Core {
                     .unwrap_or_default();
                 let inc = Incoming {
                     conversation: a.conversation.clone(),
+                    thread: a.thread.clone(),
                     id: msg.id.clone(),
                     from: author,
                     sent: msg.time,
+                    text: msg.text.clone(),
+                    link: self.surface.link(&a.conversation, &msg.id, &a.thread),
                 };
                 let project = self.cfg.channel(&a.conversation).and_then(|c| c.project.clone());
                 let refs = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
@@ -375,78 +312,99 @@ impl Core {
                         refs,
                     })
                     .await;
-                let (plan, left) = self.plan_rule(&st, &listing, &p.person, None);
-                let d = self.wake_all(plan, left, &inc).await;
-                if d.woken.is_empty() {
-                    let text = self.explain(&p.person, project.as_deref(), &listing, &[], &d.left_out, false);
+                let picks = [(p.person.clone(), Pick::Rule)];
+                let out = self.deliver(&mut st, &picks, &listing, &inc, None, false).await;
+                if out.woken.is_empty() {
+                    let text = self.explain(&p.person, project.as_deref(), &listing, &[], &out.left_out, false);
                     self.say(&a.conversation, &a.thread, text).await;
-                } else {
-                    st.woken.insert(p.person.clone(), d.woken);
-                    st.pending = None;
-                    if let Err(e) = self.surface.react(&a.conversation, &p.message, "eyes").await {
-                        tracing::warn!("reaction failed: {e:#}");
-                    }
+                } else if let Err(e) = self.surface.acknowledge(&a.conversation, &p.message).await {
+                    tracing::warn!("acknowledging {} failed: {e:#}", p.message);
                 }
             }
         }
         self.store.save_thread(&st)
     }
 
-    /// Handles the messages missed while the connection was down: a channel's
-    /// history after its cursor, and the replies of each thread that is new or
-    /// was active in the last 7 days. Whatever `handled` already has is dropped.
+    /// On start and on every reconnect: handles the messages missed while the
+    /// connection was down. Each channel recovers on its own; one that fails is
+    /// logged once, frozen at its cursor and retried every 30 s, and the others
+    /// go on.
     pub(super) async fn recover(self: Arc<Self>) {
-        if let Err(e) = self.try_recover().await {
-            // The cursor must not move past the gap while recovery fails.
-            self.cursor.freeze(true);
-            tracing::error!("recovery failed, retrying every 30 s: {e:#}");
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    match self.try_recover().await {
-                        Ok(()) => break,
-                        Err(e) => tracing::error!("recovery failed again: {e:#}"),
+        let channels: Vec<String> = self.cfg.channels().map(|(id, _)| id.clone()).collect();
+        join_all(channels.into_iter().map(|conv| {
+            let core = self.clone();
+            async move { core.recover_channel(conv).await }
+        }))
+        .await;
+    }
+
+    async fn recover_channel(self: Arc<Self>, conv: String) {
+        if !self.recovering.lock().unwrap().insert(conv.clone()) {
+            return; // its retry loop already covers this reconnect
+        }
+        match self.try_recover(&conv).await {
+            Ok(()) => {
+                self.recovering.lock().unwrap().remove(&conv);
+            }
+            Err(e) => {
+                // The cursor must not move past the gap while recovery fails.
+                self.cursor.freeze(&conv, true);
+                tracing::error!("recovery of {conv} failed, retrying every 30 s: {e:#}");
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        if self.try_recover(&conv).await.is_ok() {
+                            break;
+                        }
                     }
-                }
-                self.cursor.freeze(false);
-            });
-        } else {
-            self.cursor.freeze(false);
+                    tracing::info!("recovery of {conv} succeeded");
+                    self.cursor.freeze(&conv, false);
+                    self.recovering.lock().unwrap().remove(&conv);
+                });
+            }
         }
     }
 
-    async fn try_recover(self: &Arc<Self>) -> Result<()> {
-        let recent = self.store.recent_threads(RECOVERY_THREAD_WINDOW);
-        for (conv, _) in self.cfg.channels() {
-            if let Some(pos) = self.cursor.init(conv, ts_now()) {
-                self.store.save_cursor(&pos)?;
-            }
-            let from = self.cursor.get(conv).context("no cursor")?;
-            let top = self
+    /// One channel's top-level messages after its cursor, and the replies after
+    /// the cursor of every thread whose newest reply is past it. One `history`
+    /// call covers the last 7 days (or back to the cursor, if older). What
+    /// `handled` already has is dropped.
+    async fn try_recover(self: &Arc<Self>, conv: &str) -> Result<()> {
+        self.cursor.init(conv, ts_now())?;
+        let from = self.cursor.get(conv).context("no cursor")?;
+        let window = Utc::now().timestamp() - RECOVERY_WINDOW.as_secs() as i64;
+        let oldest = from.clone().min(format!("{window}.000000"));
+        let top = self
+            .surface
+            .recent(conv, Some(&oldest), None)
+            .await
+            .with_context(|| format!("history of {conv}"))?;
+        let threads: Vec<&str> = top
+            .iter()
+            .filter(|m| m.latest_reply.as_deref().is_some_and(|l| l > from.as_str()))
+            .map(|m| m.thread.as_str())
+            .collect();
+        let mut missed: BTreeMap<String, Msg> = BTreeMap::new();
+        for t in threads {
+            for m in self
                 .surface
-                .recent(conv, Some(&from), None)
+                .thread(conv, t, Some(&from))
                 .await
-                .with_context(|| format!("history of {conv}"))?;
-            let mut threads: BTreeSet<String> = recent.iter().filter(|(c, _)| c == conv).map(|(_, t)| t.clone()).collect();
-            threads.extend(top.iter().filter(|m| m.reply_count.unwrap_or(0) > 0).map(|m| m.thread.clone()));
-            let mut missed: BTreeMap<String, Msg> = top.into_iter().map(|m| (m.id.clone(), m)).collect();
-            for t in threads {
-                for m in self
-                    .surface
-                    .thread(conv, &t, Some(&from))
-                    .await
-                    .with_context(|| format!("replies of {conv}/{t}"))?
-                {
-                    missed.entry(m.id.clone()).or_insert(m);
-                }
+                .with_context(|| format!("replies of {conv}/{t}"))?
+            {
+                missed.insert(m.id.clone(), m);
             }
-            let count = missed.values().filter(|m| m.id > from && m.sender.id != self.bot).count();
-            if count > 0 {
-                tracing::info!("recovering {count} message(s) in {conv}");
-            }
-            for m in missed.into_values().filter(|m| m.id > from) {
-                self.accept(m);
-            }
+        }
+        for m in top {
+            missed.entry(m.id.clone()).or_insert(m);
+        }
+        let missed: Vec<Msg> = missed.into_values().filter(|m| m.id > from).collect();
+        let count = missed.iter().filter(|m| m.sender.id != self.bot).count();
+        if count > 0 {
+            tracing::info!("recovering {count} message(s) in {conv}");
+        }
+        for m in missed {
+            self.accept(m);
         }
         Ok(())
     }

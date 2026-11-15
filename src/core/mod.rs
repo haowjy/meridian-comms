@@ -10,7 +10,7 @@ mod text;
 
 pub use text::candidate_line;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +43,8 @@ pub struct Core {
     /// handled in the order they arrived while other threads go on.
     queues: Mutex<HashMap<ThreadKey, mpsc::UnboundedSender<Job>>>,
     cursor: Cursor,
+    /// Channels whose recovery is failing and being retried.
+    recovering: Mutex<BTreeSet<String>>,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -50,6 +52,8 @@ pub struct Core {
 pub struct Listing {
     pub candidates: Vec<(usize, Candidate)>,
     pub unreachable: Vec<String>,
+    /// A source failed or timed out: what is missing may only be unchecked.
+    pub failed: bool,
 }
 
 impl Listing {
@@ -60,6 +64,16 @@ impl Listing {
             }
         }
         self.unreachable.extend(r.unreachable);
+    }
+
+    pub fn absorb(&mut self, other: Listing) {
+        for (i, c) in other.candidates {
+            if self.find(&c.ref_).is_none() {
+                self.candidates.push((i, c));
+            }
+        }
+        self.unreachable.extend(other.unreachable);
+        self.failed |= other.failed;
     }
 
     fn find(&self, ref_: &str) -> Option<&(usize, Candidate)> {
@@ -81,11 +95,28 @@ impl Listing {
             _ => None,
         }
     }
+
+    /// Why `resolve` found nothing for `word`.
+    pub fn why_not(&self, word: &str) -> String {
+        let ids: Vec<&str> = self
+            .candidates
+            .iter()
+            .filter(|(_, c)| c.id.as_deref() == Some(word))
+            .map(|(_, c)| c.ref_.as_str())
+            .collect();
+        if ids.len() > 1 {
+            format!("`{}` is ambiguous: it is {}. Use a full ref.", text::clean(word), ids.join(", "))
+        } else if self.failed {
+            format!("`{}` could not be checked: a source did not answer.", text::clean(word))
+        } else {
+            format!("`{}` matches no running session.", text::clean(word))
+        }
+    }
 }
 
 impl Core {
     pub fn new(cfg: Config, surface: Arc<dyn Surface>, sources: Vec<Arc<dyn Source>>, store: Store, bot: String) -> Arc<Core> {
-        let cursor = Cursor::new(store.load_cursor());
+        let cursor = Cursor::new(store.clone());
         Arc::new(Core {
             cfg,
             surface,
@@ -95,6 +126,7 @@ impl Core {
             locks: Mutex::default(),
             queues: Mutex::default(),
             cursor,
+            recovering: Mutex::default(),
         })
     }
 
@@ -117,25 +149,28 @@ impl Core {
     }
 
     /// Asks every source, side by side. A source that fails or times out
-    /// counts as returning nothing.
+    /// returns nothing and sets `failed`.
     async fn list(&self, req: &ListRequest) -> Listing {
         let answers = join_all(self.sources.iter().enumerate().map(|(i, s)| async move {
             match tokio::time::timeout(LIST_TIMEOUT, s.list(req)).await {
-                Ok(Ok(r)) => (i, r),
+                Ok(Ok(r)) => (i, Some(r)),
                 Ok(Err(e)) => {
                     tracing::warn!("{} list failed: {e:#}", s.name());
-                    (i, Default::default())
+                    (i, None)
                 }
                 Err(_) => {
                     tracing::warn!("{} list timed out", s.name());
-                    (i, Default::default())
+                    (i, None)
                 }
             }
         }))
         .await;
         let mut l = Listing::default();
         for (i, r) in answers {
-            l.merge(i, r);
+            match r {
+                Some(r) => l.merge(i, r),
+                None => l.failed = true,
+            }
         }
         l
     }

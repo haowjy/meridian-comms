@@ -82,16 +82,9 @@ impl Slack {
             addressed,
             text: text.trim().replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"),
             reply_count: v["reply_count"].as_u64().map(|n| n as u32),
+            latest_reply: v["latest_reply"].as_str().map(String::from),
             id,
         })
-    }
-
-    fn link(&self, conversation: &str, ts: &str, thread: Option<&str>) -> String {
-        let base = format!("{}archives/{conversation}/p{}", self.url, ts.replace('.', ""));
-        match thread {
-            Some(t) if t != ts => format!("{base}?thread_ts={t}&cid={conversation}"),
-            _ => base,
-        }
     }
 
     /// Reads pages of a messages method (`conversations.replies` / `.history`) until done.
@@ -136,27 +129,39 @@ impl Surface for Slack {
         if let Some(t) = &req.thread {
             body["thread_ts"] = json!(t);
         }
-        if let Some((name, label)) = &req.button {
-            body["blocks"] = json!([
-                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-                {"type": "actions", "elements": [
-                    {"type": "button", "action_id": name, "value": name, "text": {"type": "plain_text", "text": label}}
-                ]}
-            ]);
-        }
         let v = self.web.json("chat.postMessage", &body).await?;
         let id = v["ts"].as_str().context("chat.postMessage gave no ts")?.to_string();
-        Ok(Posted {
-            link: self.link(&req.conversation, &id, req.thread.as_deref()),
-            id,
-        })
+        Ok(Posted { id })
     }
 
-    async fn react(&self, conversation: &str, id: &str, reaction: &str) -> Result<()> {
+    async fn notify_pause(&self, conversation: &str, thread: &str, limit: u32) -> Result<()> {
+        let text = format!("Paused after {limit} messages in a row that may be from agents. Press Continue to go on.");
+        let body = json!({
+            "channel": conversation, "thread_ts": thread, "text": text,
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {"type": "actions", "elements": [
+                    {"type": "button", "action_id": "continue", "value": "continue", "text": {"type": "plain_text", "text": "Continue"}}
+                ]}
+            ],
+        });
+        self.web.json("chat.postMessage", &body).await.map(|_| ())
+    }
+
+    fn link(&self, conversation: &str, id: &str, thread: &str) -> String {
+        let base = format!("{}archives/{conversation}/p{}", self.url, id.replace('.', ""));
+        if thread == id {
+            base
+        } else {
+            format!("{base}?thread_ts={thread}&cid={conversation}")
+        }
+    }
+
+    async fn acknowledge(&self, conversation: &str, id: &str) -> Result<()> {
         let p = [
             ("channel", conversation.to_string()),
             ("timestamp", id.to_string()),
-            ("name", reaction.to_string()),
+            ("name", "eyes".to_string()),
         ];
         match self.web.form(Token::Bot, "reactions.add", &p).await {
             Err(e) if e.to_string().contains("already_reacted") => Ok(()),

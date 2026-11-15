@@ -167,6 +167,9 @@ pub struct Msg {
     /// Only set by `recent`: the replies under a top-level message.
     #[serde(default)]
     pub reply_count: Option<u32>,
+    /// Only set by `recent`: the ID of the newest reply under a top-level message.
+    #[serde(default)]
+    pub latest_reply: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,19 +192,16 @@ pub enum SurfaceEvent {
     Connected,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PostRequest {
     pub conversation: String,
     pub thread: Option<String>,
     pub text: String,
-    /// One button: its action name and label. Only the loop limit's Continue uses it.
-    pub button: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Posted {
     pub id: String,
-    pub link: String,
 }
 
 #[derive(Debug, Clone)]
