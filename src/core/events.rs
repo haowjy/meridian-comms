@@ -8,11 +8,11 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use futures_util::future::join_all;
 
-use super::deliver::{Incoming, Pick};
+use super::deliver::Incoming;
 use super::{Core, ThreadKey};
 use crate::config::AgentMark;
 use crate::model::{Action, ListRequest, Msg, PostRequest, SurfaceEvent};
-use crate::state::{Pending, ThreadState};
+use crate::state::{Pick, ThreadState};
 
 /// The loop limit: this many messages in a row that woke someone and may be
 /// from agents pause the thread.
@@ -207,16 +207,6 @@ impl Core {
         if all {
             st.scope.remove(&owner);
         }
-        if st.paused {
-            // The choice stands; the message waits for Continue.
-            st.scope.extend(chosen);
-            st.pending = Some(Pending {
-                message: m.id.clone(),
-                person: owner,
-            });
-            st.mark_handled(&m.id);
-            return self.store.save_thread(&st);
-        }
         if !agent_like {
             st.streak = 0;
         }
@@ -226,9 +216,12 @@ impl Core {
         } else {
             chosen.into_iter().map(|(p, refs)| (p, Pick::Refs(refs))).collect()
         };
+        let was_paused = st.paused;
         let out = self.deliver(&mut st, &picks, &listing, &inc, None, agent_like).await;
 
-        if out.woken.is_empty() {
+        if was_paused {
+            // The message waits for Continue; the pause notice already said so.
+        } else if out.woken.is_empty() {
             // The picker on a thread's first message; after that, once per run of
             // waiting messages, so a conversation nobody was woken for stays quiet.
             if first || !prior_pending {
@@ -304,18 +297,17 @@ impl Core {
                     link: self.surface.link(&a.conversation, &msg.id, &a.thread),
                 };
                 let project = self.cfg.channel(&a.conversation).and_then(|c| c.project.clone());
-                let refs = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
-                let listing = self
-                    .list(&ListRequest {
-                        person: Some(p.person.clone()),
-                        project: project.clone(),
-                        refs,
-                    })
-                    .await;
-                let picks = [(p.person.clone(), Pick::Rule)];
+                let persons: Vec<String> = p.picks.keys().cloned().collect();
+                let mut refs: Vec<String> = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
+                refs.extend(p.picks.values().flat_map(|k| match k {
+                    Pick::Refs(r) => r.clone(),
+                    Pick::Rule => vec![],
+                }));
+                let listing = self.list_for(&persons, project.clone(), refs).await;
+                let picks: Vec<(String, Pick)> = p.picks.into_iter().collect();
                 let out = self.deliver(&mut st, &picks, &listing, &inc, None, false).await;
                 if out.woken.is_empty() {
-                    let text = self.explain(&p.person, project.as_deref(), &listing, &[], &out.left_out, false);
+                    let text = self.explain(&persons[0], project.as_deref(), &listing, &[], &out.left_out, false);
                     self.say(&a.conversation, &a.thread, text).await;
                 } else if let Err(e) = self.surface.acknowledge(&a.conversation, &p.message).await {
                     tracing::warn!("acknowledging {} failed: {e:#}", p.message);

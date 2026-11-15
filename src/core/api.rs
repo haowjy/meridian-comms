@@ -3,12 +3,12 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use super::deliver::{Author, Incoming, Pick};
+use super::deliver::{Author, Incoming};
 use super::{Core, Listing};
 use crate::config::Channel;
 use crate::model::{CallerKind, IdentifyResult, ListRequest, Msg, PostRequest};
 use crate::proto::{ListOut, MessageOut, PersonOut, ReadOut, SendOut, Target, WaitingOut};
-use crate::state::ThreadState;
+use crate::state::{Pick, ThreadState};
 
 /// The caller after `identify`: a session, or the owner at a terminal.
 pub struct Who {
@@ -143,8 +143,6 @@ impl Core {
         if text.is_none() && to.is_empty() {
             bail!("nothing to send: give --message (or stdin), or --to to wake someone about an existing message");
         }
-        let owner = self.cfg.owner.clone();
-
         // Resolve where it goes.
         let (conv, ch, requested): (String, &Channel, Option<Msg>) = match &target {
             Target::Channel(name) => {
@@ -210,23 +208,7 @@ impl Core {
                 .chain(&words)
                 .cloned()
                 .collect();
-            listing = self
-                .list(&ListRequest {
-                    person: Some(owner.clone()),
-                    project: project.clone(),
-                    refs,
-                })
-                .await;
-            for p in persons.iter().filter(|p| **p != owner) {
-                listing.absorb(
-                    self.list(&ListRequest {
-                        person: Some(p.clone()),
-                        project: project.clone(),
-                        refs: vec![],
-                    })
-                    .await,
-                );
-            }
+            listing = self.list_for(&persons, project.clone(), refs).await;
             for w in &words {
                 if listing.resolve(w).is_none() {
                     bail!(
@@ -357,11 +339,12 @@ impl Core {
             .into_iter()
             .filter_map(|st| {
                 let p = st.pending?;
+                let person = p.picks.contains_key(&who.person).then(|| who.person.clone())?;
                 let ch = self.cfg.channel(&st.conversation)?;
                 let mine = project.as_ref().is_none_or(|pr| ch.project.as_ref().is_none_or(|cp| cp == pr));
-                (mine && p.person == who.person).then(|| WaitingOut {
+                mine.then(|| WaitingOut {
                     message: self.message_ref(&st.conversation, &p.message),
-                    person: p.person,
+                    person,
                     time: ts_secs(&p.message),
                 })
             })

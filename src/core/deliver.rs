@@ -5,7 +5,7 @@ use futures_util::future::join_all;
 
 use super::{Core, Listing, text};
 use crate::model::{Candidate, Notice, NoticeKind, WakeRequest, WakeResult};
-use crate::state::{Pending, ThreadState};
+use crate::state::{Pending, Pick, ThreadState};
 
 /// The message being delivered, as notices describe it. `text` and `link` are
 /// for a source that cannot run `read`.
@@ -20,12 +20,6 @@ pub struct Incoming {
 }
 
 pub type Plan = Vec<(usize, Candidate)>;
-
-/// What to deliver to one person: the refs chosen, or whatever the rule picks.
-pub enum Pick {
-    Refs(Vec<String>),
-    Rule,
-}
 
 /// A session that speaks in the thread: it joins its person's scope.
 pub struct Author<'a> {
@@ -48,8 +42,9 @@ impl Core {
     /// refs were chosen (which replaces that person's scope) or that the rule
     /// runs. Each ref is woken once however many picks name it, the scope and
     /// `woken` record the ref each wake returned, and `pending` and `streak`
-    /// move the same way for every caller. The caller holds the thread's lock
-    /// and saves `st`.
+    /// move the same way for every caller. In a paused thread nothing is woken:
+    /// the choice still takes the scope and the message waits in `pending` with
+    /// its picks for Continue. The caller holds the thread's lock and saves `st`.
     pub(super) async fn deliver(
         &self,
         st: &mut ThreadState,
@@ -59,6 +54,7 @@ impl Core {
         author: Option<Author<'_>>,
         agent_like: bool,
     ) -> Outcome {
+        let paused = st.paused;
         let mut plan = Plan::new();
         let mut asked_by: Vec<(String, String)> = vec![]; // ref -> person
         let mut out = Outcome::default();
@@ -76,7 +72,7 @@ impl Core {
             }
         }
 
-        let results = self.wake_all(&plan, inc).await;
+        let results = if paused { vec![] } else { self.wake_all(&plan, inc).await };
         // The ref a wake returned can differ from the one asked (a source that
         // opens a new thread per wake).
         let mut returned: Vec<(String, String, String)> = vec![]; // person, asked, returned
@@ -127,8 +123,10 @@ impl Core {
                 scope.push(a.ref_.to_string());
             }
         }
-        for (person, prior) in &prior_woken {
-            self.release(st, inc, person, prior, listing).await;
+        if !paused {
+            for (person, prior) in &prior_woken {
+                self.release(st, inc, person, prior, listing).await;
+            }
         }
 
         if picks.is_empty() {
@@ -137,7 +135,7 @@ impl Core {
         if out.woken.is_empty() {
             st.pending = Some(Pending {
                 message: inc.id.clone(),
-                person: picks[0].0.clone(),
+                picks: picks.iter().cloned().collect(),
             });
         } else {
             st.pending = None;

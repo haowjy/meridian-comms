@@ -175,6 +175,29 @@ impl Core {
         l
     }
 
+    /// The owner's listing, plus each of `persons`' own sessions.
+    async fn list_for(&self, persons: &[String], project: Option<String>, refs: Vec<String>) -> Listing {
+        let owner = self.cfg.owner.clone();
+        let mut listing = self
+            .list(&ListRequest {
+                person: Some(owner.clone()),
+                project: project.clone(),
+                refs,
+            })
+            .await;
+        for p in persons.iter().filter(|p| **p != owner) {
+            listing.absorb(
+                self.list(&ListRequest {
+                    person: Some(p.clone()),
+                    project: project.clone(),
+                    refs: vec![],
+                })
+                .await,
+            );
+        }
+        listing
+    }
+
     async fn wake(&self, src: usize, req: &WakeRequest) -> WakeResult {
         let failed = |detail: String| WakeResult {
             woken: false,

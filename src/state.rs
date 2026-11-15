@@ -31,10 +31,42 @@ pub struct ThreadState {
     pub paused: bool,
 }
 
+/// What to deliver to one person: the refs chosen, or whatever the rule picks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Pick {
+    #[serde(rename = "rule")]
+    Rule,
+    #[serde(untagged)]
+    Refs(Vec<String>),
+}
+
+/// A message nobody was woken for, with what was asked for it. Replaying
+/// `picks` through delivery is how it is woken later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "PendingFile")]
 pub struct Pending {
     pub message: String,
-    pub person: String,
+    pub picks: BTreeMap<String, Pick>,
+}
+
+/// Builds before `picks` kept only the person, and always meant the rule.
+#[derive(Deserialize)]
+struct PendingFile {
+    message: String,
+    #[serde(default)]
+    picks: BTreeMap<String, Pick>,
+    #[serde(default)]
+    person: Option<String>,
+}
+
+impl From<PendingFile> for Pending {
+    fn from(f: PendingFile) -> Self {
+        let mut picks = f.picks;
+        if let Some(p) = f.person {
+            picks.entry(p).or_insert(Pick::Rule);
+        }
+        Pending { message: f.message, picks }
+    }
 }
 
 impl ThreadState {
