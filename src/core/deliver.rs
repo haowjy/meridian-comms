@@ -169,6 +169,7 @@ impl Core {
             });
         } else {
             st.pending = None;
+            st.explained = false;
             if agent_like {
                 st.streak += 1;
                 self.pause_if_needed(st).await;

@@ -25,6 +25,10 @@ pub struct ThreadState {
     pub woken: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub pending: Option<Pending>,
+    /// The bot has posted why nobody was woken, and nothing has woken anyone
+    /// since: the next message that wakes nobody is not explained again.
+    #[serde(default)]
+    pub explained: bool,
     #[serde(default)]
     pub streak: u32,
     #[serde(default)]

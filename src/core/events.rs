@@ -166,7 +166,6 @@ impl Core {
                 refs,
             })
             .await;
-        let prior_pending = st.pending.is_some();
 
         // A choice: replace the scope of each person whose refs are named.
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -236,7 +235,8 @@ impl Core {
         } else if out.woken.is_empty() {
             // The picker on a thread's first message; after that, once per run of
             // waiting messages, so a conversation nobody was woken for stays quiet.
-            if first || !prior_pending {
+            if first || !st.explained {
+                st.explained = true;
                 let text = self.explain(&owner, project.as_deref(), &listing, &[], &out.left_out, first);
                 self.say(&m.conversation, &m.thread, text).await;
             }
@@ -331,6 +331,7 @@ impl Core {
                     )
                     .await;
                 if out.woken.is_empty() {
+                    st.explained = true;
                     let text = self.explain(&persons[0], project.as_deref(), &listing, &[], &out.left_out, false);
                     self.say(&a.conversation, &a.thread, text).await;
                 } else if let Err(e) = self.surface.acknowledge(&a.conversation, &p.message).await {
