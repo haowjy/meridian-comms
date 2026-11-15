@@ -305,6 +305,7 @@ impl Core {
             ref_: r,
             person: &who.person,
         });
+        let was_paused = st.paused;
         let out = self.deliver(&mut st, &picks, &listing, &inc, author, true).await;
         self.store.save_thread(&st)?;
 
@@ -319,7 +320,7 @@ impl Core {
             posted: text.is_some(),
             woken: out.woken,
             not_woken,
-            paused: st.paused,
+            paused: st.paused && !was_paused,
         })
     }
 
