@@ -1,0 +1,171 @@
+//! The core: thread state, the wake rule, the loop limit, recovery and the
+//! client's requests. It knows no tool's vocabulary: sources and the surface
+//! come in behind traits.
+
+mod api;
+mod cursor;
+mod deliver;
+mod events;
+mod text;
+
+pub use text::candidate_line;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use futures_util::future::join_all;
+use tokio::sync::{OwnedMutexGuard, mpsc};
+
+use crate::config::Config;
+use crate::model::{Candidate, ListRequest, SurfaceEvent, WakeRequest, WakeResult};
+use crate::source::Source;
+use crate::state::Store;
+use crate::surface::Surface;
+use cursor::Cursor;
+use events::Job;
+
+const LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const WAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+type ThreadKey = (String, String);
+
+pub struct Core {
+    cfg: Config,
+    surface: Arc<dyn Surface>,
+    sources: Vec<Arc<dyn Source>>,
+    store: Store,
+    /// The bot's own sender ID: its posts are never handled.
+    bot: String,
+    locks: Mutex<HashMap<ThreadKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// One worker per thread with events waiting, so a thread's events are
+    /// handled in the order they arrived while other threads go on.
+    queues: Mutex<HashMap<ThreadKey, mpsc::UnboundedSender<Job>>>,
+    cursor: Cursor,
+}
+
+/// What the sources answered, with the index of the source that listed each candidate.
+#[derive(Default)]
+pub struct Listing {
+    pub candidates: Vec<(usize, Candidate)>,
+    pub unreachable: Vec<String>,
+}
+
+impl Listing {
+    fn merge(&mut self, src: usize, r: crate::model::ListResponse) {
+        for c in r.candidates {
+            if !self.candidates.iter().any(|(_, o)| o.ref_ == c.ref_) {
+                self.candidates.push((src, c));
+            }
+        }
+        self.unreachable.extend(r.unreachable);
+    }
+
+    fn find(&self, ref_: &str) -> Option<&(usize, Candidate)> {
+        self.candidates.iter().find(|(_, c)| c.ref_ == ref_)
+    }
+
+    pub fn for_person<'a>(&'a self, person: &'a str) -> impl Iterator<Item = &'a (usize, Candidate)> {
+        self.candidates.iter().filter(move |(_, c)| c.person == person)
+    }
+
+    /// A `to:` or `--to` word: a ref, or a short ID that exactly one candidate has.
+    pub fn resolve(&self, word: &str) -> Option<&(usize, Candidate)> {
+        if let Some(c) = self.find(word) {
+            return Some(c);
+        }
+        let mut by_id = self.candidates.iter().filter(|(_, c)| c.id.as_deref() == Some(word));
+        match (by_id.next(), by_id.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+impl Core {
+    pub fn new(cfg: Config, surface: Arc<dyn Surface>, sources: Vec<Arc<dyn Source>>, store: Store, bot: String) -> Arc<Core> {
+        let cursor = Cursor::new(store.load_cursor());
+        Arc::new(Core {
+            cfg,
+            surface,
+            sources,
+            store,
+            bot,
+            locks: Mutex::default(),
+            queues: Mutex::default(),
+            cursor,
+        })
+    }
+
+    /// Runs until the surface's event channel closes.
+    pub async fn run(self: &Arc<Self>, mut events: mpsc::Receiver<SurfaceEvent>) {
+        while let Some(ev) = events.recv().await {
+            self.on_event(ev).await;
+        }
+    }
+
+    pub async fn lock(&self, conversation: &str, thread: &str) -> OwnedMutexGuard<()> {
+        let m = self
+            .locks
+            .lock()
+            .unwrap()
+            .entry((conversation.to_string(), thread.to_string()))
+            .or_default()
+            .clone();
+        m.lock_owned().await
+    }
+
+    /// Asks every source, side by side. A source that fails or times out
+    /// counts as returning nothing.
+    async fn list(&self, req: &ListRequest) -> Listing {
+        let answers = join_all(self.sources.iter().enumerate().map(|(i, s)| async move {
+            match tokio::time::timeout(LIST_TIMEOUT, s.list(req)).await {
+                Ok(Ok(r)) => (i, r),
+                Ok(Err(e)) => {
+                    tracing::warn!("{} list failed: {e:#}", s.name());
+                    (i, Default::default())
+                }
+                Err(_) => {
+                    tracing::warn!("{} list timed out", s.name());
+                    (i, Default::default())
+                }
+            }
+        }))
+        .await;
+        let mut l = Listing::default();
+        for (i, r) in answers {
+            l.merge(i, r);
+        }
+        l
+    }
+
+    async fn wake(&self, src: usize, req: &WakeRequest) -> WakeResult {
+        let failed = |detail: String| WakeResult {
+            woken: false,
+            ref_: req.ref_.clone(),
+            detail,
+        };
+        match tokio::time::timeout(WAKE_TIMEOUT, self.sources[src].wake(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => failed(format!("{e:#}")),
+            Err(_) => failed("timed out".into()),
+        }
+    }
+
+    /// `channel-name/ts`: how a message is named to sessions.
+    fn message_ref(&self, conversation: &str, id: &str) -> String {
+        let name = self.cfg.channel(conversation).map(|c| c.name.as_str()).unwrap_or(conversation);
+        format!("{name}/{id}")
+    }
+
+    fn parse_message_ref(&self, r: &str) -> Result<(String, String)> {
+        let Some((name, id)) = r.split_once('/') else {
+            bail!("{r:?} is not a message ref: expected <channel>/<id>")
+        };
+        let Some((conv, _)) = self.cfg.channel_by_name(name) else {
+            bail!("no configured channel is named {name:?}")
+        };
+        Ok((conv.clone(), id.to_string()))
+    }
+}

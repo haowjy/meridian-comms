@@ -1,0 +1,25 @@
+/target/
+
+# Secrets: tokens never enter the repo
+.env
+.env.*
+*.env
+slack.env
+key
+
+# Local state and scratch
+/state/
+/tmp/
+*.log
+
+# Harness and agent-tool folders (generated locally)
+.claude/
+.codex/
+.cursor/
+.opencode/
+.pi/
+.agents/
+.meridian/
+.mars/
+
+.DS_Store
