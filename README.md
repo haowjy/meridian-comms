@@ -43,7 +43,7 @@ meridian-comms setup                               print the Slack app manifest
 2. Create the Slack app: [docs/slack-setup.md](docs/slack-setup.md).
 3. Write `~/.config/meridian-comms/config.toml` (mode 0600): the owner, the channels, the
    people, and the Meridian projects. The fields are in [docs/design.md](docs/design.md).
-4. Run `meridian-comms daemon` outside any agent session, as a systemd or launchd user
-   service.
+4. Run `meridian-comms daemon` outside any agent session, as a user service:
+   [docs/service.md](docs/service.md).
 
 How it works and why: [docs/design.md](docs/design.md).
