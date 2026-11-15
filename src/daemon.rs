@@ -19,7 +19,6 @@ use crate::state::Store;
 use crate::surface::{Surface, slack::Slack};
 
 const MAX_REQUEST: u64 = 4 << 20;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub fn sources(cfg: &Config) -> Result<Vec<Arc<dyn Source>>> {
     let mut out: Vec<Arc<dyn Source>> = vec![];
@@ -122,13 +121,16 @@ async fn connection(core: Arc<Core>, conn: UnixStream) -> Result<()> {
     BufReader::new(rd.take(MAX_REQUEST)).read_line(&mut line).await?;
     let reply = match serde_json::from_str::<Request>(&line) {
         Err(e) => error(format!("bad request: {e}")),
-        Ok(req) => match tokio::time::timeout(REQUEST_TIMEOUT, handle(&core, req)).await {
+        // The request runs to the end in its own task, whether or not the client
+        // is still waiting: a `send` that has posted must finish its wakes and
+        // write its thread file.
+        Ok(req) => match tokio::spawn(async move { handle(&core, req).await }).await {
             Ok(Ok(v)) => Reply {
                 error: None,
                 result: Some(v),
             },
             Ok(Err(e)) => error(format!("{e:#}")),
-            Err(_) => error("the daemon took too long".into()),
+            Err(e) => error(format!("the request failed inside the daemon: {e}")),
         },
     };
     wr.write_all(serde_json::to_string(&reply)?.as_bytes()).await?;

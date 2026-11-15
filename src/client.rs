@@ -15,6 +15,8 @@ use crate::model::{CallerKind, IdentifyRequest, IdentifyResult};
 use crate::paths;
 use crate::proto::{ListOut, ReadOut, Reply, Request, SendOut, Target};
 
+const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Who is calling: the first source that claims the environment, else the
 /// owner at a terminal. A session never falls through to the owner.
 fn identify() -> Result<IdentifyResult> {
@@ -52,7 +54,15 @@ async fn call<T: DeserializeOwned>(req: &Request) -> Result<T> {
     wr.write_all(serde_json::to_string(req)?.as_bytes()).await?;
     wr.write_all(b"\n").await?;
     let mut line = String::new();
-    BufReader::new(rd).read_line(&mut line).await?;
+    // Only this side gives up: the daemon finishes the request either way.
+    tokio::time::timeout(ANSWER_TIMEOUT, BufReader::new(rd).read_line(&mut line))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no answer from the daemon after {} s. It may still finish the request: `meridian-comms read` shows whether the message was posted before you send again",
+                ANSWER_TIMEOUT.as_secs()
+            )
+        })??;
     if line.is_empty() {
         bail!("the daemon closed the connection without answering");
     }
@@ -161,7 +171,7 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
             println!("Not woken: {l}");
         }
         if out.paused {
-            println!("The thread is now paused: a person presses Continue in Slack to go on.");
+            println!("The thread is now paused: a person presses Continue on the thread to go on.");
         }
         if let Some(r) = &out.retry {
             println!("To retry the wake: {r}");
