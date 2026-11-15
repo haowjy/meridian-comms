@@ -42,7 +42,13 @@ candidates (one `list` per event) and takes:
   so a new thread wakes nobody;
 - of those, every one that is not **cold** (idle, with a `warm_until` that has passed).
 
-Each one woken gets a notice naming the others. When nobody is woken the message
+All three ways in (a message in a thread, `send`, the Continue click) go through one
+function, `deliver` in `src/core/deliver.rs`. It takes, per person, either the refs chosen
+or "run the rule"; wakes each ref once however many picks name it; records the ref each
+wake *returned* (a source may open a new thread per wake) in `scope` and `woken`; and
+sets `pending` and `streak`. Each one woken gets a notice naming the others, and
+carrying the message text and a link for a source that cannot run `read` (the Meridian
+source leaves the text out of its line). When nobody is woken the message
 becomes `pending`, shown by `meridian-comms list`, and the bot says in the thread who
 was skipped and why. On a thread's first message that post is the picker: who is
 running, with model and activity.
@@ -51,7 +57,8 @@ running, with model and activity.
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
 one listed candidate has it. A choice replaces the scope of the person whose refs it
 names; sessions woken before and no longer in the scope get one "now with" notice.
-A session that `send`s in a thread joins its person's scope.
+A session that `send`s in a thread joins its person's scope, and a choice never drops
+the sender from it.
 
 **Wakes cost money:** a wake is a paid turn, and a cold session re-reads its whole
 context. Nothing wakes by guessing, and a message nobody was woken for waits until
@@ -70,20 +77,28 @@ no typed `continue`: an agent posting under a person's name could type it.
 
 One JSON file per thread in `~/.local/state/meridian-comms/threads/`, written whole
 (temp file, fsync, rename, fsync of the directory) by the daemon alone, under one lock
-per thread. A thread's events run in arrival order. Wakes happen before the write, so
-a crash repeats a notice and never loses one. `handled` holds the last 50 message IDs,
+per thread. A thread's events run in arrival order. A `send` that opens a thread takes
+its lock and writes its file as soon as Slack returns the post, before it wakes, so a
+reply that arrives mid-wake waits its turn and finds the scope. Wakes happen before
+the final write, so a crash repeats a notice and never loses one. `handled` holds the last 50 message IDs,
 so a redelivery is dropped.
 
 A thread file that does not parse is moved to `*.corrupt-<time>` and the thread is
-treated as new. That cannot wake anyone, since a thread with no scope wakes only
-defaults. It loses the scope, the waiting message and `handled`, and a reply without
-the mention in that thread is ignored from then on; the log names the moved file.
+treated as new. It loses the scope, the waiting message and `handled`; a reply without
+the mention is ignored from then on, and with a `default` configured a redelivered first
+message wakes it again. The log names the moved file. Only "not found" means a new
+thread: any other read error keeps the event in flight, so an intact file is never
+replaced.
 
-`cursor.json` holds per channel an ID below which every event was handled. It never
-moves past an event still in flight, and it stops while recovery is failing. On start
-and on every reconnect the daemon reads each channel's history after the cursor and
-the replies of each thread that is new or changed in the last 7 days, and handles what
-`handled` lacks. A channel's first run starts at now.
+`cursor.json` holds per channel an ID below which every event was handled. Saves happen
+under the cursor's mutex, each with its own temp file name. It never moves past an
+event still in flight, and a channel's position stops while that channel's recovery is
+failing. On start and on every reconnect each channel recovers on its own: one
+`conversations.history` call for the last 7 days (or back to the cursor, if older), then
+the replies, after the cursor, of the threads whose `latest_reply` is past it. What
+`handled` already has is dropped. A channel that fails is logged once and retried every
+30 s while the others go on. An event whose handling errors stays in flight and is
+handled again at the next recovery. A channel's first run starts at now.
 
 ## Slack
 
@@ -104,13 +119,22 @@ not in the config is refused; a process with no Meridian variables is the owner 
 terminal. Requests go over a Unix socket (mode 0600, peer uid checked) as one JSON
 object each way (`src/proto.rs`). A session reads the channels of its own project and
 those with no project. A channel with no project needs `post = true` before sessions
-may open threads there. `send` waits for the post and the wakes, and exits non-zero
-with a retry command when a wake failed.
+may open threads there. `send` waits for the post and the wakes. A cold session the rule skips is reported and
+is not a failure; the command exits non-zero, with a retry line naming only the refs
+whose wake errored. A request runs to the end in its own task in the daemon whether or
+not the client is still waiting (the client gives up after 300 s and says the daemon
+may still finish). The socket is `/run/user/<uid>/meridian-comms.sock` where that
+directory exists, whatever `XDG_RUNTIME_DIR` the caller has, so a session started
+without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed, and uses only `meridian -C <root> spawn list --primary --json --limit 200`
 and `spawn message`. Rows may carry `agent`, `work_id` and an `idle` object; their
-absence means activity is unknown, never cold.
+absence means activity is unknown, never cold. `idle` means "since the last user-loop
+turn ended": a Claude primary running a turn that something injected (a wake, a task
+notification) keeps its old `since`, so an `idle` row may be working, and a candidate
+that looks cold may be mid-turn. The row has no `waiting_on_user`, and the source never
+reports "waiting".
 
 ## Not built yet
 
