@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use futures_util::future::join_all;
 
-use super::deliver::Incoming;
+use super::deliver::{How, Incoming};
 use super::{Core, ThreadKey};
 use crate::config::AgentMark;
 use crate::model::{Action, ListRequest, Msg, PostRequest, SurfaceEvent};
@@ -217,7 +217,19 @@ impl Core {
             chosen.into_iter().map(|(p, refs)| (p, Pick::Refs(refs))).collect()
         };
         let was_paused = st.paused;
-        let out = self.deliver(&mut st, &picks, &listing, &inc, None, agent_like).await;
+        let out = self
+            .deliver(
+                &mut st,
+                &picks,
+                &listing,
+                &inc,
+                How {
+                    author: None,
+                    agent_like,
+                    pointer: false,
+                },
+            )
+            .await;
 
         if was_paused {
             // The message waits for Continue; the pause notice already said so.
@@ -305,7 +317,19 @@ impl Core {
                 }));
                 let listing = self.list_for(&persons, project.clone(), refs).await;
                 let picks: Vec<(String, Pick)> = p.picks.into_iter().collect();
-                let out = self.deliver(&mut st, &picks, &listing, &inc, None, false).await;
+                let out = self
+                    .deliver(
+                        &mut st,
+                        &picks,
+                        &listing,
+                        &inc,
+                        How {
+                            author: None,
+                            agent_like: false,
+                            pointer: false,
+                        },
+                    )
+                    .await;
                 if out.woken.is_empty() {
                     let text = self.explain(&persons[0], project.as_deref(), &listing, &[], &out.left_out, false);
                     self.say(&a.conversation, &a.thread, text).await;

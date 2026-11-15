@@ -27,6 +27,16 @@ pub struct Author<'a> {
     pub person: &'a str,
 }
 
+/// What kind of delivery this is.
+pub struct How<'a> {
+    pub author: Option<Author<'a>>,
+    /// The message may be from an agent: a wake counts toward the loop limit.
+    pub agent_like: bool,
+    /// A `send --to` with no text points at an existing message: the refs it
+    /// wakes join the scope and nobody is released.
+    pub pointer: bool,
+}
+
 #[derive(Default)]
 pub struct Outcome {
     /// Refs as the wakes returned them.
@@ -51,9 +61,13 @@ impl Core {
         picks: &[(String, Pick)],
         listing: &Listing,
         inc: &Incoming,
-        author: Option<Author<'_>>,
-        agent_like: bool,
+        how: How<'_>,
     ) -> Outcome {
+        let How {
+            author,
+            agent_like,
+            pointer,
+        } = how;
         let paused = st.paused;
         let mut plan = Plan::new();
         let mut asked_by: Vec<(String, String)> = vec![]; // ref -> person
@@ -90,8 +104,11 @@ impl Core {
         let mut prior_woken: Vec<(String, Vec<String>)> = vec![];
         for (person, pick) in picks {
             let mine = returned.iter().filter(|(p, ..)| p == person);
+            let mut woken: Vec<String> = mine.clone().map(|(.., ret)| ret.clone()).collect();
             if let Pick::Refs(refs) = pick {
-                prior_woken.push((person.clone(), st.woken_of(person).to_vec()));
+                if !pointer {
+                    prior_woken.push((person.clone(), st.woken_of(person).to_vec()));
+                }
                 let mut scope: Vec<String> = vec![];
                 for r in refs {
                     let r = returned
@@ -102,7 +119,21 @@ impl Core {
                         scope.push(r.clone());
                     }
                 }
-                st.scope.insert(person.clone(), scope);
+                if pointer {
+                    let have = st.scope.entry(person.clone()).or_default();
+                    for r in scope {
+                        if !have.contains(&r) {
+                            have.push(r);
+                        }
+                    }
+                    for r in st.woken_of(person) {
+                        if !woken.contains(r) {
+                            woken.push(r.clone());
+                        }
+                    }
+                } else {
+                    st.scope.insert(person.clone(), scope);
+                }
             } else {
                 for (_, asked, ret) in mine.clone().filter(|(_, a, r)| a != r) {
                     let scope = st.scope.entry(person.clone()).or_default();
@@ -112,7 +143,6 @@ impl Core {
                     }
                 }
             }
-            let woken: Vec<String> = mine.map(|(.., ret)| ret.clone()).collect();
             if !woken.is_empty() {
                 st.woken.insert(person.clone(), woken);
             }

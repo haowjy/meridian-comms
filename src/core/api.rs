@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use super::deliver::{Author, Incoming};
+use super::deliver::{Author, How, Incoming};
 use super::{Core, Listing};
 use crate::config::Channel;
 use crate::model::{CallerKind, IdentifyResult, ListRequest, Msg, PostRequest};
@@ -288,7 +288,12 @@ impl Core {
             person: &who.person,
         });
         let was_paused = st.paused;
-        let out = self.deliver(&mut st, &picks, &listing, &inc, author, true).await;
+        let how = How {
+            author,
+            agent_like: true,
+            pointer: text.is_none(),
+        };
+        let out = self.deliver(&mut st, &picks, &listing, &inc, how).await;
         self.store.save_thread(&st)?;
 
         let mut not_woken = out.left_out;
