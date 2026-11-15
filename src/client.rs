@@ -93,11 +93,10 @@ pub async fn read(message: Option<String>, channel: Option<String>, limit: Optio
     }
     match &out.thread {
         Some(root) => {
-            println!(
-                "Thread {root} in #{}, as requested by {}.",
-                out.channel,
-                out.requested.as_deref().unwrap_or(root)
-            );
+            println!("Thread {root} in #{}.", out.channel);
+            if let Some(r) = out.requested.as_ref().filter(|r| *r != root) {
+                println!("You asked for the reply {r}; the whole thread is below.");
+            }
             if out.omitted > 0 {
                 println!(
                     "({} messages between the first and the latest are left out; use --limit to see more.)",

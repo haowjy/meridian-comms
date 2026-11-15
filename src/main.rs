@@ -16,10 +16,9 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "meridian-comms",
     version,
-    about = "Hand work to other people's agents in Slack, and answer in the same thread.",
-    long_about = "Hand work to other people's agents in a shared Slack channel, and answer in the same thread.\n\n\
-A notice tells you a Slack message is waiting. Run `read <message-ref>` to fetch it, \
-then `send <message-ref> --message TEXT` to answer. A post wakes nobody unless you add `--to`."
+    about = "Hand work to other people's agents in a shared Slack channel, and answer in the same thread.\n\n\
+A notice says a Slack message is waiting: run `read <message-ref>` to fetch it, then \
+`send <message-ref> --message TEXT` to answer. A post wakes nobody unless you add `--to`."
 )]
 struct Cli {
     #[command(subcommand)]
