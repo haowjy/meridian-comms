@@ -295,20 +295,25 @@ impl Meridian {
             )
             .await;
             let shown = run(Some(&dir), &["spawn", "show", id, "--json", "--full", "--no-observe"]).await?;
-            let shown: Value = serde_json::from_slice(&shown.stdout).with_context(|| format!("cannot read the second step {id}"))?;
-            match shown["status"].as_str().unwrap_or("unknown") {
+            let shown: Value = serde_json::from_slice(&shown.stdout).unwrap_or_default();
+            let status = shown["status"].as_str().unwrap_or("unreadable");
+            let why = match status {
                 "succeeded" => {
                     let known: BTreeMap<&str, &str> = sessions(req).map(|(id, c)| (id, c.ref_.as_str())).collect();
                     return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known));
                 }
-                status @ ("failed" | "cancelled" | "timed_out") => bail!("the second step ended {status}"),
+                "failed" | "cancelled" | "timed_out" => bail!("the second step ended {status}"),
                 // Still going: a wait that failed early says nothing about the spawn.
-                _ if Instant::now() < give_up => tokio::time::sleep(WAIT_AGAIN).await,
-                status => {
-                    let _ = run(Some(&dir), &["spawn", "cancel", id]).await;
-                    bail!("the second step was still {status} past its {LIMIT}-minute limit, and was cancelled");
+                "queued" | "running" | "finalizing" if Instant::now() < give_up => {
+                    tokio::time::sleep(WAIT_AGAIN).await;
+                    continue;
                 }
-            }
+                "queued" | "running" | "finalizing" => format!("was still {status} past its {LIMIT}-minute limit"),
+                // Nothing to wait for: this build can't tell when it would end.
+                _ => format!("has a status this build does not know ({status})"),
+            };
+            let _ = run(Some(&dir), &["spawn", "cancel", id]).await;
+            bail!("the second step {why}, and was cancelled");
         }
     }
 }
