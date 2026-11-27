@@ -424,7 +424,7 @@ without it finds the same path as the daemon.
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
 `spawn message` and, at start, `context --json`. For the machine it runs in the home
-directory with no `-C`: `machine name` (once, at start), `spawn list --global --primary --json`,
+directory with no `-C`: `machine name --json` (once, at start), `spawn list --global --primary --json`,
 `message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
 item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it
 adds `machine list --json` and `--machine <name>` on that listing and that `spawn show`. The second step adds `work show` in a
@@ -439,20 +439,22 @@ source never reports "waiting".
 
 ## Saved machines
 
-A ref is `machine/project/spawn-id`. The machine is the name Meridian gives this one
-(`meridian machine name`), asked once when the daemon starts and kept for its life, so a
-`meridian machine rename` while it runs changes no ref and stops no wake. Where
-Meridian's `machine` command exists and can't give the name, the daemon does not start
-and says why. On a Meridian before 0.28 the name is the config's `machine`. Only the
-daemon composes refs: the client reports the project and spawn ID it reads from its
-environment.
+A ref is `machine/project/spawn-id`. The machine is the name Meridian gives this one.
+`meridian machine name --json` is asked once when the daemon starts, for the name, the
+machine's ID and the names it had before (`was`), and the name is kept for the daemon's
+life, so a `meridian machine rename` while it runs changes no ref and stops no wake.
+Where Meridian's `machine` command exists and can't answer, the daemon does not start
+and says why. A build whose `machine name` has no `--json` gives the name alone, and on
+a Meridian before 0.28 the name is the config's `machine`. Only the daemon composes
+refs: the client reports the project and spawn ID it reads from its environment.
 
-The daemon records what its refs start with in `ref-starts.json` in its state
-directory. At a start where the name differs from the record, it rewrites the refs in
-its thread files (`scope`, `woken` and `pending`) from the recorded name to the new one
-and then writes the record: a thread keeps the sessions it chose through a rename. With
-no record yet, the old name is the config's `machine`, which is what refs started with
-before the record existed.
+At each start the daemon rewrites the refs in its thread files (`scope`, `woken` and
+`pending`) that start with a name this machine no longer has, so a thread keeps the
+sessions it chose through a rename. The old names are every name in `was`, the config's
+`machine`, and the start recorded in `ref-starts.json` in the state directory, which is
+written after the rewrite. `was` covers a rename while the daemon was stopped, and
+threads a killed daemon left at an older name. The record covers what Meridian can't
+tell: a rename on a build without `--json`, and a config `machine` that was changed.
 
 For an offer the Meridian source also lists the primaries of every machine Meridian has
 saved (`meridian machine list`): one `spawn list --global --primary --json --machine M`

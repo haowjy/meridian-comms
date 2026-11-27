@@ -38,9 +38,11 @@ pub struct Meridian {
     /// the config's `machine` until `check` asks Meridian for its own name.
     /// A rename in Meridian while the daemon runs changes nothing here.
     machine: String,
-    /// The config's `machine`: what refs started with before the daemon kept
-    /// a record of it.
+    /// The config's `machine`: what refs started with before Meridian named
+    /// its machines.
     configured: String,
+    /// The names Meridian says this machine had before.
+    was: Vec<String>,
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
@@ -133,6 +135,7 @@ impl Meridian {
         Ok(Self {
             machine: cfg.machine().to_string(),
             configured: cfg.machine().to_string(),
+            was: vec![],
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
@@ -626,15 +629,20 @@ impl Source for Meridian {
         // guess: its refs would match nothing Meridian or another start wrote.
         self.machines = has_command("machine").await?;
         if self.machines {
-            let asked = "`meridian machine name`, which every session's ref starts with,";
-            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name"]))
+            let asked = "`meridian machine name --json`, which every session's ref starts with,";
+            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name", "--json"]))
                 .await
                 .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // `{"name", "id", "was"}`; a build from before that prints the name alone.
+            let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let told: Value = serde_json::from_str(&printed).unwrap_or_default();
+            let name = field(&told["name"]).unwrap_or(printed);
             if !out.status.success() || !is_id(&name) {
                 bail!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
             }
             self.machine = name;
+            let was = told["was"].as_array().into_iter().flatten();
+            self.was = was.filter_map(field).filter(|n| is_id(n)).collect();
         }
         // An older Meridian has no `inbox` command: say so once, here, instead
         // of failing a command for every message.
@@ -648,9 +656,10 @@ impl Source for Meridian {
     }
 
     fn ref_start(&self) -> Option<RefStart> {
+        let start = |name: &String| format!("{name}/");
         Some(RefStart {
-            now: format!("{}/", self.machine),
-            unrecorded: format!("{}/", self.configured),
+            now: start(&self.machine),
+            earlier: self.was.iter().chain([&self.configured]).map(start).collect(),
         })
     }
 

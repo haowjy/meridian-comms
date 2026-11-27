@@ -219,18 +219,25 @@ impl Store {
     /// machine is renamed) and a thread keeps the sessions it chose. Run
     /// before any message is handled. Gives the threads changed.
     ///
-    /// The record is written last: a daemon killed part-way rewrites the rest
-    /// at its next start, and a ref already rewritten no longer matches.
+    /// A ref is rewritten from any start the source says it had and from the
+    /// recorded one: the record is what covers a source that can't say. It is
+    /// written last, so a daemon killed part-way rewrites the rest at its
+    /// next start, and a ref already rewritten no longer matches.
     pub fn settle_refs(&self, source: &str, start: &RefStart) -> Result<usize> {
         let path = self.dir.join("ref-starts.json");
         let mut recorded: BTreeMap<String, String> = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        let old = recorded.get(source).unwrap_or(&start.unrecorded);
-        let changed = match *old == start.now {
+        let old: Vec<&String> = start
+            .earlier
+            .iter()
+            .chain(recorded.get(source))
+            .filter(|o| **o != start.now)
+            .collect();
+        let changed = match old.is_empty() {
             true => 0,
-            false => self.rename_refs(old, &start.now)?,
+            false => self.rename_refs(&old, &start.now)?,
         };
         if recorded.get(source) != Some(&start.now) {
             recorded.insert(source.to_string(), start.now.clone());
@@ -239,7 +246,7 @@ impl Store {
         Ok(changed)
     }
 
-    fn rename_refs(&self, old: &str, new: &str) -> Result<usize> {
+    fn rename_refs(&self, old: &[&String], new: &str) -> Result<usize> {
         let mut changed = 0;
         for mut st in self.all_threads() {
             let before = serde_json::to_vec(&st)?;
@@ -252,7 +259,7 @@ impl Store {
                     Pick::Rule => None,
                 });
             for r in st.scope.values_mut().chain(st.woken.values_mut()).chain(picked).flatten() {
-                if let Some(rest) = r.strip_prefix(old) {
+                if let Some(rest) = old.iter().find_map(|o| r.strip_prefix(o.as_str())) {
                     *r = format!("{new}{rest}");
                 }
             }
