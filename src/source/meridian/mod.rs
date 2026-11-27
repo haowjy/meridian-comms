@@ -293,16 +293,18 @@ async fn has_command(name: &str) -> Result<bool> {
     Ok(out.status.success())
 }
 
-/// Whether a failed `spawn show` says the session does not exist. Meridian has
-/// said it three ways, on either stream: `{"error": "… not found"}`, the same
-/// with a top-level `"kind": "not_found"`, and through `--machine`
-/// `{"error": {"kind", "text"}}`, where the kind was `failed` with the far
-/// side's "not found" text before it became `not_found`. The text counts
-/// only under no kind or `failed`: an `unreachable` whose `ssh` found no
-/// command is not a missing session. An unknown machine reads as not found
-/// too, and such a machine lists no candidates.
-fn not_found(out: &std::process::Output) -> bool {
-    let said = |text: &Value| text.as_str().is_some_and(|t| t.contains("not found"));
+/// Whether a failed `spawn show` of `chat` says the session does not exist.
+/// Meridian has said it three ways, on either stream: `{"error": "Chat '…'
+/// not found"}`, the same with a top-level `"kind": "not_found"`, and through
+/// `--machine` `{"error": {"kind", "text"}}`, where the kind was `failed`
+/// with the far side's text before it became `not_found`. Under no kind or
+/// `failed` the text must name the chat: `failed` is also a far shell that
+/// found no `meridian`, which is a machine that could not be asked. An
+/// unknown machine reads as not found too, and such a machine lists no
+/// candidates.
+fn not_found(out: &std::process::Output, chat: &str) -> bool {
+    let missing = format!("'{chat}' not found");
+    let said = |text: &Value| text.as_str().is_some_and(|t| t.contains(&missing));
     [&out.stdout, &out.stderr]
         .into_iter()
         .flat_map(|stream| stream.split(|b| *b == b'\n'))
@@ -723,7 +725,7 @@ impl Source for Meridian {
                     let machine = machine.as_deref().unwrap_or(&self.machine);
                     from = field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}"));
                 }
-                None if not_found(&out) => {}
+                None if not_found(&out, &chat) => {}
                 None => bail!(
                     "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
                     tail(&out.stdout),
