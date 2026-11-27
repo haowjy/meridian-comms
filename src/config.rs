@@ -141,8 +141,9 @@ impl Config {
             self.machine = Some(host.split('.').next().unwrap_or("local").to_string());
         }
         let machine = self.machine();
-        if machine.is_empty() || machine.contains('/') {
-            bail!("machine name {machine:?} must be non-empty and contain no '/'");
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if machine.is_empty() || machine.len() > 64 || machine.starts_with('-') || !machine.chars().all(plain) {
+            bail!("machine name {machine:?} must be 1 to 64 characters from A-Z a-z 0-9 . _ - and not start with '-'");
         }
         if !self.people.contains_key(&self.owner) {
             bail!("owner {:?} has no [people.{}] entry", self.owner, self.owner);
