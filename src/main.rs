@@ -2,9 +2,11 @@ mod client;
 mod config;
 mod core;
 mod daemon;
+mod jev;
 mod model;
 mod paths;
 mod proto;
+mod routes;
 mod setup;
 mod source;
 mod state;
@@ -73,12 +75,51 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Hand a message waiting in an inbox to the daemon's router.
+    ///
+    /// Run as the hook for a new inbox message (for Meridian: an
+    /// `inbox.received` row whose command is `meridian-comms route`), it takes
+    /// the item from the hook's environment. It returns as soon as the daemon
+    /// has accepted the item; `routes` shows what the router then did. An item
+    /// routed once is not routed again.
+    Route {
+        /// The inbox item's ID, when not run as a hook.
+        item: Option<String>,
+    },
+    /// Print the routing log: per routed item, how the routing ended.
+    Routes {
+        /// Only the routings of this inbox item ID or thread message ref.
+        of: Option<String>,
+        /// Print JSON, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     #[command(hide = true)]
     Daemon,
-    #[command(hide = true)]
+    /// Print the Slack app manifest, or with `router` set up the router's second step.
     Setup {
+        /// The owner's name for the manifest, when there is no config yet.
         #[arg(long)]
         owner: Option<String>,
+        #[command(subcommand)]
+        what: Option<Setup>,
+    },
+}
+
+#[derive(Subcommand)]
+enum Setup {
+    /// Create the router directory and install the `inbox-router` agent there.
+    ///
+    /// The router's second step starts that agent, through Meridian, for a
+    /// message its model can't place from the session list alone. The
+    /// directory is a Meridian project of its own under the state directory.
+    /// Run this once on the daemon's machine, outside any agent session, and
+    /// again to update the agent. Without it the second step fails, the
+    /// routing log says so, and the message waits.
+    Router {
+        /// The package holding the agent, as `meridian mars add` takes it: owner/repo, a URL or a local path.
+        #[arg(long, default_value = source::meridian::router::PACKAGE)]
+        package: String,
     },
 }
 
@@ -106,8 +147,14 @@ async fn main() {
             json,
         } => client::send(message, channel, to, message_text, json).await,
         Command::List { project, json } => client::list(project, json).await,
+        Command::Route { item } => client::route(item).await,
+        Command::Routes { of, json } => client::routes(of, json),
         Command::Daemon => daemon::run().await,
-        Command::Setup { owner } => setup::run(owner),
+        Command::Setup { what: None, owner } => setup::run(owner),
+        Command::Setup {
+            what: Some(Setup::Router { package }),
+            ..
+        } => source::meridian::router::setup(&package).await,
     };
     if let Err(e) = result {
         eprintln!("meridian-comms: {e:#}");

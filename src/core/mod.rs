@@ -6,6 +6,8 @@ mod api;
 mod cursor;
 mod deliver;
 mod events;
+mod filing;
+mod route;
 mod text;
 
 pub use text::candidate_line;
@@ -19,7 +21,9 @@ use futures_util::future::join_all;
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::config::Config;
+use crate::jev::Jev;
 use crate::model::{Candidate, ListRequest, SurfaceEvent, WakeRequest, WakeResult};
+use crate::routes;
 use crate::source::Source;
 use crate::state::Store;
 use crate::surface::Surface;
@@ -47,6 +51,17 @@ pub struct Core {
     recovering: Mutex<BTreeSet<String>>,
     /// Messages (conversation, id) waiting for a source to answer, each with one retry loop.
     awaiting: Mutex<BTreeSet<ThreadKey>>,
+    /// The router's model. `None`: routing is off.
+    jev: Option<Jev>,
+    routes: routes::Log,
+    routing: Mutex<route::Routing>,
+    /// Held shared from before a message is filed until its thread file names
+    /// the item. Filing starts the route request for the item, which can
+    /// arrive before the source has answered with the item's ID; the router
+    /// takes this exclusively once before it looks for the item's thread.
+    filing: tokio::sync::RwLock<()>,
+    /// One second step at a time: each starts an agent.
+    second: tokio::sync::Semaphore,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -117,9 +132,18 @@ impl Listing {
 }
 
 impl Core {
-    pub fn new(cfg: Config, surface: Arc<dyn Surface>, sources: Vec<Arc<dyn Source>>, store: Store, bot: String) -> Arc<Core> {
+    pub fn new(
+        cfg: Config,
+        surface: Arc<dyn Surface>,
+        sources: Vec<Arc<dyn Source>>,
+        store: Store,
+        bot: String,
+        jev: Option<Jev>,
+        routes: routes::Log,
+    ) -> Result<Arc<Core>> {
         let cursor = Cursor::new(store.clone());
-        Arc::new(Core {
+        let routing = Mutex::new(route::Routing::resume(&routes.read()?));
+        Ok(Arc::new(Core {
             cfg,
             surface,
             sources,
@@ -130,7 +154,12 @@ impl Core {
             cursor,
             recovering: Mutex::default(),
             awaiting: Mutex::default(),
-        })
+            jev,
+            routes,
+            routing,
+            filing: tokio::sync::RwLock::default(),
+            second: tokio::sync::Semaphore::new(1),
+        }))
     }
 
     /// Runs until the surface's event channel closes.
@@ -186,6 +215,7 @@ impl Core {
                 person: Some(owner.clone()),
                 project: project.clone(),
                 refs,
+                any_project: false,
             })
             .await;
         for p in persons.iter().filter(|p| **p != owner) {
@@ -194,6 +224,7 @@ impl Core {
                     person: Some(p.clone()),
                     project: project.clone(),
                     refs: vec![],
+                    any_project: false,
                 })
                 .await,
             );

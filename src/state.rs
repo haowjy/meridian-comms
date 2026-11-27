@@ -33,6 +33,36 @@ pub struct ThreadState {
     pub streak: u32,
     #[serde(default)]
     pub paused: bool,
+    /// The thread's message that waits in a source's inbox. At most one.
+    #[serde(default)]
+    pub filed: Option<FiledItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiledItem {
+    pub source: String,
+    pub item: String,
+    /// Where it waits, as the bot's post says it.
+    pub place: String,
+    /// The message that was filed.
+    pub message: String,
+    /// The bot's post that names the item, once made: the router's note goes there.
+    #[serde(default)]
+    pub post: Option<String>,
+    /// The router's one question about the item.
+    #[serde(default)]
+    pub question: Question,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Question {
+    #[default]
+    None,
+    /// Posted in the thread: a person's next message there routes the item again.
+    Asked,
+    /// That second routing came to an end: later messages route nothing.
+    Answered,
 }
 
 /// What to deliver to one person: the refs chosen, or whatever the rule picks.
@@ -170,7 +200,8 @@ impl Store {
         )
     }
 
-    /// Every thread file that parses, for `list`'s waiting messages.
+    /// Every thread file that parses: for `list`'s waiting messages, and to find
+    /// the thread an inbox item was filed from.
     pub fn all_threads(&self) -> Vec<ThreadState> {
         let Ok(rd) = fs::read_dir(self.dir.join("threads")) else {
             return vec![];
@@ -204,7 +235,7 @@ impl Store {
 
 /// Each write has its own temp name, so two writes of one file at once cannot
 /// truncate each other's temp file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().context("state path has no parent")?;
     let tmp = dir.join(format!(

@@ -35,6 +35,8 @@ pub struct How<'a> {
     /// A `send --to` with no text points at an existing message: the refs it
     /// wakes join the scope and nobody is released.
     pub pointer: bool,
+    /// The directory name of whoever a choice in `picks` is by.
+    pub chooser: &'a str,
 }
 
 #[derive(Default)]
@@ -52,7 +54,8 @@ impl Core {
     /// refs were chosen (which replaces that person's scope) or that the rule
     /// runs. Each ref is woken once however many picks name it, the scope and
     /// `woken` record the ref each wake returned, and `pending` and `streak`
-    /// move the same way for every caller. In a paused thread nothing is woken:
+    /// move the same way for every caller. A choice that wakes someone takes the
+    /// thread's filed item out of its inbox. In a paused thread nothing is woken:
     /// the choice still takes the scope and the message waits in `pending` with
     /// its picks for Continue. The caller holds the thread's lock and saves `st`.
     pub(super) async fn deliver(
@@ -67,6 +70,7 @@ impl Core {
             author,
             agent_like,
             pointer,
+            chooser,
         } = how;
         let paused = st.paused;
         let mut plan = Plan::new();
@@ -170,6 +174,9 @@ impl Core {
         } else {
             st.pending = None;
             st.explained = false;
+            if picks.iter().any(|(_, p)| matches!(p, Pick::Refs(_))) {
+                self.take_filed(st, chooser).await;
+            }
             if agent_like {
                 st.streak += 1;
                 self.pause_if_needed(st).await;
@@ -306,20 +313,29 @@ impl Core {
     }
 
     /// The bot's post when nobody was woken (the picker, on a thread's first
-    /// message): who was woken, who was left out and why, and how to choose.
+    /// message): who was woken, where the message waits (`filed`), who was left
+    /// out and why, and how to choose.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn explain(
         &self,
         person: &str,
         project: Option<&str>,
         listing: &Listing,
         woken: &[String],
+        filed: Option<&str>,
         left_out: &[String],
         running: bool,
     ) -> String {
+        if self.sources.is_empty() {
+            return "Nobody is woken for messages here: this daemon has no source of sessions configured. The message waits, and `meridian-comms list` shows it.".into();
+        }
         let now = Utc::now();
         let mut out = String::new();
         if woken.is_empty() {
             out.push_str("Nobody was woken for this message.\n");
+            if let Some(f) = filed {
+                out.push_str(&format!("{f}\n"));
+            }
         } else {
             out.push_str(&format!(
                 "Woken for {person}: {}\n",

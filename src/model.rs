@@ -3,6 +3,7 @@
 //! or on another machine, and these structs are what crosses.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,11 @@ pub struct Candidate {
     pub default: bool,
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// The directory the session's project lives in on this machine, when
+    /// the source knows it. For the source's own later calls about the
+    /// session: it never leaves the daemon.
+    #[serde(skip)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +68,10 @@ pub struct ListRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub refs: Vec<String>,
+    /// Every project the person's sessions run in, configured or not: what the
+    /// router lists. `project` and `refs` are not read with it.
+    #[serde(default)]
+    pub any_project: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -147,6 +157,96 @@ impl IdentifyResult {
     }
 }
 
+// ---- a source's inbox ----
+//
+// A source may keep a place where its sessions look for messages nobody was
+// woken for. Every request here is optional: a source without one leaves the
+// message waiting in the thread.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRequest {
+    pub text: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Where an answer goes: the thread, as an address.
+    pub reply_to: String,
+    /// The message ref.
+    pub via_ref: String,
+    /// The directory name of who wrote it.
+    pub via_sender: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Filed {
+    pub item: String,
+    /// Where it waits, for people: "desk's inbox".
+    pub place: String,
+}
+
+/// A filed message as the router reads it. `text`, `via_*` and `from` are the
+/// sender's: they go to the model and nowhere else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub text: String,
+    /// The short ID of the session that filed it, if a session did.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub via_program: Option<String>,
+    #[serde(default)]
+    pub via_ref: Option<String>,
+    #[serde(default)]
+    pub via_sender: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Nobody has taken it yet.
+    pub waiting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Offered {
+    Yes,
+    /// Nothing was sent: the item waits.
+    No,
+    /// The notice may have reached the session, and the source recorded no offer.
+    Maybe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferResult {
+    pub offered: Offered,
+    /// The source's own word for why not (`cold`, `taken`): never the item's text.
+    pub detail: String,
+}
+
+/// The second step: the item, and the candidates the core kept after its own
+/// filters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideRequest {
+    pub item: String,
+    pub message: InboxItem,
+    pub candidates: Vec<Candidate>,
+    /// A question can be posted: the item was filed from a thread, and none
+    /// was asked about it yet.
+    pub may_ask: bool,
+    /// What a person answered to the question asked before: untrusted, like
+    /// the message's text.
+    #[serde(default)]
+    pub reply: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Decision {
+    /// A ref; the core offers only if it is one of the request's candidates.
+    Offer(String),
+    None,
+    /// A question for whoever wrote the message, in the decider's own words:
+    /// untrusted, since what it read may have steered it.
+    Ask(String),
+}
+
 // ---- surface ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +298,9 @@ pub struct PostRequest {
     pub thread: Option<String>,
     pub text: String,
     pub menu: Option<Menu>,
+    /// The text holds words the daemon did not write: the surface shows it as
+    /// it is, making no mention, link or formatting from it.
+    pub plain: bool,
 }
 
 /// A menu of grouped options and one button that submits the selection, as

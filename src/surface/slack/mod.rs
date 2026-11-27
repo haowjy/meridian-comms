@@ -173,10 +173,24 @@ impl Surface for Slack {
     async fn post(&self, req: PostRequest) -> Result<Posted> {
         // `<!channel>` and its kin would notify everyone; text from a session
         // never gets to do that. Real user mentions (`<@U…>`) pass.
-        let text = req.text.replace("<!", "&lt;!");
+        let text = match req.plain {
+            // Slack's three control characters, escaped as it asks: nothing in
+            // the text can then be a mention, a channel ping or a link.
+            true => req.text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+            false => req.text.replace("<!", "&lt;!"),
+        };
         let mut body = json!({
             "channel": req.conversation, "text": text, "unfurl_links": false, "unfurl_media": false,
         });
+        if req.plain {
+            // Slack still links a bare URL and styles `*` and backticks in
+            // `text`, whatever `mrkdwn` says. A rich-text block with one text
+            // element is shown exactly as written; `text` is then only the
+            // fallback a notification shows.
+            body["blocks"] = json!([{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": req.text}]}
+            ]}]);
+        }
         if let Some(menu) = &req.menu
             && let Some(select) = menu_select(menu)
         {
@@ -210,7 +224,7 @@ impl Surface for Slack {
         self.web.json("chat.postMessage", &body).await.map(|_| ())
     }
 
-    async fn annotate(&self, conversation: &str, thread: &str, post: &str, note: &str) -> Result<()> {
+    async fn annotate(&self, conversation: &str, thread: &str, post: &str, note: &str, keep_menu: bool) -> Result<()> {
         let p = [
             ("channel", conversation.to_string()),
             ("ts", thread.to_string()),
@@ -222,16 +236,26 @@ impl Surface for Slack {
         let v = self.web.form(Token::Bot, "conversations.replies", &p).await?;
         let msg = v["messages"].as_array().and_then(|m| m.iter().find(|m| m["ts"] == post));
         let msg = msg.context("the post is gone")?;
-        let mut blocks: Vec<Value> = msg["blocks"].as_array().cloned().unwrap_or_default();
-        blocks.retain(|b| b["type"] != "actions");
-        for b in &mut blocks {
-            if let Some(b) = b.as_object_mut() {
-                b.remove("accessory");
-            }
-        }
-        blocks.push(json!({"type": "context", "elements": [{"type": "mrkdwn", "text": fit(note, SECTION_TEXT)}]}));
         let text = format!("{}\n{note}", msg["text"].as_str().unwrap_or_default());
-        let body = json!({"channel": conversation, "ts": post, "text": text, "blocks": blocks});
+        let mut body = json!({"channel": conversation, "ts": post, "text": text});
+        // Only a post with a menu was sent as blocks; Slack shows the blocks
+        // in place of the text, so a plain post stays plain.
+        if let Some(mut blocks) = msg["blocks"]
+            .as_array()
+            .cloned()
+            .filter(|b| b.iter().any(|b| b["block_id"] == MENU_BLOCK))
+        {
+            if !keep_menu {
+                blocks.retain(|b| b["type"] != "actions");
+                for b in &mut blocks {
+                    if let Some(b) = b.as_object_mut() {
+                        b.remove("accessory");
+                    }
+                }
+            }
+            blocks.push(json!({"type": "context", "elements": [{"type": "mrkdwn", "text": fit(note, SECTION_TEXT)}]}));
+            body["blocks"] = json!(blocks);
+        }
         self.web.json("chat.update", &body).await.map(|_| ())
     }
 
