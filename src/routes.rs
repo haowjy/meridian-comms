@@ -16,15 +16,20 @@ use crate::state::write_atomic;
 
 const MAX_BYTES: u64 = 5 << 20;
 
+/// How a routing ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Decision {
-    /// A session was chosen; `done` says whether the offer went out.
-    Offer,
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// The chosen session was told the item waits.
+    Offered,
+    /// A session was chosen and the source sent it nothing.
+    NotOffered,
+    /// A session was chosen, and its notice may or may not have arrived.
+    MaybeOffered,
     /// Routed, and nobody is to be offered it.
     None,
     /// The second step's question was posted in the item's thread.
-    Ask,
+    Asked,
     /// The router is not configured, or has no key.
     Off,
     /// Over the limit on routings a minute.
@@ -33,11 +38,11 @@ pub enum Decision {
     Failed,
 }
 
-impl Decision {
+impl Outcome {
     /// Routed to an end: the item is not routed again. The others leave it
     /// waiting, and a later `route` for it runs.
     pub fn is_final(self) -> bool {
-        matches!(self, Decision::Offer | Decision::None | Decision::Ask)
+        !matches!(self, Outcome::Off | Outcome::Capped | Outcome::Failed)
     }
 }
 
@@ -60,7 +65,8 @@ pub struct Route {
     /// The source's ID for a second-step run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
-    pub decision: Decision,
+    pub outcome: Outcome,
+    /// The outcome in words, for a person.
     pub done: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

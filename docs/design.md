@@ -168,17 +168,17 @@ The daemon routes each accepted item in its own task (`src/core/route.rs`):
 No thread lock is held while a source or the model is asked.
 
 - **One routing per item.** Meridian fires the hook again when a repeated filing matches
-  an existing item. An item with an `offer`, `none` or `ask` line in the log, or one
-  being routed, is not routed again. `off`, `capped` and `failed` leave the item waiting, and
-  a later `meridian-comms route <item>` runs it.
+  an existing item. An item whose line in the log is anything but `off`, `capped` or
+  `failed`, or one being routed, is not routed again. Those three leave the item waiting,
+  and a later `meridian-comms route <item>` runs it.
 - **A cap:** 20 routings a minute, counted in memory. Past it the log says `capped`.
 - **A failed run changes nothing:** no key, a timeout, any answer but a 2xx with a
   choice in it (429 and 529 included), a Meridian without the inbox.
 - **The routing log** is `routes.jsonl` in the state directory (`src/routes.rs`): one JSON
   line per routing with the time, source, item, the thread message ref if any, the refs
   the model chose among, its choice and probabilities, the second step's spawn ID, the
-  decision (`offer`, `none`, `ask`, `off`, `capped`, `failed`), what was done, and the
-  error. It never holds message text.
+  outcome (`offered`, `not_offered`, `maybe_offered`, `none`, `asked`, `off`, `capped`,
+  `failed`), the outcome in words, and the error. It never holds message text.
   A line is appended in one `write` on an `O_APPEND` file and fsynced; a reader skips a
   line that does not parse. At daemon start a file over 5 MB is replaced by its newest
   half. `meridian-comms routes [ITEM | MESSAGE-REF] [--json]` reads the file directly.

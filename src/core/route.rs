@@ -14,9 +14,9 @@ use chrono::{DateTime, Utc};
 use super::filing::INBOX_TIMEOUT;
 use super::{Core, WAKE_TIMEOUT, text};
 use crate::jev;
-use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision as Second, InboxItem, ListRequest, Offered, PostRequest};
+use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision, InboxItem, ListRequest, Offered, PostRequest};
 use crate::proto::RouteOut;
-use crate::routes::{Decision, Route};
+use crate::routes::{Outcome, Route};
 use crate::state::ThreadState;
 
 const ROUTES_PER_MINUTE: usize = 20;
@@ -46,7 +46,7 @@ impl Routing {
         Routing {
             done: log
                 .iter()
-                .filter(|r| r.decision.is_final())
+                .filter(|r| r.outcome.is_final())
                 .map(|r| (r.source.clone(), r.item.clone()))
                 .collect(),
             ..Default::default()
@@ -156,12 +156,12 @@ impl Core {
                 choice: None,
                 probabilities: BTreeMap::new(),
                 record: None,
-                decision: Decision::Failed,
-                done: "nothing".into(),
+                outcome: Outcome::Failed,
+                done: "nothing: the run failed".into(),
                 error: None,
             };
             match core.run_route(src, &mut route).await {
-                Ok((decision, done)) => (route.decision, route.done) = (decision, done),
+                Ok((outcome, done)) => (route.outcome, route.done) = (outcome, done),
                 Err(e) => route.error = Some(format!("{e:#}")),
             }
             match &route.error {
@@ -173,7 +173,7 @@ impl Core {
             }
             let mut r = core.routing.lock().unwrap();
             r.flying.remove(&key);
-            if route.decision.is_final() {
+            if route.outcome.is_final() {
                 r.done.insert(key);
             }
         });
@@ -183,10 +183,10 @@ impl Core {
     /// One routing, start to end: the decision and what was done. `route`
     /// gathers what the log keeps as the steps learn it. An error is a failed
     /// run: nothing was offered and the item waits.
-    async fn run_route(&self, src: usize, route: &mut Route) -> Result<(Decision, String)> {
+    async fn run_route(&self, src: usize, route: &mut Route) -> Result<(Outcome, String)> {
         let Some(jev) = &self.jev else {
             return Ok((
-                Decision::Off,
+                Outcome::Off,
                 "nothing: the router is off (no [router] section, or no OPENCODE_API_KEY)".into(),
             ));
         };
@@ -197,7 +197,7 @@ impl Core {
                 r.recent.pop_front();
             }
             if r.recent.len() >= ROUTES_PER_MINUTE {
-                return Ok((Decision::Capped, format!("nothing: over {ROUTES_PER_MINUTE} routings a minute")));
+                return Ok((Outcome::Capped, format!("nothing: over {ROUTES_PER_MINUTE} routings a minute")));
             }
             r.recent.push_back(now);
         }
@@ -219,7 +219,7 @@ impl Core {
             .as_ref()
             .and_then(|t| Some(self.message_ref(&t.conversation, &t.filed.as_ref()?.message)));
         if !item.waiting {
-            return Ok((Decision::None, "nothing: it was already taken".into()));
+            return Ok((Outcome::None, "nothing: it was already taken".into()));
         }
 
         let owner = &self.cfg.owner;
@@ -246,10 +246,10 @@ impl Core {
             .filter(|c| awake(c, now))
             .collect();
         if kept.is_empty() {
-            return Ok((Decision::None, "nothing: no working or warm session to offer it to".into()));
+            return Ok((Outcome::None, "nothing: no working or warm session to offer it to".into()));
         }
         if kept.len() > MAX_KEPT {
-            return Ok((Decision::None, format!("nothing: more than {MAX_KEPT} sessions to choose among")));
+            return Ok((Outcome::None, format!("nothing: more than {MAX_KEPT} sessions to choose among")));
         }
         route.candidates = kept.iter().map(|c| c.ref_.clone()).collect();
 
@@ -269,7 +269,7 @@ impl Core {
         let chosen = kept.iter().enumerate().find(|(i, _)| option(*i) == answer.choice).map(|(_, c)| c);
         let target = match chosen {
             Some(c) if answer.probability() >= self.cfg.router.as_ref().map_or(1.0, |r| r.floor) => c,
-            None if answer.choice != MORE => return Ok((Decision::None, "nothing: the model chose no session".into())),
+            None if answer.choice != MORE => return Ok((Outcome::None, "nothing: the model chose no session".into())),
             // `more`, or a session the model was not sure of: the second step.
             _ => {
                 let req = DecideRequest {
@@ -293,32 +293,29 @@ impl Core {
                         "asked for more"
                     };
                     return Ok((
-                        Decision::None,
+                        Outcome::None,
                         format!("nothing: the model {why}, and {} has no second step", source.name()),
                     ));
                 };
                 route.record = second.record;
                 match second.decision {
-                    Second::Offer(r) => match kept.iter().find(|c| c.ref_ == r) {
+                    Decision::Offer(r) => match kept.iter().find(|c| c.ref_ == r) {
                         Some(c) => c,
                         None => {
-                            return Ok((
-                                Decision::None,
-                                "nothing: the second step named a session that was not listed".into(),
-                            ));
+                            return Ok((Outcome::None, "nothing: the second step named a session that was not listed".into()));
                         }
                     },
-                    Second::None => return Ok((Decision::None, "nothing: the second step chose no session".into())),
-                    Second::Failed(why) => bail!("the second step did not decide: {why}"),
-                    Second::Ask(q) => {
+                    Decision::None => return Ok((Outcome::None, "nothing: the second step chose no session".into())),
+                    Decision::Failed(why) => bail!("the second step did not decide: {why}"),
+                    Decision::Ask(q) => {
                         let Some(t) = &thread else {
                             return Ok((
-                                Decision::None,
+                                Outcome::None,
                                 "nothing: the second step asked a question, and the item has no thread to ask in".into(),
                             ));
                         };
                         self.ask(t, source.name(), &route.item, &q).await?;
-                        return Ok((Decision::Ask, "asked the second step's question in the thread".into()));
+                        return Ok((Outcome::Asked, "asked the second step's question in the thread".into()));
                     }
                 }
             }
@@ -332,15 +329,15 @@ impl Core {
         let why = text::clean(&offer.detail);
         match offer.offered {
             Offered::Yes => {}
-            Offered::No => return Ok((Decision::Offer, format!("not offered to {}: {why}", target.ref_))),
-            Offered::Maybe => return Ok((Decision::Offer, format!("may have been offered to {}: {why}", target.ref_))),
+            Offered::No => return Ok((Outcome::NotOffered, format!("not offered to {}: {why}", target.ref_))),
+            Offered::Maybe => return Ok((Outcome::MaybeOffered, format!("may have been offered to {}: {why}", target.ref_))),
         }
         if let Some(t) = thread
             && let Err(e) = self.note_offer(&t, source.name(), &route.item, target, now).await
         {
             tracing::warn!("cannot say in the thread who was offered {}: {e:#}", route.item);
         }
-        Ok((Decision::Offer, format!("offered to {}", target.ref_)))
+        Ok((Outcome::Offered, format!("offered to {}", target.ref_)))
     }
 
     /// Posts the second step's question in the thread its item was filed from.

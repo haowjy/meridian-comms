@@ -269,14 +269,7 @@ pub fn routes(of: Option<String>, as_json: bool) -> Result<()> {
     }
     for r in &log {
         let from = r.message.as_ref().map(|m| format!(" ({m})")).unwrap_or_default();
-        let decision = serde_json::to_value(r.decision)?;
-        println!(
-            "[{}] {}{from}: {}, {}",
-            local(r.time),
-            r.item,
-            decision.as_str().unwrap_or_default(),
-            r.done
-        );
+        println!("[{}] {}{from}: {}", local(r.time), r.item, r.done);
         if let Some(c) = &r.choice {
             let p = r.probabilities.get(c).map(|p| format!(" at {p:.2}")).unwrap_or_default();
             println!("  the model chose {c}{p} among {} session(s)", r.candidates.len());

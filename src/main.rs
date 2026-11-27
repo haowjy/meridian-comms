@@ -86,7 +86,7 @@ enum Command {
         /// The inbox item's ID, when not run as a hook.
         item: Option<String>,
     },
-    /// Print the routing log: per routed item, the decision and what was done.
+    /// Print the routing log: per routed item, how the routing ended.
     Routes {
         /// Only the routings of this inbox item ID or thread message ref.
         of: Option<String>,
