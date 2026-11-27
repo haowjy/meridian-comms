@@ -145,7 +145,7 @@ fn prompt(req: &DecideRequest, sessions: &[(&str, &Candidate, Option<String>)]) 
     out.push_str(match (req.may_ask, &req.reply) {
         (true, _) => "The message came from Slack, so `ask <question>` is allowed.\n",
         (false, Some(_)) => "A question about this message was already asked, and the reply to it is below, so `ask` is not allowed.\n",
-        (false, None) => "The message did not come from Slack, so `ask` is not allowed.\n",
+        (false, None) => "`ask` is not allowed for this message.\n",
     });
     match &m.from {
         Some(f) => out.push_str(&format!("From: session {f}\n")),

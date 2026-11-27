@@ -320,7 +320,10 @@ impl Core {
                     item: route.item.clone(),
                     message: item.clone(),
                     candidates: kept.clone(),
-                    may_ask: thread.is_some() && reply.is_none(),
+                    may_ask: thread
+                        .as_ref()
+                        .and_then(|t| t.filed.as_ref())
+                        .is_some_and(|f| f.question == Question::None),
                     reply: reply.map(String::from),
                 };
                 match self.second_step(src, route, &req, &kept, chosen.is_some()).await? {
@@ -387,7 +390,9 @@ impl Core {
             },
             Decision::None => none("the second step chose no session"),
             Decision::Ask(_) if req.reply.is_some() => none("the second step asked again, and an item gets one question"),
-            Decision::Ask(_) if !req.may_ask => none("the second step asked a question, and the item has no thread to ask in"),
+            Decision::Ask(_) if !req.may_ask => {
+                none("the second step asked a question, and the item has no thread to ask in or had its one question")
+            }
             Decision::Ask(q) => {
                 // The agent's words after reading a stranger's message: cut
                 // down, under the daemon's own label, never logged or kept.
