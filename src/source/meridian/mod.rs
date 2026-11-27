@@ -84,6 +84,18 @@ struct Idle {
 
 impl Meridian {
     pub fn new(cfg: &Config, m: &MeridianConfig) -> Result<Self> {
+        // A filed message carries its sender's directory name and its channel's
+        // name as fields, and Meridian refuses a field outside its safe set.
+        let names = cfg
+            .people
+            .keys()
+            .map(|name| (format!("people.{name}"), name))
+            .chain(cfg.channels().map(|(id, ch)| (format!("channel {id}"), &ch.name)));
+        for (at, name) in names {
+            if !is_field(name) {
+                bail!("{at}: the name {name:?} cannot go in Meridian's inbox, which takes {FIELD_RULE}");
+            }
+        }
         let projects = m
             .projects
             .iter()
@@ -207,6 +219,17 @@ fn tail(bytes: &[u8]) -> String {
 /// An inbox item or spawn ID, safe as a command's argument: never an option.
 fn is_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
+}
+
+/// Meridian's rule for an inbox field (its `SAFE_FIELD`), with room left for
+/// the message ID a channel's name is joined to.
+const FIELD_RULE: &str = "at most 150 characters from A-Z a-z 0-9 . _ : / @ -";
+
+fn is_field(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 150
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '@' | '-'))
 }
 
 /// What a `--json` inbox command printed: its object on success, else the
