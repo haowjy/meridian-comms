@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -88,7 +88,8 @@ pub struct Log {
 }
 
 impl Log {
-    /// At daemon start: a file over 5 MB is replaced by its newest half.
+    /// At daemon start: a file over 5 MB is replaced by its newest half, and a
+    /// file that ends mid-line gets its newline.
     pub fn open(state_dir: &Path) -> Result<Log> {
         let path = path(state_dir);
         if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
@@ -96,6 +97,18 @@ impl Log {
             let half = bytes.len() / 2;
             let start = bytes[half..].iter().position(|b| *b == b'\n').map_or(bytes.len(), |i| half + i + 1);
             write_atomic(&path, &bytes[start..])?;
+        }
+        // A torn last line has no newline: end it, so the next record gets a
+        // line of its own. Only the daemon appends, so once is enough.
+        if let Ok(mut f) = fs::OpenOptions::new().read(true).append(true).open(&path) {
+            let mut last = *b"\n";
+            if f.seek(SeekFrom::End(-1)).is_ok() {
+                f.read_exact(&mut last)?;
+            }
+            if last != *b"\n" {
+                f.write_all(b"\n")?;
+                f.sync_all()?;
+            }
         }
         Ok(Log { path })
     }
