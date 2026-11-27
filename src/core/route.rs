@@ -163,10 +163,10 @@ impl Core {
 
     /// Whether the log has the end of `item`'s second routing. The thread file
     /// can lag the log: the line is written first, and a daemon can die between.
-    pub(super) fn routed_again(&self, source: &str, item: &str) -> bool {
+    pub(super) fn routed_again(&self, source: &str, item: &str, message: &str) -> bool {
         self.routes.read().is_ok_and(|log| {
             log.iter()
-                .any(|r| r.again && r.outcome.is_final() && r.source == source && r.item == item)
+                .any(|r| r.again && r.outcome.is_final() && r.source == source && r.item == item && r.message.as_deref() == Some(message))
         })
     }
 
@@ -218,7 +218,8 @@ impl Core {
                         text::clean(&key.1)
                     )
                 });
-                if let Err(e) = core.set_question(&key.0, &key.1, Question::Answered, nobody).await {
+                let message = route.message.as_deref().unwrap_or_default();
+                if let Err(e) = core.set_question(&key.0, &key.1, message, Question::Answered, nobody).await {
                     tracing::warn!("cannot close the question about {}: {e:#}", key.1);
                 }
             }
@@ -261,14 +262,11 @@ impl Core {
         // The thread is found through the daemon's own files, never the item's
         // `via`: anyone can file an item that claims to come from here.
         drop(self.filing.write().await);
-        let thread = self
-            .store
-            .all_threads()
-            .into_iter()
-            .find(|t| t.filed.as_ref().is_some_and(|f| f.source == source.name() && f.item == route.item));
-        route.message = thread
-            .as_ref()
-            .and_then(|t| Some(self.message_ref(&t.conversation, &t.filed.as_ref()?.message)));
+        let thread = item
+            .via_ref
+            .as_deref()
+            .and_then(|via| self.filed_thread(source.name(), &route.item, via));
+        route.message = thread.as_ref().and(item.via_ref.clone());
         if !item.waiting {
             return Ok((Outcome::None, "nothing: it was already taken".into()));
         }
@@ -411,18 +409,37 @@ impl Core {
                     "The router asks about {}: {question}\nReply here and the router will try once more to find a session for it, or choose one yourself with to: or the picker.",
                     text::clean(&route.item)
                 );
-                self.set_question(source.name(), &route.item, Question::Asked, Some(post)).await?;
+                let message = route.message.as_deref().unwrap_or_default();
+                self.set_question(source.name(), &route.item, message, Question::Asked, Some(post))
+                    .await?;
                 Ok(Second::End(Outcome::Asked, "asked the second step's question in the thread".into()))
             }
         }
     }
 
+    /// The thread `item` was filed from: the one whose file names the item and
+    /// whose waiting message is `message`, the ref the item says it came by.
+    /// The file is what proves it, since anyone can file an item with any
+    /// `via`; the ref tells two files apart when an inbox issued an ID twice.
+    fn filed_thread(&self, source: &str, item: &str, message: &str) -> Option<ThreadState> {
+        self.store
+            .all_threads()
+            .into_iter()
+            .find(|t| self.filed_as(t, source, item, message))
+    }
+
+    fn filed_as(&self, t: &ThreadState, source: &str, item: &str, message: &str) -> bool {
+        t.filed
+            .as_ref()
+            .is_some_and(|f| f.source == source && f.item == item && self.message_ref(&t.conversation, &f.message) == message)
+    }
+
     /// Moves the question of the thread `item` was filed from to `to`, under the
     /// thread's lock, and posts `post` there as plain text. `Asked` is saved
     /// only once its post is up: the state says a person can see a question.
-    async fn set_question(&self, source: &str, item: &str, to: Question, post: Option<String>) -> Result<()> {
-        let named = |t: &ThreadState| t.filed.as_ref().is_some_and(|f| f.source == source && f.item == item);
-        let Some(t) = self.store.all_threads().into_iter().find(named) else {
+    async fn set_question(&self, source: &str, item: &str, message: &str, to: Question, post: Option<String>) -> Result<()> {
+        let named = |t: &ThreadState| self.filed_as(t, source, item, message);
+        let Some(t) = self.filed_thread(source, item, message) else {
             bail!("the item is no longer its thread's waiting message");
         };
         let _guard = self.lock(&t.conversation, &t.thread).await;

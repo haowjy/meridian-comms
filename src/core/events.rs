@@ -298,7 +298,7 @@ impl Core {
                 if pcfg.agent != AgentMark::Always
                     && let Some(f) = st.filed.as_mut().filter(|f| f.question == Question::Asked)
                 {
-                    if self.routed_again(&f.source, &f.item) {
+                    if self.routed_again(&f.source, &f.item, &self.message_ref(&m.conversation, &f.message)) {
                         f.question = Question::Answered;
                     } else {
                         self.route_again(&f.source, &f.item, m.text.clone());
