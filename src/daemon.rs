@@ -39,7 +39,7 @@ pub async fn run() -> Result<()> {
     }
     let sources = sources(&cfg)?;
     if sources.is_empty() {
-        bail!("config has no sources: add [sources.meridian] with at least one project");
+        tracing::info!("no source is configured: threads are read and posted, nobody is woken, and every message waits");
     }
     for s in &sources {
         s.check().await?;

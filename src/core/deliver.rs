@@ -326,6 +326,9 @@ impl Core {
         left_out: &[String],
         running: bool,
     ) -> String {
+        if self.sources.is_empty() {
+            return "Nobody is woken for messages here: this daemon has no source of sessions configured. The message waits, and `meridian-comms list` shows it.".into();
+        }
         let now = Utc::now();
         let mut out = String::new();
         if woken.is_empty() {

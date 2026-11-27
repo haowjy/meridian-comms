@@ -247,7 +247,12 @@ same, each session's work item goal, and whatever the agent reads.
 `~/.config/meridian-comms/config.toml`, mode 0600. The Slack tokens sit beside it in
 `slack.env` ([slack-setup.md](slack-setup.md)), and so does the router's key,
 `OPENCODE_API_KEY`. The daemon refuses to start if either file can be read by anyone but
-the owner. It starts without the router's key, and then routes nothing.
+the owner. It starts without the router's key, and then routes nothing. It starts with no
+`[sources.meridian]` too, on a machine without Meridian: threads are read and posted,
+nobody is woken, and every message waits and shows in `meridian-comms list`. A
+`[sources.meridian]` that is there is checked when the daemon starts: a project key that
+is not its root's Meridian project ID, or a root or a `meridian` that can't be asked,
+stops it with an error that says which.
 
 ```toml
 owner = "jimmy"                  # the person whose agents this daemon wakes
