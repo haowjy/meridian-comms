@@ -28,8 +28,9 @@ pub struct Candidate {
     #[serde(default)]
     pub activity: Option<Activity>,
     /// The directory the session's project lives in on this machine, when
-    /// the source knows it. For the source's own later calls about the session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// the source knows it. For the source's own later calls about the
+    /// session: it never leaves the daemon.
+    #[serde(skip)]
     pub root: Option<PathBuf>,
 }
 
