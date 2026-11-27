@@ -21,7 +21,7 @@ use super::Source;
 use crate::config::{Config, MeridianConfig};
 use crate::model::{
     Activity, ActivityState, CallerKind, Candidate, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListRequest,
-    ListResponse, NoticeKind, OfferResult, WakeRequest, WakeResult,
+    ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -466,9 +466,18 @@ impl Source for Meridian {
             Err(kind) if kind == "not_found" => return Ok(None),
             Err(kind) => bail!("meridian inbox read: {kind}"),
         };
+        // `from` names the sender's chat; a candidate is named by its spawn ID.
+        // A sender that no longer resolves is not running, so not a candidate.
+        let mut from = None;
+        if let Some(chat) = field(&v["from"]["id"]).filter(|id| v["from"]["kind"] == "session" && is_id(id)) {
+            let out = run(None, &["spawn", "show", &chat, "--json"]).await?;
+            from = serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .and_then(|s| field(&s["spawn_id"]));
+        }
         Ok(Some(InboxItem {
             text: field(&v["text"]).unwrap_or_default(),
-            from: field(&v["from"]["id"]).filter(|_| v["from"]["kind"] == "session"),
+            from,
             via_program: field(&v["via"]["program"]),
             via_ref: field(&v["via"]["ref"]),
             via_sender: field(&v["via"]["sender"]),
@@ -485,11 +494,13 @@ impl Source for Meridian {
         let out = run(None, &["inbox", "offer", item, id, "--json"]).await?;
         Ok(match answer(&out)? {
             Ok(_) => OfferResult {
-                offered: true,
+                offered: Offered::Yes,
                 detail: String::new(),
             },
+            // Only this kind means the notice may have arrived; every other
+            // (`refused`, `not_running`, `cold`, `taken`) sent nothing.
             Err(kind) => OfferResult {
-                offered: false,
+                offered: if kind == "maybe_delivered" { Offered::Maybe } else { Offered::No },
                 detail: kind,
             },
         })

@@ -45,22 +45,22 @@ pub struct Route {
     pub source: String,
     pub item: String,
     /// The thread message the item was filed from, when this daemon filed it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The refs the model was asked to choose among.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<String>,
     /// The model's choice: a ref, `none` or `more`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choice: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub probabilities: BTreeMap<String, f64>,
     /// The source's ID for a second-step run.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
     pub decision: Decision,
     pub done: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

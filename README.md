@@ -17,9 +17,13 @@ several machines are next.
 
 ## How it behaves
 
-- **Nothing wakes by guessing.** A wake is a paid turn, and waking a session whose
-  prompt cache has expired re-reads its whole context. A new thread wakes nobody until
-  someone chooses; a cold session isn't woken unless someone names it.
+- **Nothing wakes a cold session by guessing.** A wake is a paid turn, and waking a
+  session whose prompt cache has expired re-reads its whole context. A new thread wakes
+  nobody until someone chooses; a cold session isn't woken unless someone names it.
+- **A message nobody was woken for waits in Meridian's inbox,** where sessions look. With
+  the router switched on, a small model picks the running session it looks meant for,
+  and that session is told a message is waiting. It is told only if it is working or its
+  cache is still warm.
 - **Nothing from Slack runs as a command.** A woken session gets a notice naming the
   message and fetches the text with `meridian-comms read`.
 - **Only people listed in the config count.** Everyone else's messages are ignored, and
@@ -33,6 +37,8 @@ several machines are next.
 meridian-comms read <message> | --channel NAME     print a thread or a channel's recent threads
 meridian-comms send <message> | --channel NAME     post as the bot; --to wakes who it names
 meridian-comms list                                who could take a message, and what is waiting
+meridian-comms route [ITEM]                        hand an inbox message to the router (run as a hook)
+meridian-comms routes [ITEM | <message>]           what the router did with each message
 meridian-comms daemon                              the Slack connection (run as a user service)
 meridian-comms setup                               print the Slack app manifest
 ```

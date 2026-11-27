@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use super::filing::INBOX_TIMEOUT;
 use super::{Core, WAKE_TIMEOUT, text};
 use crate::jev;
-use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision as Second, InboxItem, ListRequest};
+use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision as Second, InboxItem, ListRequest, Offered};
 use crate::proto::RouteOut;
 use crate::routes::{Decision, Route};
 use crate::state::ThreadState;
@@ -308,11 +308,13 @@ impl Core {
         let offer = tokio::time::timeout(WAKE_TIMEOUT, source.offer(&route.item, &target.ref_))
             .await
             .context("the offer timed out")??;
-        if !offer.offered {
-            return Ok((
-                Decision::Offer,
-                format!("not offered to {}: {}", target.ref_, text::clean(&offer.detail)),
-            ));
+        // Not offered, or perhaps offered: either way the item waits, and the
+        // routing is not run again. Repeating an offer is for a person to do.
+        let why = text::clean(&offer.detail);
+        match offer.offered {
+            Offered::Yes => {}
+            Offered::No => return Ok((Decision::Offer, format!("not offered to {}: {why}", target.ref_))),
+            Offered::Maybe => return Ok((Decision::Offer, format!("may have been offered to {}: {why}", target.ref_))),
         }
         if let Some(t) = thread
             && let Err(e) = self.note_offer(&t, source.name(), &route.item, target, now).await

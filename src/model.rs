@@ -197,9 +197,19 @@ pub struct InboxItem {
     pub waiting: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Offered {
+    Yes,
+    /// Nothing was sent: the item waits.
+    No,
+    /// The notice may have reached the session, and the source recorded no offer.
+    Maybe,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferResult {
-    pub offered: bool,
+    pub offered: Offered,
     /// The source's own word for why not (`cold`, `taken`): never the item's text.
     pub detail: String,
 }

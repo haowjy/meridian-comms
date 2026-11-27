@@ -16,12 +16,16 @@ session ─ client ──┘        + wake rule     └── source: amp, remot
 | Word | Meaning |
 |---|---|
 | surface | Where people talk (Slack). Delivers messages and clicks, takes posts. `src/surface/` |
-| source | Where agents run. Answers `list` (who could take a message) and `wake`. `src/source/` |
+| source | Where agents run. Answers `list` (who could take a message) and `wake`, and may keep an inbox. `src/source/` |
+| inbox | A source's place for messages nobody was woken for, where its sessions look. For Meridian, the machine's inbox (`meridian inbox list`). |
+| item | One message in an inbox, named by the ID its source gave it: `m412`. |
+| offer | Telling a running session that an item looks like its own. The session decides whether to take it. |
 | candidate | One thing a source can wake: a Meridian primary. Has a ref, a person, a label, a model, a `default` flag its source sets, and when known an activity. |
-| ref | A candidate's name, unique across sources: `desk/meridian-cli/p41`. The core stores and compares refs and never takes one apart. |
+| ref | A candidate's name, unique across sources: `desk/mellow-hollow-brood/p41`. The core stores and compares refs and never takes one apart. |
 | scope | Per thread and person: the refs that person's messages go to. Empty means the defaults. |
 | notice | The one line a woken session gets. It names the message; the session fetches the text with `read`. |
 | message ref | `meridian-cli/1731600123.000200`: a channel's configured name and the message's ID. |
+| project | A Meridian project ID (`mellow-hollow-brood`). A channel's `project`, a candidate's project and a filed item's project are this one value. |
 
 `src/model.rs` holds the JSON shapes the core exchanges with sources and surfaces. A
 module could later run out of process, or on another machine, and only how it is
@@ -84,14 +88,116 @@ A session that `send`s in a thread joins its person's scope, and a choice never 
 the sender from it.
 
 **Wakes cost money:** a wake is a paid turn, and a cold session re-reads its whole
-context. Nothing wakes by guessing, and a message nobody was woken for waits until
-someone pulls it or chooses.
+context. Nothing wakes a cold session by guessing, and a message nobody was woken for
+waits until a session takes it or someone chooses.
+
+## A message nobody was woken for
+
+**It is filed.** When the rule ran (nobody named a session), the thread is not paused
+and nobody was woken, the core asks the first source that has an inbox to file the
+message (`src/core/filing.rs`). The Meridian source runs `meridian message inbox - --json`
+with the text on stdin, `--project-id` the channel's project, `--reply-to
+@<the thread's message ref>`, `--via-program meridian-comms`, `--via-ref` the message ref
+and `--via-sender` the sender's directory name. The thread file records `filed`: the
+source, the item, where it waits, the message, and the bot's post that names it. That
+post is the one the message gets anyway (the picker, or the "nobody was woken"
+explanation) with one more line, "In desk's inbox as m412."; when the thread was already
+explained, the line is a post of its own.
+
+- A thread has at most one waiting item. A later unwoken message asks the source whether
+  the item still waits: if it does, nothing new is filed; if a session took it, the new
+  message is filed.
+- A paused thread files nothing, or the inbox would be a way round the loop limit.
+  Continue files the replayed message if it still wakes nobody.
+- A message someone named a session for is not filed, even when the wake failed: it was
+  addressed.
+- A choice that wakes someone (`to:`, the picker, `send --to`) takes the thread's item
+  out of the inbox for the daemon (`meridian inbox take --via-program meridian-comms
+  --via-sender <who chose>`) and clears `filed`.
+- A filed message leaves `meridian-comms list`: the inbox is where a session looks for
+  it. `pending` stays in the thread file, for Continue and a later choice to replay.
+- Filing fails when no source has an inbox, or Meridian is older than the inbox or does
+  not answer in 20 s. The failure is logged and the message waits as `pending` alone,
+  listed as before.
+
+The thread's lock is held while the message is filed. Filing makes Meridian start the
+`inbox.received` hook, so the route request for the item can reach the daemon before
+`meridian message inbox` has returned the item's ID. A gate (`Core::filing`) is held
+shared from before the filing call until the thread file names the item; the router takes
+it exclusively once before it looks for the item's thread, so it never looks too early.
+
+**It is routed, when the router is on.** `meridian-comms route [ITEM]` is a thin client:
+it hands the item to the daemon and exits when the daemon has accepted it. Run as
+Meridian's hook it reads the item from `MERIDIAN_INBOX_MESSAGE_ID` (the source's
+`routed_item` knows the variable; the client does not):
+
+```toml
+# ~/.meridian/config.toml
+[[hooks]]
+name = "comms-route"
+event = "inbox.received"
+command = "meridian-comms route"
+```
+
+The daemon routes each accepted item in its own task (`src/core/route.rs`):
+
+1. Read the item through its source. Stop if it is taken.
+2. Find the thread it was filed from by `filed.item` in the thread files, never by the
+   item's `via`: anyone can file an item that claims to come from here.
+3. List the owner's running sessions in every project (`ListRequest.any_project`; the
+   Meridian source makes one `spawn list --global --primary --json` call).
+4. Keep a session only if it is in the item's project (an item with no project: any), is
+   not the item's sender, and is working or idle with `warm_until` ahead. A session with
+   no activity is dropped. None kept, or more than 253: stop, the item waits.
+5. Ask Jev (`src/jev.rs`), TypeSafe AI's decision model on OpenCode: one HTTP request
+   with a `state` string and one `choice` question. The state is the item's text (first
+   4 KiB) with its sender, `via` and project. The options are `s1`…`sN`, one per kept
+   session, described by project, agent, work item and activity, plus `none` and `more`.
+   Jev answers with a choice and a probability per option; it writes no text.
+6. A listed session whose probability is at least `floor` is offered the item. `more`,
+   or a session under the floor, goes to the source's second step (`decide`), which no
+   source has yet, so it ends as `none`. Anything else is `none`.
+7. Offer through the source (`meridian inbox offer <item> <spawn-id>`). Meridian sends
+   its own fixed notice, which never carries the text, and refuses a session that is
+   cold, not running, not a primary, or in another project. A refusal is logged with
+   Meridian's word for it and the item waits.
+8. If the item came from a thread, take the thread's lock and add "m412 offered to
+   `<ref>`, <project>, <activity>" under the post that names the item. The picker keeps
+   its menu: an offer is a guess, and a person can still choose.
+
+No thread lock is held while a source or the model is asked.
+
+- **One routing per item.** Meridian fires the hook again when a repeated filing matches
+  an existing item. An item with an `offer` or `none` line in the log, or one being
+  routed, is not routed again. `off`, `capped` and `failed` leave the item waiting, and
+  a later `meridian-comms route <item>` runs it.
+- **A cap:** 20 routings a minute, counted in memory. Past it the log says `capped`.
+- **A failed run changes nothing:** no key, a timeout, any answer but a 2xx with a
+  choice in it (429 and 529 included), a Meridian without the inbox.
+- **The routing log** is `routes.jsonl` in the state directory (`src/routes.rs`): one JSON
+  line per routing with the time, source, item, the thread message ref if any, the refs
+  the model chose among, its choice and probabilities, the decision (`offer`, `none`,
+  `off`, `capped`, `failed`), what was done, and the error. It never holds message text.
+  A line is appended in one `write` on an `O_APPEND` file and fsynced; a reader skips a
+  line that does not parse. At daemon start a file over 5 MB is replaced by its newest
+  half. `meridian-comms routes [ITEM | MESSAGE-REF] [--json]` reads the file directly.
+
+**What a hostile message can do.** The text is a stranger's. It goes to Jev, which can
+only return one of the options the daemon listed, so the worst it does is pick the wrong
+listed session (which gets the fixed notice, one turn on a warm cache) or `none`. Nothing
+from the item goes into a Slack post, a command line or the routing log: the post names
+the item's ID and the chosen candidate, both the daemon's own.
+
+**What leaves the machine.** Each routing sends OpenCode the item's text (first 4 KiB),
+sender, `via` and project ID, and for each kept session its project ID, agent name, work
+item name and activity.
 
 ## Config
 
 `~/.config/meridian-comms/config.toml`, mode 0600. The Slack tokens sit beside it in
-`slack.env` ([slack-setup.md](slack-setup.md)). The daemon refuses to start if either
-file can be read by anyone but the owner.
+`slack.env` ([slack-setup.md](slack-setup.md)), and so does the router's key,
+`OPENCODE_API_KEY`. The daemon refuses to start if either file can be read by anyone but
+the owner. It starts without the router's key, and then routes nothing.
 
 ```toml
 owner = "jimmy"                  # the person whose agents this daemon wakes
@@ -99,7 +205,7 @@ machine = "desk"                 # optional; default: the hostname. Starts every
 
 [surface.slack.channels.C0123ABCD]   # the channel's Slack ID
 name = "meridian-cli"                # the name in message refs
-project = "meridian-cli"             # optional; none means every project
+project = "mellow-hollow-brood"      # optional: a Meridian project ID; none means every project
 post = false                         # sessions may open threads here (needed with no project)
 external = false                     # set true to allow a channel shared with another org
 
@@ -113,10 +219,23 @@ agent = "maybe"
 
 [sources.meridian]
 # default = "product-lead"           # optional: primaries of this agent wake with no choice
-[sources.meridian.projects.meridian-cli]
+[sources.meridian.projects.mellow-hollow-brood]   # the root's Meridian project ID
 root = "/path/to/meridian-cli"
 # default = "tech-lead"              # optional, this project only
+
+[router]                             # optional: present, filed messages are routed
+# model = "jev-1.13-free"
+# floor = 0.6                        # the probability a session needs to be offered a message
+# url = "https://opencode.ai/inference/systemone/v1/systemone"
 ```
+
+A project's key is the Meridian project ID of its root, the one `meridian -C <root>
+context` prints, and a channel's `project` is the same ID. One value then names the
+project in a channel, a candidate, a ref and a filed item, so a message filed for a
+channel's project is seen by that project's sessions. At start the Meridian source asks
+Meridian for each root's ID. If a key differs, or the root has no ID of its own (no
+`[project] id` in its `meridian.toml`), the daemon refuses to start and the error names
+the key and the ID to write.
 
 A channel the config doesn't list is ignored. A message counts only if its sender is
 under `[people]`. `agent` feeds the [loop limit](#loop-limit): a message from a person
@@ -201,15 +320,23 @@ directory exists, whatever `XDG_RUNTIME_DIR` the caller has, so a session starte
 without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
-removed, and uses only `meridian -C <root> spawn list --primary --json --limit 200`
-and `spawn message`. Rows may carry `agent`, `work_id` and an `idle` object; their
-absence means activity is unknown, never cold. `idle` means "since the last user-loop
-turn ended": a Claude primary running a turn that something injected (a wake, a task
-notification) keeps its old `since`, so an `idle` row may be working, and a candidate
-that looks cold may be mid-turn. The row has no `waiting_on_user`, and the source never
-reports "waiting".
+removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
+`spawn message` and, at start, `context --json`. For the machine it runs in the home
+directory with no `-C`: `spawn list --global --primary --json`, `message inbox`,
+`inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an item's sender
+(a chat ID) into the spawn ID a candidate carries. Rows may carry `agent`, `work_id`,
+`activity` and an `idle` object. `activity` of `turn_active`, `starting` or `finalizing`
+is working; otherwise `idle` is idle with its cache deadline; neither means activity is
+unknown, never cold. `activity` is read first because `idle` means "since the last
+user-loop turn ended": a Claude primary running a turn that something injected (a wake,
+a task notification) keeps its old `since`. The row has no `waiting_on_user`, and the
+source never reports "waiting". A Meridian older than the inbox (before 0.28) still
+serves everything here but filing and routing: those fail, are logged, and the message
+waits as `pending`.
 
 ## Not built yet
 
-The Amp source, and joining several machines. Refs already start
-with the machine name, and the client already talks to the daemon in JSON.
+The router's second step (a small agent for the messages Jev answers `more` to; the
+source request `decide` is defined and no source answers it), offers to sessions on
+other machines, and the Amp source. Refs already start with the machine name, and the
+client already talks to the daemon in JSON.
