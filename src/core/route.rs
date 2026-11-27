@@ -160,6 +160,15 @@ impl Core {
         }
     }
 
+    /// Whether the log has the end of `item`'s second routing. The thread file
+    /// can lag the log: the line is written first, and a daemon can die between.
+    pub(super) fn routed_again(&self, source: &str, item: &str) -> bool {
+        self.routes.read().is_ok_and(|log| {
+            log.iter()
+                .any(|r| r.again && r.outcome.is_final() && r.source == source && r.item == item)
+        })
+    }
+
     /// Runs one routing in its own task, unless the item is being routed now.
     fn start_route(self: &Arc<Self>, src: usize, key: ItemKey, reply: Option<String>) -> bool {
         if !self.routing.lock().unwrap().flying.insert(key.clone()) {

@@ -296,9 +296,13 @@ impl Core {
                 // A person's answer to the router's question about the item
                 // that still waits: it is routed once more, with the answer.
                 if pcfg.agent != AgentMark::Always
-                    && let Some(f) = st.filed.as_ref().filter(|f| f.question == Question::Asked)
+                    && let Some(f) = st.filed.as_mut().filter(|f| f.question == Question::Asked)
                 {
-                    self.route_again(&f.source, &f.item, m.text.clone());
+                    if self.routed_again(&f.source, &f.item) {
+                        f.question = Question::Answered;
+                    } else {
+                        self.route_again(&f.source, &f.item, m.text.clone());
+                    }
                 }
             }
             let filed = filing::note(&st);
