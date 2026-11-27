@@ -127,7 +127,11 @@ The thread's lock is held while the message is filed. Filing makes Meridian star
 shared from before the filing call until the thread file names the item; the router takes
 it exclusively once before it looks for the item's thread, so it never looks too early.
 
-**It is routed, when the router is on.** `meridian-comms route [ITEM]` is a thin client:
+**It is routed, when the router is on:** the config has a `[router]` section and the
+daemon has `OPENCODE_API_KEY` ([Config](#config)). Otherwise each `route` is logged as
+`off` and the message waits. Filing and routing need Meridian 0.28 or later; on an older
+one both fail, are logged, and the message waits as `pending`.
+`meridian-comms route [ITEM]` is a thin client:
 it hands the item to the daemon and exits when the daemon has accepted it. Run as
 Meridian's hook it reads the item from `MERIDIAN_INBOX_MESSAGE_ID` (the source's
 `routed_item` knows the variable; the client does not):
@@ -175,14 +179,16 @@ No thread lock is held while a source or the model is asked.
 - **A cap:** 20 routings a minute, counted in memory. Past it the log says `capped`.
 - **A failed run changes nothing:** no key, a timeout, any answer but a 2xx with a
   choice in it (429 and 529 included), a Meridian without the inbox.
-- **The routing log** is `routes.jsonl` in the state directory (`src/routes.rs`): one JSON
+- **The routing log** is `~/.local/state/meridian-comms/routes.jsonl` (`src/routes.rs`): one JSON
   line per routing with the time, source, item, the thread message ref if any, the refs
   the model chose among, its choice and probabilities, the second step's spawn ID, the
   outcome (`offered`, `not_offered`, `maybe_offered`, `none`, `asked`, `off`, `capped`,
   `failed`), the outcome in words, and the error. It never holds message text.
   A line is appended in one `write` on an `O_APPEND` file and fsynced; a reader skips a
   line that does not parse. At daemon start a file over 5 MB is replaced by its newest
-  half. `meridian-comms routes [ITEM | MESSAGE-REF] [--json]` reads the file directly.
+  half. `meridian-comms routes [ITEM | <message>] [--json]` reads the file directly: every
+  routing, those of one inbox item (`m412`), or those of one thread message
+  (`meridian-cli/1712345678.000100`).
 
 ### The second step
 
@@ -190,15 +196,21 @@ When Jev answers `more`, or picks a session under the floor, the core asks the i
 source to decide among the kept sessions (`start_decision`, which names the run for the
 log, then `decision`, which waits for it). A source without one
 ends the routing as `none`. The Meridian source's is a small agent
-(`src/source/meridian/router.rs`): a Meridian spawn of the `inbox-router` profile, on
-OpenCode with the model the profile names, which may run Meridian's read commands to see
-what the listed sessions are doing and ends its report with one decision line. Code
-carries the decision out; the agent can't message, start or offer anything.
+(`src/source/meridian/router.rs`): a Meridian spawn of the `inbox-router` profile, which
+may run Meridian's read commands to see what the listed sessions are doing and ends its
+report with one decision line. Code carries the decision out; the agent can't message,
+start or offer anything. It runs on OpenCode with the model the profile names
+(`opencode-go/hy4-flash-free` today), on the OpenCode account this machine is signed in
+to. `[router].model` does not change it: that setting is Jev's, and Jev is paid for by
+`OPENCODE_API_KEY`.
 
-- **The router directory** is `router/` in the state directory: a Meridian project of
-  its own holding only that profile. `meridian-comms setup router [--package SPEC]`
+- **The router directory** is `~/.local/state/meridian-comms/router/`: a Meridian project
+  of its own holding only that profile. `meridian-comms setup router [--package SPEC]`
   makes it with `meridian -C <dir> mars init` and `mars add <package> --agents
-  inbox-router`, and is run again to update the profile. The daemon never sets it up:
+  inbox-router`, and is run again to update the profile. The default package is
+  `haowjy/meridian-base`, which does not carry `inbox-router` until Meridian's prompts
+  are released: until then pass the `meridian-base` directory of a local checkout of
+  them. The daemon never sets it up:
   with no directory, or no OpenCode, the step fails, the log says so and the item waits.
 - **The prompt** names the item, says whether the agent may ask, gives the sender, `via`
   and project, lists each kept session by spawn ID with its project, agent, work item,
@@ -251,22 +263,26 @@ only return one of the options the daemon listed, so the worst it does there is 
 wrong listed session (which gets the fixed notice, one turn on a warm cache) or `none`.
 Through the second step it can steer the agent to read anything Meridian's read commands
 reach (other sessions' transcripts, reports, work items, configured values), and with
-`ask` get up to 300 characters of that posted in its own Slack thread. The owner accepted
-that path; cleaning the question does not close it. The agent can't message, start or
+`ask` get up to 300 code points of that posted in its own Slack thread. Cleaning the
+question does not close that path. Turning the router on is choosing it: a stranger's
+text may steer an agent that can read those things and post one short line of them. The agent can't message, start or
 cancel a session, write a file, or take or offer an item. Nothing from the item itself
 goes into a Slack post, a command line or the routing log.
 
 **What leaves the machine.** Each routing sends OpenCode, for Jev, the item's text (first
 4 KiB), sender, `via` and project ID, the reply to the router's question when there is
-one, and for each kept session its project ID, agent name, work item name and activity. A second step sends the model the profile names the
-same, each session's work item goal, and whatever the agent reads.
+one, and for each kept session its project ID, agent name, work item name and activity.
+A second step sends the model the profile names the same, each session's work item
+goal, and whatever the agent reads.
 
 ## Config
 
 `~/.config/meridian-comms/config.toml`, mode 0600. The Slack tokens sit beside it in
 `slack.env` ([slack-setup.md](slack-setup.md)), and so does the router's key,
-`OPENCODE_API_KEY`. The daemon refuses to start if either file can be read by anyone but
-the owner. It starts without the router's key, and then routes nothing. It starts with no
+`OPENCODE_API_KEY`: an API key from the OpenCode Console, which pays for Jev. The daemon
+refuses to start if either file can be read by anyone but the owner. It starts without
+the router's key, and then routes nothing: filed messages wait, and `meridian-comms
+routes` shows each as `off`. It starts with no
 `[sources.meridian]` too, on a machine without Meridian: threads are read and posted,
 nobody is woken, and every message waits and shows in `meridian-comms list`. A
 `[sources.meridian]` that is there is checked when the daemon starts: a project key that
@@ -298,10 +314,16 @@ root = "/path/to/meridian-cli"
 # default = "tech-lead"              # optional, this project only
 
 [router]                             # optional: present, filed messages are routed
+# Each line below is the default; an empty section is enough.
 # model = "jev-1.13-free"
-# floor = 0.6                        # the probability a session needs to be offered a message
+# floor = 0.6
 # url = "https://opencode.ai/inference/systemone/v1/systemone"
 ```
+
+`floor` is the probability, from 0 to 1, that Jev must give a session before the daemon
+offers it the message without asking further. Under it, the second step decides. Higher
+means fewer direct offers and more second steps. 0.6 is a placeholder until it has been
+measured against real messages.
 
 A project's key is the Meridian project ID of its root, the one `meridian -C <root>
 context` prints, and a channel's `project` is the same ID. One value then names the
@@ -406,9 +428,7 @@ is working; otherwise `idle` is idle with its cache deadline; neither means acti
 unknown, never cold. `activity` is read first because `idle` means "since the last
 user-loop turn ended": a Claude primary running a turn that something injected (a wake,
 a task notification) keeps its old `since`. The row has no `waiting_on_user`, and the
-source never reports "waiting". A Meridian older than the inbox (before 0.28) still
-serves everything here but filing and routing: those fail, are logged, and the message
-waits as `pending`.
+source never reports "waiting".
 
 ## Not built yet
 
