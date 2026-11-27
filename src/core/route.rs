@@ -205,7 +205,13 @@ impl Core {
             // a failed one, the next reply tries again. The person who answered
             // is told when the answer found nobody; an offer has its own note.
             if route.again && route.outcome.is_final() {
-                let nobody = matches!(route.outcome, Outcome::None | Outcome::NotOffered).then(|| {
+                // Not when a session took the item meanwhile: it has one.
+                let unplaced = matches!(route.outcome, Outcome::None | Outcome::NotOffered)
+                    && matches!(
+                        tokio::time::timeout(INBOX_TIMEOUT, core.sources[src].inbox_item(&key.1)).await,
+                        Ok(Ok(Some(item))) if item.waiting
+                    );
+                let nobody = unplaced.then(|| {
                     format!(
                         "The router found no session for {}; choose one with to: or the picker.",
                         text::clean(&key.1)
