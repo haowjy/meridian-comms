@@ -19,9 +19,8 @@ use crate::model::{
 /// What a source's refs start with.
 pub struct RefStart {
     pub now: String,
-    /// What they started with in thread files written before the daemon
-    /// recorded it.
-    pub unrecorded: String,
+    /// Every other start the source knows its refs may still carry.
+    pub earlier: Vec<String>,
 }
 
 #[async_trait]

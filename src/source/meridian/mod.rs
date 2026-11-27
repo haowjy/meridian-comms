@@ -38,9 +38,14 @@ pub struct Meridian {
     /// the config's `machine` until `check` asks Meridian for its own name.
     /// A rename in Meridian while the daemon runs changes nothing here.
     machine: String,
-    /// The config's `machine`: what refs started with before the daemon kept
-    /// a record of it.
+    /// The config's `machine`: what refs started with before Meridian named
+    /// its machines.
     configured: String,
+    /// The names Meridian says this machine had before.
+    was: Vec<String>,
+    /// This machine's ID, which no rename changes: what an inbox item's
+    /// sender carries. `None` on a Meridian that does not tell it.
+    id: Option<String>,
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
@@ -133,6 +138,8 @@ impl Meridian {
         Ok(Self {
             machine: cfg.machine().to_string(),
             configured: cfg.machine().to_string(),
+            was: vec![],
+            id: None,
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
@@ -170,6 +177,79 @@ impl Meridian {
         } else {
             format!("{machine}/{id}")
         })
+    }
+
+    /// The ref of the session that filed an item, from the item's `from`:
+    /// `None` when no session did, or none a candidate could be.
+    ///
+    /// `from` names the sender's chat and machine; a candidate is named by its
+    /// spawn ID, so the ref takes one more call, on the sender's machine. That
+    /// machine is told by its ID, which no rename changes, or by its name on
+    /// an item that has no ID: this one, a saved one (the ref then takes the
+    /// saved name, as a candidate's does), or neither, and a machine nobody
+    /// saved lists no candidates, so its chat ID is not looked up: here it
+    /// would name some other session.
+    /// A chat Meridian does not find is taken as gone, so not a candidate; any
+    /// other failure, a machine that can't be reached among them, is an
+    /// error, or the sender would be offered its own message.
+    async fn sender_ref(&self, sender: &Value) -> Result<Option<String>> {
+        let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) else {
+            return Ok(None);
+        };
+        let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
+        // An item from before the ID was written carries a name alone, and
+        // Meridian's own rule reads it: a name this machine has or had is this
+        // machine, before any saved machine that has since taken it.
+        let own = |name: &String| *name == self.machine || self.was.contains(name);
+        let here = match &id {
+            Some(_) => id == self.id,
+            None => name.as_ref().is_none_or(own),
+        };
+        let machine = if here {
+            None
+        } else {
+            let saved = self.saved_machines().await.context("cannot tell which machine sent it")?;
+            let saved = saved.into_iter().find(|m| match &id {
+                Some(id) => m.id == *id,
+                None => Some(&m.name) == name.as_ref(),
+            });
+            match saved {
+                Some(m) => Some(m.name),
+                // An ID on a Meridian that does not tell this machine's own:
+                // any sender not on a saved machine is taken as here.
+                None if id.is_some() && self.id.is_none() => None,
+                None => {
+                    // The ID is read once, at start: this machine got a new
+                    // one since (its machine.json was replaced), and until a
+                    // restart no sender here can be told from the candidates.
+                    if id.is_some() && name.as_ref() == Some(&self.machine) {
+                        tracing::warn!(
+                            "an inbox item's sender is on {} under a machine ID this daemon does not know: this machine's ID changed since the daemon started, so a session here can be offered its own message. Restart the daemon",
+                            self.machine
+                        );
+                    }
+                    return Ok(None);
+                }
+            }
+        };
+        let mut args = vec!["spawn", "show", &chat, "--json"];
+        if let Some(m) = &machine {
+            args.extend(["--machine", m]);
+        }
+        let out = run(None, &args).await?;
+        let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        match field(&shown["spawn_id"]).filter(|id| is_id(id)) {
+            Some(id) => {
+                let machine = machine.as_deref().unwrap_or(&self.machine);
+                Ok(field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}")))
+            }
+            None if not_found(&out, &chat) => Ok(None),
+            None => bail!(
+                "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
+                tail(&out.stdout),
+                tail(&out.stderr)
+            ),
+        }
     }
 
     /// One project's running primaries.
@@ -626,15 +706,30 @@ impl Source for Meridian {
         // guess: its refs would match nothing Meridian or another start wrote.
         self.machines = has_command("machine").await?;
         if self.machines {
-            let asked = "`meridian machine name`, which every session's ref starts with,";
-            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name"]))
+            let asked = "`meridian machine name --json`, which every session's ref starts with,";
+            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name", "--json"]))
                 .await
                 .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // `{"name", "id", "was"}`. A build from before that prints the name
+            // alone, and is the only answer that may come without the other two:
+            // half an answer would quietly run without the ID and the old names.
+            let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let told: Value = serde_json::from_str(&printed).unwrap_or_default();
+            let failed = || anyhow::anyhow!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+            let (name, id, was) = match told.get("name") {
+                None => (printed.clone(), None, vec![]),
+                Some(name) => {
+                    let whole = (field(name), field(&told["id"]), told["was"].as_array());
+                    let (Some(name), Some(id), Some(was)) = whole else {
+                        return Err(failed());
+                    };
+                    (name, Some(id), was.iter().filter_map(field).filter(|n| is_id(n)).collect())
+                }
+            };
             if !out.status.success() || !is_id(&name) {
-                bail!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+                return Err(failed());
             }
-            self.machine = name;
+            (self.machine, self.id, self.was) = (name, id, was);
         }
         // An older Meridian has no `inbox` command: say so once, here, instead
         // of failing a command for every message.
@@ -648,9 +743,10 @@ impl Source for Meridian {
     }
 
     fn ref_start(&self) -> Option<RefStart> {
+        let start = |name: &String| format!("{name}/");
         Some(RefStart {
-            now: format!("{}/", self.machine),
-            unrecorded: format!("{}/", self.configured),
+            now: start(&self.machine),
+            earlier: self.was.iter().chain([&self.configured]).map(start).collect(),
         })
     }
 
@@ -706,45 +802,7 @@ impl Source for Meridian {
             Err(kind) if kind == "not_found" => return Ok(None),
             Err(kind) => bail!("meridian inbox read: {kind}"),
         };
-        // `from` names the sender's chat and machine; a candidate is named by
-        // its spawn ID, so the sender's ref takes one more call, on its machine.
-        // That machine is found by its ID, which no rename changes, among the
-        // saved ones, and the ref takes the saved name as a candidate's does.
-        // Any other sender is looked up here: the chat of a machine nobody
-        // saved names no candidate, wherever it is looked for.
-        // A chat Meridian does not find is taken as gone, so not a candidate;
-        // any other failure, a machine that can't be reached among them, fails
-        // the read, or the sender would be offered its own message.
-        let mut from = None;
-        let sender = &v["from"];
-        if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
-            // Before the ID was written, an item carried the saved name alone.
-            let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
-            let saved = self.saved_machines().await.context("cannot tell which machine sent it")?;
-            let saved = saved.into_iter().find(|m| match &id {
-                Some(id) => m.id == *id,
-                None => Some(&m.name) == name.as_ref(),
-            });
-            let machine = saved.map(|m| m.name);
-            let mut args = vec!["spawn", "show", &chat, "--json"];
-            if let Some(m) = &machine {
-                args.extend(["--machine", m]);
-            }
-            let out = run(None, &args).await?;
-            let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            match field(&shown["spawn_id"]).filter(|id| is_id(id)) {
-                Some(id) => {
-                    let machine = machine.as_deref().unwrap_or(&self.machine);
-                    from = field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}"));
-                }
-                None if not_found(&out, &chat) => {}
-                None => bail!(
-                    "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
-                    tail(&out.stdout),
-                    tail(&out.stderr)
-                ),
-            }
-        }
+        let from = self.sender_ref(&v["from"]).await?;
         Ok(Some(InboxItem {
             text: field(&v["text"]).unwrap_or_default(),
             from,
