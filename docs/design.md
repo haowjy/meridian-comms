@@ -473,12 +473,15 @@ itself. They differ when Meridian could not take over a rename because the name 
 taken. Refs carry the saved name, because that is the one `--machine` and
 `<machine>/p41` resolve; what a row says its machine is called is not read.
 
-A sender on another machine is left out of the candidates as a local one is. Its
-machine is found among the saved ones by `from.machine_id`, which no rename changes,
-and `spawn show <chat> --machine <saved name>` gives its spawn ID. A sender whose
-machine is not saved is looked up here, where its chat names nobody. If the sender's
-machine can't be reached the routing fails and the item waits, since its sender could
-not be told from the candidates.
+A sender is left out of the candidates wherever it runs. Its machine is told by
+`from.machine_id`, which no rename changes. This machine's own ID: `spawn show <chat>`
+here gives its spawn ID. A saved machine's: `spawn show <chat> --machine <saved name>`
+does. Neither: the sender is on a machine that is not saved, which lists no candidates,
+and its chat ID is not looked up, since here it would name some other session. An item
+with no `machine_id`, or a Meridian that does not tell this machine's ID, takes the
+older path: a saved machine by name, else here. If the sender's machine can't be
+reached the routing fails and the item waits, since its sender could not be told from
+the candidates.
 
 An offer that crosses machines can fail in more ways, and the log carries Meridian's
 word for each. `maybe_delivered` means the notice may have arrived: the routing is
