@@ -501,11 +501,16 @@ impl Source for Meridian {
         };
         IdentifyResult {
             caller: CallerKind::Session,
-            ref_: Some(self.ref_of(project, id)),
+            source: Some(self.name().to_string()),
+            session: Some(id.clone()),
             person: Some(self.owner.clone()),
             project: Some(project.clone()),
             may_post: var("MERIDIAN_SESSION_ROLE").is_some_and(|r| r == "primary"),
         }
+    }
+
+    fn session_ref(&self, project: &str, session: &str) -> Option<String> {
+        (self.projects.contains_key(project) && is_id(session)).then(|| self.ref_of(project, session))
     }
 
     /// Each project's key must be its root's Meridian project ID: a channel's

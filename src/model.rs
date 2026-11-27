@@ -140,8 +140,12 @@ pub enum CallerKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentifyResult {
     pub caller: CallerKind,
-    #[serde(default, rename = "ref")]
-    pub ref_: Option<String>,
+    /// The source that claimed the caller, and that source's own ID for the
+    /// session. The daemon makes the ref from them: the client names nothing.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
     #[serde(default)]
     pub person: Option<String>,
     #[serde(default)]
@@ -154,7 +158,8 @@ impl IdentifyResult {
     pub fn none() -> Self {
         Self {
             caller: CallerKind::None,
-            ref_: None,
+            source: None,
+            session: None,
             person: None,
             project: None,
             may_post: false,

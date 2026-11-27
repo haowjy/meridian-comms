@@ -40,7 +40,7 @@ impl Core {
         match id.caller {
             CallerKind::Unlisted => bail!("this session's project is not in the config, so it cannot use meridian-comms"),
             CallerKind::Session => Ok(Who {
-                ref_: id.ref_.clone(),
+                ref_: Some(self.session_ref(id)?),
                 person: id.person.clone().unwrap_or_else(|| self.cfg.owner.clone()),
                 project: id.project.clone(),
                 may_post: id.may_post,
@@ -52,6 +52,15 @@ impl Core {
                 may_post: true,
             }),
         }
+    }
+
+    fn session_ref(&self, id: &IdentifyResult) -> Result<String> {
+        let source = self.sources.iter().find(|s| Some(s.name()) == id.source.as_deref());
+        let named = id.project.as_deref().zip(id.session.as_deref());
+        source
+            .zip(named)
+            .and_then(|(s, (project, session))| s.session_ref(project, session))
+            .context("the daemon cannot name this session: its project or source is not in the daemon's config, or the client and the daemon are different builds (restart the daemon)")
     }
 
     /// A session reads its own project's channels and the channels with no project.

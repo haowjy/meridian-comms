@@ -21,7 +21,11 @@ pub trait Source: Send + Sync {
     fn name(&self) -> &'static str;
     async fn list(&self, req: &ListRequest) -> Result<ListResponse>;
     async fn wake(&self, req: &WakeRequest) -> Result<WakeResult>;
+    /// Run in the client, on the caller's environment: it starts no process.
     fn identify(&self, req: &IdentifyRequest) -> IdentifyResult;
+    /// Run in the daemon: the ref of the session `identify` reported, or
+    /// `None` when the two are not a session this source would list.
+    fn session_ref(&self, project: &str, session: &str) -> Option<String>;
 
     /// Run once when the daemon starts; an error stops it. For what the config
     /// says about this source that only the source's tool can confirm.
