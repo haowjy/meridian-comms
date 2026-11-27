@@ -33,6 +33,12 @@ const MORE: &str = "more";
 
 type ItemKey = (String, String);
 
+/// How the second step left a routing: a session to offer to, or its end.
+enum Second<'a> {
+    Offer(&'a Candidate),
+    End(Outcome, String),
+}
+
 /// Which items are routed or being routed, and the starts of the last minute.
 #[derive(Default)]
 pub struct Routing {
@@ -270,55 +276,14 @@ impl Core {
         let target = match chosen {
             Some(c) if answer.probability() >= self.cfg.router.as_ref().map_or(1.0, |r| r.floor) => c,
             None if answer.choice != MORE => return Ok((Outcome::None, "nothing: the model chose no session".into())),
-            // `more`, or a session the model was not sure of: the second step.
-            _ => {
-                let req = DecideRequest {
-                    item: route.item.clone(),
-                    message: item.clone(),
-                    candidates: kept.clone(),
-                    may_ask: thread.is_some(),
-                };
-                // No thread lock and no gate is held here: a step takes minutes.
-                let one = tokio::time::timeout(SECOND_STEP_QUEUE, self.second.acquire())
-                    .await
-                    .context("dropped after 15 minutes waiting for another second step to finish")??;
-                let second = tokio::time::timeout(SECOND_STEP_GUARD, source.decide(&req))
-                    .await
-                    .context("the second step hung")??;
-                drop(one);
-                let Some(second) = second else {
-                    let why = if chosen.is_some() {
-                        "was not sure enough"
-                    } else {
-                        "asked for more"
-                    };
-                    return Ok((
-                        Outcome::None,
-                        format!("nothing: the model {why}, and {} has no second step", source.name()),
-                    ));
-                };
-                route.record = second.record;
-                match second.decision {
-                    Decision::Offer(r) => match kept.iter().find(|c| c.ref_ == r) {
-                        Some(c) => c,
-                        None => {
-                            return Ok((Outcome::None, "nothing: the second step named a session that was not listed".into()));
-                        }
-                    },
-                    Decision::None => return Ok((Outcome::None, "nothing: the second step chose no session".into())),
-                    Decision::Failed(why) => bail!("the second step did not decide: {why}"),
-                    Decision::Ask(q) => {
-                        let Some(t) = &thread else {
-                            return Ok((
-                                Outcome::None,
-                                "nothing: the second step asked a question, and the item has no thread to ask in".into(),
-                            ));
-                        };
-                        self.ask(t, source.name(), &route.item, &q).await?;
-                        return Ok((Outcome::Asked, "asked the second step's question in the thread".into()));
-                    }
-                }
-            }
+            // `more`, or a session the model was not sure of.
+            _ => match self
+                .second_step(src, route, &item, &kept, thread.as_ref(), chosen.is_some())
+                .await?
+            {
+                Second::Offer(c) => c,
+                Second::End(outcome, done) => return Ok((outcome, done)),
+            },
         };
 
         let offer = tokio::time::timeout(WAKE_TIMEOUT, source.offer(&route.item, &target.ref_))
@@ -338,6 +303,55 @@ impl Core {
             tracing::warn!("cannot say in the thread who was offered {}: {e:#}", route.item);
         }
         Ok((Outcome::Offered, format!("offered to {}", target.ref_)))
+    }
+
+    /// Asks the source to decide what the model could not. No thread lock and
+    /// no gate is held: a step takes minutes. One runs at a time, and one that
+    /// waited too long for its turn is dropped.
+    async fn second_step<'a>(
+        &self,
+        src: usize,
+        route: &mut Route,
+        item: &InboxItem,
+        kept: &'a [Candidate],
+        thread: Option<&ThreadState>,
+        unsure: bool,
+    ) -> Result<Second<'a>> {
+        let source = &self.sources[src];
+        let none = |why: &str| Ok(Second::End(Outcome::None, format!("nothing: {why}")));
+        let req = DecideRequest {
+            item: route.item.clone(),
+            message: item.clone(),
+            candidates: kept.to_vec(),
+            may_ask: thread.is_some(),
+        };
+        let one = tokio::time::timeout(SECOND_STEP_QUEUE, self.second.acquire())
+            .await
+            .context("dropped after 15 minutes waiting for another second step to finish")??;
+        let second = tokio::time::timeout(SECOND_STEP_GUARD, source.decide(&req))
+            .await
+            .context("the second step hung")??;
+        drop(one);
+        let Some(second) = second else {
+            let why = if unsure { "was not sure enough" } else { "asked for more" };
+            return none(&format!("the model {why}, and {} has no second step", source.name()));
+        };
+        route.record = second.record;
+        match second.decision {
+            Decision::Offer(r) => match kept.iter().find(|c| c.ref_ == r) {
+                Some(c) => Ok(Second::Offer(c)),
+                None => none("the second step named a session that was not listed"),
+            },
+            Decision::None => none("the second step chose no session"),
+            Decision::Failed(why) => bail!("the second step did not decide: {why}"),
+            Decision::Ask(q) => {
+                let Some(t) = thread else {
+                    return none("the second step asked a question, and the item has no thread to ask in");
+                };
+                self.ask(t, source.name(), &route.item, &q).await?;
+                Ok(Second::End(Outcome::Asked, "asked the second step's question in the thread".into()))
+            }
+        }
     }
 
     /// Posts the second step's question in the thread its item was filed from.
