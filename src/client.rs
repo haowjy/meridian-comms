@@ -1,5 +1,7 @@
 //! The client a session runs: `read`, `send` and `list`. It learns who is calling
 //! from the sources, asks the daemon over its socket, and prints the answer.
+//! `route` is what a source's inbox runs for a new message, and `routes` prints
+//! the routing log.
 
 use std::collections::BTreeMap;
 
@@ -13,7 +15,8 @@ use crate::config::Config;
 use crate::daemon;
 use crate::model::{CallerKind, IdentifyRequest, IdentifyResult};
 use crate::paths;
-use crate::proto::{ListOut, ReadOut, Reply, Request, SendOut, Target};
+use crate::proto::{ListOut, ReadOut, Reply, Request, RouteOut, SendOut, Target};
+use crate::routes;
 
 const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -21,12 +24,7 @@ const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// owner at a terminal. A session never falls through to the owner.
 fn identify() -> Result<IdentifyResult> {
     let cfg = Config::load()?;
-    let req = IdentifyRequest {
-        env: std::env::vars()
-            .filter(|(k, _)| k.starts_with("MERIDIAN_"))
-            .collect::<BTreeMap<_, _>>(),
-        cwd: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
-    };
+    let req = environment();
     for s in daemon::sources(&cfg)? {
         let id = s.identify(&req);
         match id.caller {
@@ -40,6 +38,16 @@ fn identify() -> Result<IdentifyResult> {
         }
     }
     Ok(IdentifyResult::none())
+}
+
+/// What a source reads to learn who, or what, the client was run for.
+fn environment() -> IdentifyRequest {
+    IdentifyRequest {
+        env: std::env::vars()
+            .filter(|(k, _)| k.starts_with("MERIDIAN_"))
+            .collect::<BTreeMap<_, _>>(),
+        cwd: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+    }
 }
 
 async fn call<T: DeserializeOwned>(req: &Request) -> Result<T> {
@@ -222,6 +230,62 @@ pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
                 local(w.time),
                 w.message
             );
+        }
+    }
+    Ok(())
+}
+
+/// Hands one inbox item to the daemon and returns once it is accepted: the
+/// routing itself can take minutes, and a hook that runs this has a deadline.
+pub async fn route(item: Option<String>) -> Result<()> {
+    let (source, item) = match item {
+        Some(item) => (None, item),
+        None => {
+            let env = environment();
+            daemon::sources(&Config::load()?)?
+                .iter()
+                .find_map(|s| Some((Some(s.name().to_string()), s.routed_item(&env)?)))
+                .context("no item to route: name one, or run this as a source's hook for a new inbox message")?
+        }
+    };
+    let out: RouteOut = call(&Request::Route { source, item }).await?;
+    println!("{}", out.detail);
+    Ok(())
+}
+
+/// Prints the routing log, or the routings of one item or thread message. It
+/// reads the file itself: the log is on the daemon's machine, like the socket.
+pub fn routes(of: Option<String>, as_json: bool) -> Result<()> {
+    let path = routes::path(&paths::state_dir());
+    let mut log = routes::read(&path)?;
+    if let Some(of) = &of {
+        log.retain(|r| r.item == *of || r.message.as_ref() == Some(of));
+    }
+    if as_json {
+        return json(&log);
+    }
+    if log.is_empty() {
+        println!("No routings{} in {}.", if of.is_some() { " of that" } else { "" }, path.display());
+    }
+    for r in &log {
+        let from = r.message.as_ref().map(|m| format!(" ({m})")).unwrap_or_default();
+        let decision = serde_json::to_value(r.decision)?;
+        println!(
+            "[{}] {}{from}: {}, {}",
+            local(r.time),
+            r.item,
+            decision.as_str().unwrap_or_default(),
+            r.done
+        );
+        if let Some(c) = &r.choice {
+            let p = r.probabilities.get(c).map(|p| format!(" at {p:.2}")).unwrap_or_default();
+            println!("  the model chose {c}{p} among {} session(s)", r.candidates.len());
+        }
+        if let Some(id) = &r.record {
+            println!("  second step: {id}");
+        }
+        if let Some(e) = &r.error {
+            println!("  error: {e}");
         }
     }
     Ok(())

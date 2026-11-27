@@ -18,6 +18,32 @@ pub struct Config {
     pub people: BTreeMap<String, Person>,
     #[serde(default)]
     pub sources: Sources,
+    /// Present: messages filed in a source's inbox are routed.
+    #[serde(default)]
+    pub router: Option<RouterConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RouterConfig {
+    #[serde(default = "RouterConfig::default_url")]
+    pub url: String,
+    #[serde(default = "RouterConfig::default_model")]
+    pub model: String,
+    /// The probability the model must give a session before it is offered a message.
+    #[serde(default = "RouterConfig::default_floor")]
+    pub floor: f64,
+}
+
+impl RouterConfig {
+    fn default_url() -> String {
+        "https://opencode.ai/inference/systemone/v1/systemone".into()
+    }
+    fn default_model() -> String {
+        "jev-1.13-free".into()
+    }
+    fn default_floor() -> f64 {
+        0.6
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,6 +162,11 @@ impl Config {
                 bail!("two channels are named {:?}", ch.name);
             }
         }
+        if let Some(r) = &self.router
+            && !(0.0..=1.0).contains(&r.floor)
+        {
+            bail!("router.floor is {}: it is a probability, from 0 to 1", r.floor);
+        }
         Ok(())
     }
 
@@ -192,6 +223,8 @@ pub fn check_private(path: &Path) -> Result<()> {
 pub struct Tokens {
     pub bot: String,
     pub app: String,
+    /// The router's model key. Without it nothing is routed; the daemon still runs.
+    pub router: Option<String>,
 }
 
 impl Tokens {
@@ -212,16 +245,17 @@ impl Tokens {
                 }
             }
         }
-        let get = |key: &str| -> Result<String> {
+        let get = |key: &str| -> Option<String> {
             std::env::var(key)
                 .ok()
                 .filter(|v| !v.is_empty())
                 .or_else(|| file.get(key).cloned().filter(|v| !v.is_empty()))
-                .with_context(|| format!("{key} is neither in the environment nor in {}", path.display()))
         };
+        let need = |key: &str| get(key).with_context(|| format!("{key} is neither in the environment nor in {}", path.display()));
         Ok(Tokens {
-            bot: get("SLACK_BOT_TOKEN")?,
-            app: get("SLACK_APP_TOKEN")?,
+            bot: need("SLACK_BOT_TOKEN")?,
+            app: need("SLACK_APP_TOKEN")?,
+            router: get("OPENCODE_API_KEY"),
         })
     }
 }

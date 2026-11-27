@@ -24,6 +24,12 @@ pub enum Request {
         identity: IdentifyResult,
         project: Option<String>,
     },
+    /// Route one item waiting in a source's inbox. Answered when accepted, not
+    /// when routed. No source named: the first one.
+    Route {
+        source: Option<String>,
+        item: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +83,13 @@ pub struct SendOut {
     /// A command that retries the wake, when one failed.
     pub retry: Option<String>,
     pub paused: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RouteOut {
+    /// False when the item was routed before or is being routed now.
+    pub accepted: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

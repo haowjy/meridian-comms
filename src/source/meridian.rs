@@ -1,23 +1,32 @@
 //! The Meridian source. It uses only Meridian's public CLI: `spawn list
-//! --primary --json` for the running primaries and `spawn message` to wake one.
+//! --primary --json` for the running primaries, `spawn message` to wake one,
+//! `message inbox` and `inbox read/take/offer` for the machine's inbox, and
+//! `context` for a root's project ID.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use serde::Deserialize;
+use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::Source;
 use crate::config::{Config, MeridianConfig};
 use crate::model::{
-    Activity, ActivityState, CallerKind, Candidate, IdentifyRequest, IdentifyResult, ListRequest, ListResponse, NoticeKind, WakeRequest,
-    WakeResult,
+    Activity, ActivityState, CallerKind, Candidate, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListRequest,
+    ListResponse, NoticeKind, OfferResult, WakeRequest, WakeResult,
 };
+
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// What this program calls itself in an inbox item's `via` and in a claim.
+const PROGRAM: &str = "meridian-comms";
 
 pub struct Meridian {
     machine: String,
@@ -54,6 +63,11 @@ struct Row {
     work_id: Option<String>,
     #[serde(default)]
     idle: Option<Idle>,
+    #[serde(default)]
+    activity: Option<String>,
+    /// Only in a `--global` listing.
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -98,24 +112,51 @@ impl Meridian {
         self.projects.contains_key(project).then_some((project, id))
     }
 
-    async fn primaries(&self, project: &str) -> Result<Rows> {
-        let root = &self.projects[project].root;
-        let out = run(root, &["spawn", "list", "--primary", "--json", "--limit", "200"]).await?;
+    /// `machine/project/spawn-id` of any Meridian ref on this machine, whether
+    /// or not its project is configured: the spawn ID alone names the session.
+    fn spawn_of<'a>(&self, r: &'a str) -> Option<&'a str> {
+        let rest = r.strip_prefix(self.machine.as_str())?.strip_prefix('/')?;
+        let (_, id) = rest.split_once('/')?;
+        is_id(id).then_some(id)
+    }
+
+    /// One project's running primaries, or with no project every project's.
+    async fn primaries(&self, project: Option<&str>) -> Result<Rows> {
+        let out = match project {
+            Some(p) => {
+                run(
+                    Some(&self.projects[p].root),
+                    &["spawn", "list", "--primary", "--json", "--limit", "200"],
+                )
+                .await?
+            }
+            None => run(None, &["spawn", "list", "--global", "--primary", "--json"]).await?,
+        };
         if !out.status.success() {
-            bail!("meridian spawn list failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!("meridian spawn list failed: {}", tail(&out.stderr));
         }
         serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
     }
 
     fn candidate(&self, project: &str, row: Row) -> Candidate {
-        let p = &self.projects[project];
-        let default = row.agent.is_some() && row.agent == p.default.clone().or_else(|| self.default.clone());
-        let activity = row.idle.map(|i| Activity {
-            state: ActivityState::Idle,
-            since: i.since,
-            warm_until: i.warm_until,
-            note: i.ttl_estimated.then(|| "cache expiry estimated".to_string()),
-        });
+        let own = self.projects.get(project).and_then(|p| p.default.clone());
+        let default = row.agent.is_some() && row.agent == own.or_else(|| self.default.clone());
+        // `idle` is measured from the last turn the user's loop ended, so a row
+        // can carry it while a turn runs: `activity` wins.
+        let activity = match row.activity.as_deref() {
+            Some("turn_active" | "starting" | "finalizing") => Some(Activity {
+                state: ActivityState::Working,
+                since: None,
+                warm_until: None,
+                note: None,
+            }),
+            _ => row.idle.map(|i| Activity {
+                state: ActivityState::Idle,
+                since: i.since,
+                warm_until: i.warm_until,
+                note: i.ttl_estimated.then(|| "cache expiry estimated".to_string()),
+            }),
+        };
         Candidate {
             ref_: self.ref_of(project, &row.spawn_id),
             id: Some(row.spawn_id),
@@ -130,22 +171,60 @@ impl Meridian {
     }
 }
 
-/// `meridian -C <root> ...` with Meridian's session variables removed, so the
+/// `meridian [-C <root>] ...` with Meridian's session variables removed, so the
 /// call is not framed as coming from whatever session started the daemon.
-/// `MERIDIAN_HOME` stays: it says where Meridian keeps its state.
-fn meridian_command(root: &Path) -> Command {
+/// `MERIDIAN_HOME` stays: it says where Meridian keeps its state. A command
+/// about the machine (the inbox, every project's sessions) has no root and
+/// runs in the home directory, as Meridian runs a machine hook.
+fn meridian_command(root: Option<&Path>) -> Command {
     let mut cmd = Command::new("meridian");
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("MERIDIAN_") && k != "MERIDIAN_HOME" {
             cmd.env_remove(k);
         }
     }
-    cmd.arg("-C").arg(root).stdin(Stdio::null()).kill_on_drop(true);
+    match root {
+        Some(root) => cmd.arg("-C").arg(root),
+        None => cmd.current_dir(std::env::var_os("HOME").unwrap_or_else(|| "/".into())),
+    };
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
     cmd
 }
 
-async fn run(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+async fn run(root: Option<&Path>, args: &[&str]) -> Result<std::process::Output> {
     meridian_command(root).args(args).output().await.context("cannot run `meridian`")
+}
+
+/// The end of what a command wrote, for an error: short, and on one line.
+fn tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    let start = text.len().saturating_sub(300);
+    let start = (start..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
+    text[start..].replace('\n', " ")
+}
+
+/// An inbox item or spawn ID, safe as a command's argument: never an option.
+fn is_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
+}
+
+/// What a `--json` inbox command printed: its object on success, else the
+/// error's kind (one of Meridian's closed list). A Meridian without the
+/// command prints no such object, and that is an error.
+fn answer(out: &std::process::Output) -> Result<std::result::Result<Value, String>> {
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .ok()
+        .filter(|v: &Value| v["ok"].is_boolean())
+        .with_context(|| format!("meridian gave no answer this build understands: {}", tail(&out.stderr)))?;
+    if v["ok"] == true {
+        return Ok(Ok(v));
+    }
+    Ok(Err(v["error"]["kind"].as_str().unwrap_or("failed").to_string()))
+}
+
+fn field(v: &Value) -> Option<String> {
+    v.as_str().map(String::from)
 }
 
 fn ago(sent: DateTime<Utc>) -> String {
@@ -189,6 +268,18 @@ impl Source for Meridian {
 
     async fn list(&self, req: &ListRequest) -> Result<ListResponse> {
         let for_owner = req.person.as_deref() == Some(self.owner.as_str());
+        if req.any_project {
+            let mut out = ListResponse::default();
+            if for_owner {
+                let rows = self.primaries(None).await?;
+                for mut row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
+                    if let Some(project) = row.project_id.take() {
+                        out.candidates.push(self.candidate(&project, row));
+                    }
+                }
+            }
+            return Ok(out);
+        }
         let own: BTreeSet<&str> = req
             .refs
             .iter()
@@ -204,7 +295,7 @@ impl Source for Meridian {
             }
         }
 
-        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(p).await) })).await;
+        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(Some(p)).await) })).await;
         let mut out = ListResponse::default();
         for (project, rows) in answers {
             let rows = match rows {
@@ -236,7 +327,11 @@ impl Source for Meridian {
         let (project, id) = self
             .parse_ref(&req.ref_)
             .with_context(|| format!("{} is not a Meridian ref", req.ref_))?;
-        let out = run(&self.projects[project].root, &["spawn", "message", id, "--message", &line(req)]).await?;
+        let out = run(
+            Some(&self.projects[project].root),
+            &["spawn", "message", id, "--message", &line(req)],
+        )
+        .await?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         // Exit 0 is woken, with or without a receipt. "not running" means the
@@ -291,5 +386,130 @@ impl Source for Meridian {
             project: Some(project.clone()),
             may_post: var("MERIDIAN_SESSION_ROLE").is_some_and(|r| r == "primary"),
         }
+    }
+
+    /// Each project's key must be its root's Meridian project ID: a channel's
+    /// project, a candidate's project and a filed item's project are one value.
+    async fn check(&self) -> Result<()> {
+        let answers = join_all(self.projects.iter().map(|(key, p)| async move {
+            let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
+            (key, p, out)
+        }))
+        .await;
+        for (key, p, out) in answers {
+            let at = format!("sources.meridian.projects.{key}");
+            let root = p.root.display();
+            let out = out
+                .map_err(|_| anyhow::anyhow!("timed out"))
+                .and_then(|o| o)
+                .with_context(|| format!("{at}: cannot ask Meridian for the project ID of {root}"))?;
+            let v: Value = serde_json::from_slice(&out.stdout)
+                .with_context(|| format!("{at}: `meridian -C {root} context --json` failed: {}", tail(&out.stderr)))?;
+            let id = v["project_id"].as_str().unwrap_or_default();
+            if v["project_identity_source"] != "meridian.toml" || id.is_empty() {
+                bail!(
+                    "{at}: {root} has no Meridian project ID of its own (no `[project] id` in its meridian.toml). Run `meridian init` there, then use the ID `meridian -C {root} context` prints as this key and as `project` on its channels"
+                );
+            }
+            if id != key {
+                bail!(
+                    "{at}: the key must be the Meridian project ID of {root}, which is {id:?}. Write [sources.meridian.projects.{id}], and project = {id:?} on the channels that say project = {key:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn file(&self, req: &FileRequest) -> Result<Option<Filed>> {
+        let mut cmd = meridian_command(None);
+        cmd.args(["message", "inbox", "-", "--json", "--via-program", PROGRAM]);
+        cmd.args([
+            "--reply-to",
+            &req.reply_to,
+            "--via-ref",
+            &req.via_ref,
+            "--via-sender",
+            &req.via_sender,
+        ]);
+        if let Some(p) = &req.project {
+            cmd.args(["--project-id", p]);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot run `meridian`")?;
+        let mut stdin = child.stdin.take().context("no stdin")?;
+        // A Meridian that refuses the flags exits without reading: not an error here.
+        let _ = stdin.write_all(req.text.as_bytes()).await;
+        drop(stdin);
+        let out = child.wait_with_output().await?;
+        let v = answer(&out)?.map_err(|kind| anyhow::anyhow!("meridian message inbox: {kind}"))?;
+        let item = field(&v["message"])
+            .filter(|m| is_id(m))
+            .context("meridian message inbox gave no message ID")?;
+        let machine = field(&v["machine"]).unwrap_or_else(|| self.machine.clone());
+        Ok(Some(Filed {
+            item,
+            place: format!("{machine}'s inbox"),
+        }))
+    }
+
+    async fn inbox_item(&self, item: &str) -> Result<Option<InboxItem>> {
+        if !is_id(item) {
+            bail!("{item:?} is not an inbox message ID");
+        }
+        let out = run(None, &["inbox", "read", item, "--json"]).await?;
+        let v = match answer(&out)? {
+            Ok(v) => v,
+            Err(kind) if kind == "not_found" => return Ok(None),
+            Err(kind) => bail!("meridian inbox read: {kind}"),
+        };
+        Ok(Some(InboxItem {
+            text: field(&v["text"]).unwrap_or_default(),
+            from: field(&v["from"]["id"]).filter(|_| v["from"]["kind"] == "session"),
+            via_program: field(&v["via"]["program"]),
+            via_ref: field(&v["via"]["ref"]),
+            via_sender: field(&v["via"]["sender"]),
+            project: field(&v["project"]),
+            waiting: v["taken"].is_null(),
+        }))
+    }
+
+    async fn offer(&self, item: &str, ref_: &str) -> Result<OfferResult> {
+        let id = self.spawn_of(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
+        if !is_id(item) {
+            bail!("{item:?} is not an inbox message ID");
+        }
+        let out = run(None, &["inbox", "offer", item, id, "--json"]).await?;
+        Ok(match answer(&out)? {
+            Ok(_) => OfferResult {
+                offered: true,
+                detail: String::new(),
+            },
+            Err(kind) => OfferResult {
+                offered: false,
+                detail: kind,
+            },
+        })
+    }
+
+    async fn take(&self, item: &str, by: &str) -> Result<()> {
+        if !is_id(item) {
+            bail!("{item:?} is not an inbox message ID");
+        }
+        let out = run(
+            None,
+            &["inbox", "take", item, "--json", "--via-program", PROGRAM, "--via-sender", by],
+        )
+        .await?;
+        answer(&out)?
+            .map(|_| ())
+            .map_err(|kind| anyhow::anyhow!("meridian inbox take: {kind}"))
+    }
+
+    fn routed_item(&self, req: &IdentifyRequest) -> Option<String> {
+        req.env.get("MERIDIAN_INBOX_MESSAGE_ID").filter(|v| !v.is_empty()).cloned()
     }
 }

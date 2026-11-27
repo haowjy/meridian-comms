@@ -12,8 +12,10 @@ use tokio::sync::mpsc;
 
 use crate::config::{self, Config, Tokens};
 use crate::core::Core;
+use crate::jev::Jev;
 use crate::paths;
 use crate::proto::{Reply, Request};
+use crate::routes;
 use crate::source::{Source, meridian::Meridian};
 use crate::state::Store;
 use crate::surface::{Surface, slack::Slack};
@@ -39,6 +41,20 @@ pub async fn run() -> Result<()> {
     if sources.is_empty() {
         bail!("config has no sources: add [sources.meridian] with at least one project");
     }
+    for s in &sources {
+        s.check().await?;
+    }
+    let jev = match (&cfg.router, tokens.router) {
+        (Some(r), Some(key)) => Some(Jev::new(r.url.clone(), r.model.clone(), key)?),
+        (Some(_), None) => {
+            tracing::warn!(
+                "[router] is configured but OPENCODE_API_KEY is neither in the environment nor in {}: nothing is routed",
+                config::env_path().display()
+            );
+            None
+        }
+        (None, _) => None,
+    };
 
     let slack = Arc::new(Slack::connect(tokens.bot, tokens.app).await?);
     let channels: Vec<String> = cfg.channels().map(|(id, _)| id.clone()).collect();
@@ -55,7 +71,8 @@ pub async fn run() -> Result<()> {
     let store = Store::open(paths::state_dir())?;
     let listener = bind(&paths::socket_path())?;
     let surface: Arc<dyn Surface> = slack;
-    let core = Core::new(cfg, surface.clone(), sources, store, who.bot);
+    let routes = routes::Log::open(&paths::state_dir())?;
+    let core = Core::new(cfg, surface.clone(), sources, store, who.bot, jev, routes)?;
 
     let (tx, rx) = mpsc::channel(4096);
     tokio::spawn(async move { surface.run(tx).await });
@@ -145,7 +162,7 @@ fn error(e: String) -> Reply<serde_json::Value> {
     }
 }
 
-async fn handle(core: &Core, req: Request) -> Result<serde_json::Value> {
+async fn handle(core: &Arc<Core>, req: Request) -> Result<serde_json::Value> {
     Ok(match req {
         Request::Read { identity, target, limit } => serde_json::to_value(core.read(&core.who(&identity)?, target, limit).await?)?,
         Request::Send {
@@ -155,5 +172,6 @@ async fn handle(core: &Core, req: Request) -> Result<serde_json::Value> {
             text,
         } => serde_json::to_value(core.send(&core.who(&identity)?, target, to, text).await?)?,
         Request::List { identity, project } => serde_json::to_value(core.list_people(&core.who(&identity)?, project).await?)?,
+        Request::Route { source, item } => serde_json::to_value(core.route(source, item)?)?,
     })
 }

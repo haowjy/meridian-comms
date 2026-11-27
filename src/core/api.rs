@@ -293,6 +293,7 @@ impl Core {
             author,
             agent_like: true,
             pointer: text.is_none(),
+            chooser: &who.person,
         };
         let out = self.deliver(&mut st, &picks, &listing, &inc, how).await;
         self.store.save_thread(&st)?;
@@ -326,6 +327,7 @@ impl Core {
                     person: Some(name.clone()),
                     project: project.clone(),
                     refs: vec![],
+                    any_project: false,
                 })
                 .await;
             let mut candidates: Vec<_> = l.candidates.into_iter().map(|(_, c)| c).filter(|c| c.person == *name).collect();
@@ -337,12 +339,14 @@ impl Core {
                 unreachable: l.unreachable,
             });
         }
-        // Messages nobody was woken for, in this project's channels and the
-        // channels with no project, for the caller's person.
+        // Messages nobody was woken for and no source's inbox holds, in this
+        // project's channels and the channels with no project, for the caller's
+        // person. A filed message is found where its source's sessions look.
         let mut waiting: Vec<WaitingOut> = self
             .store
             .all_threads()
             .into_iter()
+            .filter(|st| st.filed.is_none())
             .filter_map(|st| {
                 let p = st.pending?;
                 let person = p.picks.contains_key(&who.person).then(|| who.person.clone())?;

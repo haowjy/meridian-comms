@@ -2,9 +2,11 @@ mod client;
 mod config;
 mod core;
 mod daemon;
+mod jev;
 mod model;
 mod paths;
 mod proto;
+mod routes;
 mod setup;
 mod source;
 mod state;
@@ -73,6 +75,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Hand a message waiting in an inbox to the daemon's router.
+    ///
+    /// Run as the hook for a new inbox message (for Meridian: an
+    /// `inbox.received` row whose command is `meridian-comms route`), it takes
+    /// the item from the hook's environment. It returns as soon as the daemon
+    /// has accepted the item; `routes` shows what the router then did. An item
+    /// routed once is not routed again.
+    Route {
+        /// The inbox item's ID, when not run as a hook.
+        item: Option<String>,
+    },
+    /// Print the routing log: per routed item, the decision and what was done.
+    Routes {
+        /// Only the routings of this inbox item ID or thread message ref.
+        of: Option<String>,
+        /// Print JSON, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     #[command(hide = true)]
     Daemon,
     #[command(hide = true)]
@@ -106,6 +127,8 @@ async fn main() {
             json,
         } => client::send(message, channel, to, message_text, json).await,
         Command::List { project, json } => client::list(project, json).await,
+        Command::Route { item } => client::route(item).await,
+        Command::Routes { of, json } => client::routes(of, json),
         Command::Daemon => daemon::run().await,
         Command::Setup { owner } => setup::run(owner),
     };
