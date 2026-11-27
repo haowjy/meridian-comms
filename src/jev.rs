@@ -44,7 +44,8 @@ impl Jev {
     }
 
     /// `criteria` maps each option to its description. Any answer but a 2xx
-    /// with a choice in it is an error; the error never holds the key.
+    /// with a choice in it is an error; the error never holds the key, and no
+    /// log line holds the answer's body: a service may echo the request.
     pub async fn choose(&self, state: &str, instructions: &str, criteria: &BTreeMap<String, String>) -> Result<Answer> {
         let body = json!({
             "model": self.model,
@@ -62,7 +63,7 @@ impl Jev {
         let status = resp.status();
         let text = resp.text().await.context("the model's answer broke off")?;
         if !status.is_success() {
-            tracing::warn!("the model answered {status}: {}", cut(&text));
+            tracing::warn!("the model answered {status}, with a body of {} bytes", text.len());
             bail!("the model answered HTTP {}", status.as_u16());
         }
         let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
@@ -80,15 +81,9 @@ impl Jev {
         match parsed {
             Some(a) => Ok(a),
             None => {
-                tracing::warn!("the model's answer has no choice in it: {}", cut(&text));
+                tracing::warn!("the model's answer ({status}, {} bytes) has no choice in it", text.len());
                 bail!("the model's answer could not be read")
             }
         }
     }
-}
-
-/// A response body in a log line: its first 500 bytes.
-fn cut(s: &str) -> &str {
-    let end = (0..=s.len().min(500)).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
-    &s[..end]
 }
