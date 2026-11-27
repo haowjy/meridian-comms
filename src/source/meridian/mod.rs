@@ -691,17 +691,26 @@ impl Source for Meridian {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name", "--json"]))
                 .await
                 .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
-            // `{"name", "id", "was"}`; a build from before that prints the name alone.
+            // `{"name", "id", "was"}`. A build from before that prints the name
+            // alone, and is the only answer that may come without the other two:
+            // half an answer would quietly run without the ID and the old names.
             let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let told: Value = serde_json::from_str(&printed).unwrap_or_default();
-            let name = field(&told["name"]).unwrap_or(printed);
+            let failed = || anyhow::anyhow!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+            let (name, id, was) = match told.get("name") {
+                None => (printed.clone(), None, vec![]),
+                Some(name) => {
+                    let whole = (field(name), field(&told["id"]), told["was"].as_array());
+                    let (Some(name), Some(id), Some(was)) = whole else {
+                        return Err(failed());
+                    };
+                    (name, Some(id), was.iter().filter_map(field).filter(|n| is_id(n)).collect())
+                }
+            };
             if !out.status.success() || !is_id(&name) {
-                bail!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+                return Err(failed());
             }
-            self.machine = name;
-            self.id = field(&told["id"]);
-            let was = told["was"].as_array().into_iter().flatten();
-            self.was = was.filter_map(field).filter(|n| is_id(n)).collect();
+            (self.machine, self.id, self.was) = (name, id, was);
         }
         // An older Meridian has no `inbox` command: say so once, here, instead
         // of failing a command for every message.
