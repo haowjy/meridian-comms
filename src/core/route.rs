@@ -381,9 +381,9 @@ impl Core {
         let Some(f) = st.filed.as_mut().filter(|f| f.source == source && f.item == item) else {
             return Ok(()); // someone chose a session while the model was asked
         };
-        let place = c.project.as_deref().map(|p| format!(", {}", text::clean(p))).unwrap_or_default();
+        // A second step may have run since the listing: the activity is that old.
         let note = format!(
-            "{} offered to `{}`{place}, {}",
+            "{} offered to `{}` ({} when listed)",
             text::clean(item),
             c.ref_,
             text::activity(c.activity.as_ref(), now)
