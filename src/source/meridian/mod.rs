@@ -512,15 +512,23 @@ impl Source for Meridian {
             Err(kind) => bail!("meridian inbox read: {kind}"),
         };
         // `from` names the sender's chat; a candidate is named by its spawn ID.
-        // A chat Meridian no longer finds is not running, so not a candidate;
+        // A chat Meridian does not find is taken as gone, so not a candidate;
         // any other failure fails the read, or the sender would be offered
-        // its own message.
+        // its own message. Meridian prints this error as JSON on stderr.
         let mut from = None;
         if let Some(chat) = field(&v["from"]["id"]).filter(|id| v["from"]["kind"] == "session" && is_id(id)) {
             let out = run(None, &["spawn", "show", &chat, "--json"]).await?;
-            let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            from = field(&shown["spawn_id"]);
-            if from.is_none() && !shown["error"].as_str().is_some_and(|e| e.contains("not found")) {
+            from = serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .and_then(|s| field(&s["spawn_id"]));
+            let gone = || {
+                let errors = String::from_utf8_lossy(&out.stderr);
+                errors
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .any(|e| e["error"].as_str().is_some_and(|e| e.contains("not found")))
+            };
+            if from.is_none() && !gone() {
                 bail!(
                     "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}",
                     tail(&out.stderr)
