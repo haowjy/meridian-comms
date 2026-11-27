@@ -16,6 +16,14 @@ use crate::model::{
     WakeRequest, WakeResult,
 };
 
+/// What a source's refs start with.
+pub struct RefStart {
+    pub now: String,
+    /// What they started with in thread files written before the daemon
+    /// recorded it.
+    pub unrecorded: String,
+}
+
 #[async_trait]
 pub trait Source: Send + Sync {
     fn name(&self) -> &'static str;
@@ -29,13 +37,13 @@ pub trait Source: Send + Sync {
 
     /// Run once when the daemon starts; an error stops it. For what the config
     /// says about this source that only the source's tool can confirm.
-    async fn check(&self) -> Result<()> {
+    async fn check(&mut self) -> Result<()> {
         Ok(())
     }
-    /// After `check`: the start of the refs this source used to compose and the
-    /// start it composes now, when they differ. The daemon rewrites the refs
-    /// its threads hold, so a thread keeps the sessions it chose.
-    fn renamed(&self) -> Option<(String, String)> {
+    /// After `check`: what this source's refs start with. The daemon records
+    /// it, and when it changes rewrites the refs its threads hold, so a thread
+    /// keeps the sessions it chose.
+    fn ref_start(&self) -> Option<RefStart> {
         None
     }
     /// Puts a message where this source's sessions look. `None`: no inbox.

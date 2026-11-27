@@ -22,10 +22,10 @@ use crate::surface::{Surface, slack::Slack};
 
 const MAX_REQUEST: u64 = 4 << 20;
 
-pub fn sources(cfg: &Config) -> Result<Vec<Arc<dyn Source>>> {
-    let mut out: Vec<Arc<dyn Source>> = vec![];
+pub fn sources(cfg: &Config) -> Result<Vec<Box<dyn Source>>> {
+    let mut out: Vec<Box<dyn Source>> = vec![];
     if let Some(m) = &cfg.sources.meridian {
-        out.push(Arc::new(Meridian::new(cfg, m)?));
+        out.push(Box::new(Meridian::new(cfg, m)?));
     }
     Ok(out)
 }
@@ -37,13 +37,14 @@ pub async fn run() -> Result<()> {
     if cfg.surface.slack.is_none() {
         bail!("config has no [surface.slack] section: this build holds a bot only");
     }
-    let sources = sources(&cfg)?;
+    let mut sources = sources(&cfg)?;
     if sources.is_empty() {
         tracing::info!("no source is configured: threads are read and posted, nobody is woken, and every message waits");
     }
-    for s in &sources {
+    for s in &mut sources {
         s.check().await?;
     }
+    let sources: Vec<Arc<dyn Source>> = sources.into_iter().map(Arc::from).collect();
     let jev = match (&cfg.router, tokens.router) {
         (Some(r), Some(key)) => Some(Jev::new(r.url.clone(), r.model.clone(), key)?),
         (Some(_), None) => {
@@ -77,13 +78,10 @@ pub async fn run() -> Result<()> {
     }
     // After the bind too: only the one daemon rewrites its threads' refs.
     for s in &sources {
-        if let Some((old, new)) = s.renamed() {
-            let threads = store.rename_refs(&old, &new)?;
+        if let Some(start) = s.ref_start() {
+            let threads = store.settle_refs(s.name(), &start)?;
             if threads > 0 {
-                tracing::info!(
-                    "{} names its sessions {new}… where it wrote {old}…: {threads} thread(s) updated",
-                    s.name()
-                );
+                tracing::info!("{} names its sessions {}… now: {threads} thread(s) updated", s.name(), start.now);
             }
         }
     }
