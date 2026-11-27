@@ -35,6 +35,11 @@ pub trait Source: Send + Sync {
     /// `None` when the two are not a session this source would list.
     fn session_ref(&self, project: &str, session: &str) -> Option<String>;
 
+    /// Whether `word` is the ref of a session this source can list and never
+    /// wakes, because it runs on another machine.
+    async fn elsewhere(&self, _word: &str) -> bool {
+        false
+    }
     /// Run once when the daemon starts; an error stops it. For what the config
     /// says about this source that only the source's tool can confirm.
     async fn check(&mut self) -> Result<()> {

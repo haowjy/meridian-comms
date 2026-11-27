@@ -556,6 +556,18 @@ impl Source for Meridian {
         }
     }
 
+    async fn elsewhere(&self, word: &str) -> bool {
+        let Some((machine, _, _)) = self.split_ref(word) else {
+            return false;
+        };
+        // A list that can't be read leaves the plain "matches no running session".
+        machine != self.machine
+            && self
+                .saved_machines()
+                .await
+                .is_ok_and(|saved| saved.iter().any(|m| m.name == machine))
+    }
+
     fn session_ref(&self, project: &str, session: &str) -> Option<String> {
         (self.projects.contains_key(project) && is_id(session)).then(|| self.ref_of(project, session))
     }

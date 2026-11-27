@@ -222,7 +222,7 @@ impl Core {
                 if listing.resolve(w).is_none() {
                     bail!(
                         "{} Use a ref or short ID from `meridian-comms list`, or @person.",
-                        listing.why_not(w)
+                        self.why_not(&listing, w).await
                     );
                 }
             }

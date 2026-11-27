@@ -487,8 +487,8 @@ final and is not repeated. Every other word means nothing was sent and the item 
 **Waking stays on this machine.** The picker, `to:` and `send --to` list only the
 configured projects' sessions here: the projects in the config are directories on this
 machine, and so are the rules about who may post. A session on a saved machine can be
-offered an item and nothing else; `to:` with its ref answers that no running session
-matches.
+offered an item and nothing else; `to:` or `send --to` with its ref answers that it is
+on another machine and can be offered a message but not woken from Slack.
 
 ## Not built yet
 

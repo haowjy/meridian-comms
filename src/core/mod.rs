@@ -113,8 +113,8 @@ impl Listing {
         }
     }
 
-    /// Why `resolve` found nothing for `word`.
-    pub fn why_not(&self, word: &str) -> String {
+    /// Why `resolve` found nothing for `word`, as far as the listing can tell.
+    fn why_not(&self, word: &str) -> String {
         let ids: Vec<&str> = self
             .candidates
             .iter()
@@ -132,6 +132,19 @@ impl Listing {
 }
 
 impl Core {
+    /// Why `listing` resolved nothing for the `to:` or `--to` word `word`.
+    async fn why_not(&self, listing: &Listing, word: &str) -> String {
+        for s in &self.sources {
+            if s.elsewhere(word).await {
+                return format!(
+                    "`{}` is on another machine: sessions there can be offered a message but not woken from Slack.",
+                    text::clean(word)
+                );
+            }
+        }
+        listing.why_not(word)
+    }
+
     pub fn new(
         cfg: Config,
         surface: Arc<dyn Surface>,

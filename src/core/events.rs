@@ -249,7 +249,7 @@ impl Core {
                 self.store.save_thread(&st)?;
                 let msg = format!(
                     "I can't match it: {}\n{}",
-                    listing.why_not(bad),
+                    self.why_not(&listing, bad).await,
                     self.explain(&owner, project.as_deref(), &listing, &[], None, &[], true)
                 );
                 let menu = self.menu(&owner, &listing);
