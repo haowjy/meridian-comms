@@ -84,19 +84,17 @@ struct Idle {
 
 impl Meridian {
     pub fn new(cfg: &Config, m: &MeridianConfig) -> Result<Self> {
-        let mut projects = BTreeMap::new();
-        for (name, p) in &m.projects {
-            if name.contains('/') {
-                bail!("sources.meridian.projects.{name}: a project name contains no '/'");
-            }
-            projects.insert(
-                name.clone(),
-                Project {
+        let projects = m
+            .projects
+            .iter()
+            .map(|(name, p)| {
+                let project = Project {
                     root: p.root.clone(),
                     default: p.default.clone(),
-                },
-            );
-        }
+                };
+                (name.clone(), project)
+            })
+            .collect();
         Ok(Self {
             machine: cfg.machine().to_string(),
             owner: cfg.owner.clone(),
@@ -109,19 +107,17 @@ impl Meridian {
         format!("{}/{project}/{id}", self.machine)
     }
 
-    /// `machine/project/spawn-id` of a ref this source composed.
-    fn parse_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
+    /// `machine/project/spawn-id` of any Meridian ref on this machine. A project
+    /// ID may itself hold a `/`, so the spawn ID is split off the end.
+    fn split_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
         let rest = r.strip_prefix(self.machine.as_str())?.strip_prefix('/')?;
-        let (project, id) = rest.split_once('/')?;
-        self.projects.contains_key(project).then_some((project, id))
+        let (project, id) = rest.rsplit_once('/')?;
+        is_id(id).then_some((project, id))
     }
 
-    /// `machine/project/spawn-id` of any Meridian ref on this machine, whether
-    /// or not its project is configured: the spawn ID alone names the session.
-    fn spawn_of<'a>(&self, r: &'a str) -> Option<&'a str> {
-        let rest = r.strip_prefix(self.machine.as_str())?.strip_prefix('/')?;
-        let (_, id) = rest.split_once('/')?;
-        is_id(id).then_some(id)
+    /// The project and spawn ID of a ref in a configured project.
+    fn parse_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
+        self.split_ref(r).filter(|(project, _)| self.projects.contains_key(*project))
     }
 
     /// One project's running primaries, or with no project every project's.
@@ -518,7 +514,8 @@ impl Source for Meridian {
     }
 
     async fn offer(&self, item: &str, ref_: &str) -> Result<OfferResult> {
-        let id = self.spawn_of(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
+        // The spawn ID alone names the session, whether or not its project is configured.
+        let (_, id) = self.split_ref(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
