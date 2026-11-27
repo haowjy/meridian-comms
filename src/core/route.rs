@@ -328,22 +328,27 @@ impl Core {
         let one = tokio::time::timeout(SECOND_STEP_QUEUE, self.second.acquire())
             .await
             .context("dropped after 15 minutes waiting for another second step to finish")??;
-        let second = tokio::time::timeout(SECOND_STEP_GUARD, source.decide(&req))
-            .await
-            .context("the second step hung")??;
+        // The run's ID goes in the log before its end is known.
+        let decided = tokio::time::timeout(SECOND_STEP_GUARD, async {
+            let Some(run) = source.start_decision(&req).await? else {
+                return Ok(None);
+            };
+            let run = route.record.insert(run);
+            source.decision(&req, run).await.map(Some)
+        })
+        .await
+        .unwrap_or_else(|_| bail!("the second step hung"));
         drop(one);
-        let Some(second) = second else {
+        let Some(decided) = decided? else {
             let why = if unsure { "was not sure enough" } else { "asked for more" };
             return none(&format!("the model {why}, and {} has no second step", source.name()));
         };
-        route.record = second.record;
-        match second.decision {
+        match decided {
             Decision::Offer(r) => match kept.iter().find(|c| c.ref_ == r) {
                 Some(c) => Ok(Second::Offer(c)),
                 None => none("the second step named a session that was not listed"),
             },
             Decision::None => none("the second step chose no session"),
-            Decision::Failed(why) => bail!("the second step did not decide: {why}"),
             Decision::Ask(q) => {
                 let Some(t) = thread else {
                     return none("the second step asked a question, and the item has no thread to ask in");

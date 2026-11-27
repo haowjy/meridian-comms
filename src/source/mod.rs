@@ -2,7 +2,7 @@
 //! message) and `wake` (send one of them a notice); one whose sessions run on
 //! this machine also answers `identify`. A source may also keep an inbox, where
 //! its sessions look for messages nobody was woken for: `file`, `inbox_item`,
-//! `offer`, `take` and `decide` are optional, and their defaults say "not
+//! `offer`, `take` and the second step are optional, and their defaults say "not
 //! supported". A source never starts a session, touches the surface, or keeps
 //! state between calls.
 
@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::model::{
-    DecideRequest, Decided, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListRequest, ListResponse, OfferResult,
+    DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListRequest, ListResponse, OfferResult,
     WakeRequest, WakeResult,
 };
 
@@ -45,9 +45,15 @@ pub trait Source: Send + Sync {
     async fn take(&self, _item: &str, _by: &str) -> Result<()> {
         bail!("{} has no inbox", self.name())
     }
-    /// The second step of routing. `None`: this source has none.
-    async fn decide(&self, _req: &DecideRequest) -> Result<Option<Decided>> {
+    /// Starts the second step of routing and names the run, for the log.
+    /// `None`: this source has none.
+    async fn start_decision(&self, _req: &DecideRequest) -> Result<Option<String>> {
         Ok(None)
+    }
+    /// Waits for the run `start_decision` named and gives what it decided. The
+    /// run bounds itself; an error is a run that came to no decision.
+    async fn decision(&self, _req: &DecideRequest, _run: &str) -> Result<Decision> {
+        bail!("{} has no second step", self.name())
     }
     /// The item a `route` run from this environment was called for.
     fn routed_item(&self, _req: &IdentifyRequest) -> Option<String> {

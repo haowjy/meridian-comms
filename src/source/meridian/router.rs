@@ -9,14 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 
 use super::{Meridian, PROGRAM, field, is_id, run, tail};
-use crate::model::{ActivityState, Candidate, DecideRequest, Decided, Decision};
+use crate::model::{ActivityState, Candidate, DecideRequest, Decision};
 use crate::paths;
 
 const PROFILE: &str = "inbox-router";
@@ -25,8 +25,10 @@ pub const PACKAGE: &str = "haowjy/meridian-base";
 /// Minutes: the spawn's own limit and the wait's. The spawn carries its limit
 /// itself, so it ends even if this process dies.
 const LIMIT: &str = "5";
-/// The wait enforces `LIMIT` itself; this only bounds a `meridian` that hangs.
-const WAIT_GUARD: Duration = Duration::from_secs(6 * 60);
+const LIMIT_TIME: Duration = Duration::from_secs(5 * 60);
+/// Past the limit, for the spawn to end itself before it is called stuck.
+const WAIT_SLACK: Duration = Duration::from_secs(30);
+const WAIT_AGAIN: Duration = Duration::from_secs(5);
 const TEXT_BYTES: usize = 4096;
 const GOALS_AT_ONCE: usize = 4;
 const GOAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -128,6 +130,13 @@ fn activity(c: &Candidate) -> &'static str {
     }
 }
 
+/// The candidates the agent may name, each by the ID its decision line uses.
+fn sessions(req: &DecideRequest) -> impl Iterator<Item = (&str, &Candidate)> {
+    req.candidates
+        .iter()
+        .filter_map(|c| Some((c.id.as_deref().filter(|id| is_id(id))?, c)))
+}
+
 /// What the profile expects: the message's text marked as someone else's
 /// words, who sent it, and the sessions that could take it, each by the ID
 /// the decision line must use.
@@ -209,7 +218,8 @@ impl Meridian {
             .await
     }
 
-    pub(super) async fn second_step(&self, req: &DecideRequest) -> Result<Option<Decided>> {
+    /// Starts the agent on `req` and gives its spawn ID.
+    pub(super) async fn launch_router(&self, req: &DecideRequest) -> Result<String> {
         let dir = dir();
         if !dir.join("mars.toml").exists() {
             bail!(
@@ -218,15 +228,12 @@ impl Meridian {
             );
         }
         let goals = self.goals(&req.candidates).await;
-        let listed: Vec<(&str, &Candidate, Option<String>)> = req
-            .candidates
-            .iter()
-            .filter_map(|c| {
+        let listed: Vec<(&str, &Candidate, Option<String>)> = sessions(req)
+            .map(|(id, c)| {
                 let goal = c.root.clone().zip(c.group.clone()).and_then(|at| goals.get(&at).cloned());
-                Some((c.id.as_deref().filter(|id| is_id(id))?, c, goal))
+                (id, c, goal)
             })
             .collect();
-        let sessions: BTreeMap<&str, &str> = listed.iter().map(|(id, c, _)| (*id, c.ref_.as_str())).collect();
 
         let file = PromptFile::write(&dir, &prompt(req, &listed))?;
         let path = file.0.to_string_lossy().into_owned();
@@ -256,35 +263,44 @@ impl Meridian {
         // Stdout is one JSON value; a launch that failed names its error there.
         let launched: Value =
             serde_json::from_slice(&launch.stdout).with_context(|| format!("the second step did not start: {}", tail(&launch.stderr)))?;
-        let Some(id) = field(&launched["spawn_id"]).filter(|id| is_id(id)) else {
-            bail!(
+        match field(&launched["spawn_id"]).filter(|id| is_id(id)) {
+            Some(id) => Ok(id),
+            None => bail!(
                 "the second step did not start: {}",
                 launched["error"].as_str().unwrap_or("meridian spawn gave no spawn ID")
-            );
-        };
+            ),
+        }
+    }
 
-        let waited = tokio::time::timeout(
-            WAIT_GUARD,
-            run(Some(&dir), &["spawn", "wait", &id, "--timeout", LIMIT, "--no-observe", "--json"]),
-        )
-        .await;
-        let shown = run(Some(&dir), &["spawn", "show", &id, "--json", "--full", "--no-observe"]).await?;
-        let shown: Value = serde_json::from_slice(&shown.stdout).with_context(|| format!("cannot read the second step {id}"))?;
-        let status = shown["status"].as_str().unwrap_or("unknown");
-        let decision = if status == "succeeded" {
-            decision(shown["report_body"].as_str().unwrap_or_default(), &sessions)
-        } else {
-            // Still going after the wait gave up: end it. A finished spawn ignores this.
-            let _ = run(Some(&dir), &["spawn", "cancel", &id]).await;
-            Decision::Failed(if waited.is_err() {
-                "the wait hung".into()
-            } else {
-                format!("it ended {status}")
-            })
-        };
-        Ok(Some(Decided {
-            decision,
-            record: Some(id),
-        }))
+    /// Waits for the spawn `id` to end and reads the decision off its report.
+    pub(super) async fn router_decision(&self, req: &DecideRequest, id: &str) -> Result<Decision> {
+        if !is_id(id) {
+            bail!("{id:?} is not a spawn ID");
+        }
+        let dir = dir();
+        let give_up = Instant::now() + LIMIT_TIME + WAIT_SLACK;
+        loop {
+            // The wait only blocks: what happened is read from the spawn itself.
+            let _ = tokio::time::timeout(
+                LIMIT_TIME + WAIT_SLACK,
+                run(Some(&dir), &["spawn", "wait", id, "--timeout", LIMIT, "--no-observe", "--json"]),
+            )
+            .await;
+            let shown = run(Some(&dir), &["spawn", "show", id, "--json", "--full", "--no-observe"]).await?;
+            let shown: Value = serde_json::from_slice(&shown.stdout).with_context(|| format!("cannot read the second step {id}"))?;
+            match shown["status"].as_str().unwrap_or("unknown") {
+                "succeeded" => {
+                    let known: BTreeMap<&str, &str> = sessions(req).map(|(id, c)| (id, c.ref_.as_str())).collect();
+                    return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known));
+                }
+                status @ ("failed" | "cancelled" | "timed_out") => bail!("the second step ended {status}"),
+                // Still going: a wait that failed early says nothing about the spawn.
+                _ if Instant::now() < give_up => tokio::time::sleep(WAIT_AGAIN).await,
+                status => {
+                    let _ = run(Some(&dir), &["spawn", "cancel", id]).await;
+                    bail!("the second step was still {status} past its {LIMIT}-minute limit, and was cancelled");
+                }
+            }
+        }
     }
 }

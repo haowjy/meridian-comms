@@ -22,8 +22,8 @@ use tokio::process::Command;
 use super::Source;
 use crate::config::{Config, MeridianConfig};
 use crate::model::{
-    Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decided, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem,
-    ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
+    Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult,
+    InboxItem, ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -575,8 +575,12 @@ impl Source for Meridian {
         }
     }
 
-    async fn decide(&self, req: &DecideRequest) -> Result<Option<Decided>> {
-        self.second_step(req).await
+    async fn start_decision(&self, req: &DecideRequest) -> Result<Option<String>> {
+        self.launch_router(req).await.map(Some)
+    }
+
+    async fn decision(&self, req: &DecideRequest, run: &str) -> Result<Decision> {
+        self.router_decision(req, run).await
     }
 
     fn routed_item(&self, req: &IdentifyRequest) -> Option<String> {

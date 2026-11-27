@@ -239,16 +239,6 @@ pub enum Decision {
     /// A question for whoever wrote the message, in the decider's own words:
     /// untrusted, since what it read may have steered it.
     Ask(String),
-    /// The run started and came to no decision: why, in the source's words.
-    Failed(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Decided {
-    pub decision: Decision,
-    /// The source's ID for the run that decided, for the routing log.
-    #[serde(default)]
-    pub record: Option<String>,
 }
 
 // ---- surface ----
