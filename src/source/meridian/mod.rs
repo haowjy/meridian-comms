@@ -265,6 +265,27 @@ fn meridian_command(root: Option<&Path>) -> Command {
     cmd
 }
 
+/// Whether a failed `spawn show` says the session does not exist. Meridian has
+/// said it three ways, on either stream: `{"error": "… not found"}`, the same
+/// with a top-level `"kind": "not_found"`, and through `--machine`
+/// `{"error": {"kind", "text"}}`, where the kind was `failed` with the far
+/// side's "not found" text before it became `not_found`. The text counts
+/// only under no kind or `failed`: an `unreachable` whose `ssh` found no
+/// command is not a missing session. An unknown machine reads as not found
+/// too, and such a machine lists no candidates.
+fn not_found(out: &std::process::Output) -> bool {
+    let said = |text: &Value| text.as_str().is_some_and(|t| t.contains("not found"));
+    [&out.stdout, &out.stderr]
+        .into_iter()
+        .flat_map(|stream| stream.split(|b| *b == b'\n'))
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .any(|e| match e["kind"].as_str().or(e["error"]["kind"].as_str()) {
+            Some("not_found") => true,
+            Some("failed") | None => said(&e["error"]) || said(&e["error"]["text"]),
+            Some(_) => false,
+        })
+}
+
 fn rows(out: std::process::Output) -> Result<Rows> {
     if !out.status.success() {
         bail!("meridian spawn list failed: {}{}", tail(&out.stdout), tail(&out.stderr));
@@ -653,9 +674,7 @@ impl Source for Meridian {
         // saved names no candidate, wherever it is looked for.
         // A chat Meridian does not find is taken as gone, so not a candidate;
         // any other failure, a machine that can't be reached among them, fails
-        // the read, or the sender would be offered its own message. A local
-        // `spawn show` prints its error as JSON on stderr, one through
-        // `--machine` on stdout.
+        // the read, or the sender would be offered its own message.
         let mut from = None;
         let sender = &v["from"];
         if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
@@ -672,20 +691,12 @@ impl Source for Meridian {
             }
             let out = run(None, &args).await?;
             let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            let gone = || {
-                let errors = String::from_utf8_lossy(&out.stderr);
-                shown["error"]["kind"] == "not_found"
-                    || errors
-                        .lines()
-                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                        .any(|e| e["error"].as_str().is_some_and(|e| e.contains("not found")))
-            };
             match field(&shown["spawn_id"]).filter(|id| is_id(id)) {
                 Some(id) => {
                     let machine = machine.as_deref().unwrap_or(&self.machine);
                     from = field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}"));
                 }
-                None if gone() => {}
+                None if not_found(&out) => {}
                 None => bail!(
                     "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
                     tail(&out.stdout),
