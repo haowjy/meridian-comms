@@ -82,6 +82,7 @@ fn awake(c: &Candidate, now: DateTime<Utc>) -> bool {
 fn describe(c: &Candidate, now: DateTime<Utc>) -> String {
     let named = |word: &str, v: &Option<String>| v.as_ref().map(|v| format!("{word} {v}"));
     [
+        named("machine", &c.machine),
         named("project", &c.project),
         named("agent", &c.label),
         named("work item", &c.group),
@@ -276,7 +277,7 @@ impl Core {
         let listing = self
             .list(&ListRequest {
                 person: Some(owner.clone()),
-                any_project: true,
+                offerable: true,
                 ..Default::default()
             })
             .await;
@@ -292,7 +293,7 @@ impl Core {
             .filter(|(i, c)| *i == src && c.person == *owner)
             .map(|(_, c)| c)
             .filter(|c| item.project.is_none() || c.project == item.project)
-            .filter(|c| item.from.is_none() || c.id != item.from)
+            .filter(|c| item.from.as_ref() != Some(&c.ref_))
             .filter(|c| awake(c, now))
             .collect();
         if kept.is_empty() {

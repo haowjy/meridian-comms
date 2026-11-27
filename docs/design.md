@@ -8,8 +8,8 @@ why. Slack setup is in [slack-setup.md](slack-setup.md).
 ## Shape
 
 ```
-Slack ── surface ──┐                        ┌── source: meridian  (this machine's primaries)
-                   ├── core: thread state ──┤
+Slack ── surface ──┐                        ┌── source: meridian  (this machine's primaries;
+                   ├── core: thread state ──┤    saved machines' too, for an offer)
 session ─ client ──┘        + wake rule     └── source: amp, remote (later)
 ```
 
@@ -150,23 +150,26 @@ The daemon routes each accepted item in its own task (`src/core/route.rs`):
 1. Read the item through its source. Stop if it is taken.
 2. Find the thread it was filed from by `filed.item` in the thread files, never by the
    item's `via`: anyone can file an item that claims to come from here.
-3. List the owner's running sessions in every project (`ListRequest.any_project`; the
-   Meridian source makes one `spawn list --global --primary --json` call).
+3. List every session the item could be offered to (`ListRequest.offerable`): the
+   owner's running sessions in every project, on this machine and on each
+   [saved machine](#saved-machines).
 4. Keep a session only if it is in the item's project (an item with no project: any), is
    not the item's sender, and is working or idle with `warm_until` ahead. A session with
    no activity is dropped. None kept, or more than 253: stop, the item waits.
 5. Ask Jev (`src/jev.rs`), TypeSafe AI's decision model on OpenCode: one HTTP request
    with a `state` string and one `choice` question. The state is the item's text (first
    4 KiB) with its sender, `via` and project. The options are `s1`…`sN`, one per kept
-   session, described by project, agent, work item and activity, plus `none` and `more`.
+   session, described by machine, project, agent, work item and activity, plus `none` and
+   `more`.
    Jev answers with a choice and a probability per option; it writes no text.
 6. A listed session whose probability is at least `floor` is offered the item. `more`,
    or a session under the floor, goes to the source's [second step](#the-second-step).
    Anything else is `none`.
-7. Offer through the source (`meridian inbox offer <item> <spawn-id>`). Meridian sends
-   its own fixed notice, which never carries the text, and refuses a session that is
-   cold, not running, not a primary, or in another project. A refusal is logged with
-   Meridian's word for it and the item waits.
+7. Offer through the source (`meridian inbox offer <item> <spawn-id>`, or
+   `<machine>/<spawn-id>` for a session on a saved machine). Meridian sends its own
+   fixed notice, which never carries the text, and refuses a session that is cold, not
+   running, not a primary, or in another project. A refusal is logged with Meridian's
+   word for it and the item waits.
 8. If the item came from a thread, take the thread's lock and add "m412 offered to
    `<ref>` (<activity> when listed)" under the post that names the item. The picker keeps
    its menu: an offer is a guess, and a person can still choose.
@@ -231,8 +234,9 @@ to. `[router].model` does not change it: that setting is Jev's, and Jev is paid 
   still runs is repeated. A spawn that ended any way but `succeeded` is a failed run; one
   still running 30 seconds past its limit is cancelled. The spawn's ID is in the log
   either way.
-- **The decision** is the last non-empty line of the report: `offer <spawn-id>` for a
-  session on the list, `none`, or `ask <question>`. Anything else is `none`: more words
+- **The decision** is the last non-empty line of the report: `offer <session>` for a
+  session on the list, by the name the list gave it (`p41`, or `jimyao-minibox/p41` on
+  a saved machine), `none`, or `ask <question>`. Anything else is `none`: more words
   after the ID, an ID not on the list, a bare `ask`, a line wrapped in backticks or a
   code fence.
 - **One at a time.** The core runs one second step at once; the next waits, and one that
@@ -292,7 +296,8 @@ stops it with an error that says which.
 
 ```toml
 owner = "jimmy"                  # the person whose agents this daemon wakes
-machine = "desk"                 # optional; default: the hostname. Starts every ref.
+machine = "desk"                 # optional; default: the hostname. Starts every ref only
+                                 # where Meridian has no name for the machine (before 0.28).
 
 [surface.slack.channels.C0123ABCD]   # the channel's Slack ID
 name = "meridian-cli"                # the name in message refs
@@ -419,9 +424,10 @@ without it finds the same path as the daemon.
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
 `spawn message` and, at start, `context --json`. For the machine it runs in the home
-directory with no `-C`: `spawn list --global --primary --json`, `message inbox`,
-`inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an item's sender
-(a chat ID) into the spawn ID a candidate carries. The second step adds `work show` in a
+directory with no `-C`: `machine name`, `spawn list --global --primary --json`,
+`message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
+item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it
+adds `machine list --json` and `--machine <name>` on that listing and that `spawn show`. The second step adds `work show` in a
 candidate's project and, in the router directory, `spawn`, `spawn wait`, `spawn show`
 and `spawn cancel`. Rows may carry `agent`, `work_id`,
 `activity` and an `idle` object. `activity` of `turn_active`, `starting` or `finalizing`
@@ -431,7 +437,43 @@ user-loop turn ended": a Claude primary running a turn that something injected (
 a task notification) keeps its old `since`. The row has no `waiting_on_user`, and the
 source never reports "waiting".
 
+## Saved machines
+
+A ref is `machine/project/spawn-id`, and the machine is the name Meridian gives it
+(`meridian machine name`, and the `machine` of every row it lists), so the daemon, the
+client and Meridian's own notices name a session the same way. A daemon that finds
+refs in its thread files starting with the name it composed before (the config's
+`machine`, or the hostname) rewrites them at start, in `scope`, `woken` and `pending`:
+a thread keeps the sessions it chose.
+
+For an offer the Meridian source also lists the primaries of every machine Meridian has
+saved (`meridian machine list`): one `spawn list --global --primary --json --machine M`
+each, all at once, beside the local listing. Each has 8 seconds. One that answers takes
+about 2; one that is down, too old or slow contributes no sessions, is logged, and
+fails nothing. The whole listing stays under the core's 15-second limit however many
+machines are saved.
+
+Two machines can each have a `p41`. Their refs differ, the model's options are numbered,
+and the second step's agent names a session on another machine as `<machine>/p41`,
+which is also what `meridian inbox offer` takes. The offer always runs on this machine,
+where the item is. A sender on another machine is left out of the candidates as a local
+one is: `spawn show <chat> --machine <its machine>` gives its spawn ID. If that machine
+can't be reached the routing fails and the item waits, since its sender could not be
+told from the candidates.
+
+An offer that crosses machines can fail in more ways, and the log carries Meridian's
+word for each. `maybe_delivered` means the notice may have arrived: the routing is
+final and is not repeated. Every other word means nothing was sent and the item waits:
+`unreachable`, and from a machine whose Meridian is too old for the inbox `refused`,
+`usage` or `version`.
+
+**Waking stays on this machine.** The picker, `to:` and `send --to` list only the
+configured projects' sessions here: the projects in the config are directories on this
+machine, and so are the rules about who may post. A session on a saved machine can be
+offered an item and nothing else; `to:` with its ref answers that no running session
+matches.
+
 ## Not built yet
 
-Offers to sessions on other machines, and the Amp source. Refs already start with the machine name, and the
-client already talks to the daemon in JSON.
+The Amp source, and waking a session on another machine. The client already talks to
+the daemon in JSON.

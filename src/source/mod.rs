@@ -28,6 +28,12 @@ pub trait Source: Send + Sync {
     async fn check(&self) -> Result<()> {
         Ok(())
     }
+    /// After `check`: the start of the refs this source used to compose and the
+    /// start it composes now, when they differ. The daemon rewrites the refs
+    /// its threads hold, so a thread keeps the sessions it chose.
+    fn renamed(&self) -> Option<(String, String)> {
+        None
+    }
     /// Puts a message where this source's sessions look. `None`: no inbox.
     async fn file(&self, _req: &FileRequest) -> Result<Option<Filed>> {
         Ok(None)

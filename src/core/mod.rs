@@ -215,7 +215,7 @@ impl Core {
                 person: Some(owner.clone()),
                 project: project.clone(),
                 refs,
-                any_project: false,
+                offerable: false,
             })
             .await;
         for p in persons.iter().filter(|p| **p != owner) {
@@ -224,7 +224,7 @@ impl Core {
                     person: Some(p.clone()),
                     project: project.clone(),
                     refs: vec![],
-                    any_project: false,
+                    offerable: false,
                 })
                 .await,
             );

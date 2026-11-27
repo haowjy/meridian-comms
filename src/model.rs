@@ -15,6 +15,9 @@ pub struct Candidate {
     #[serde(default)]
     pub id: Option<String>,
     pub person: String,
+    /// The machine the session runs on, when the source knows it.
+    #[serde(default)]
+    pub machine: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
@@ -68,10 +71,12 @@ pub struct ListRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub refs: Vec<String>,
-    /// Every project the person's sessions run in, configured or not: what the
-    /// router lists. `project` and `refs` are not read with it.
+    /// Every session an inbox item could be offered to: in any project,
+    /// configured or not, on this machine and on each one the source can
+    /// reach. What the router lists; `project` and `refs` are not read with
+    /// it. A source need not be able to wake what it lists here.
     #[serde(default)]
-    pub any_project: bool,
+    pub offerable: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -188,7 +193,8 @@ pub struct Filed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxItem {
     pub text: String,
-    /// The short ID of the session that filed it, if a session did.
+    /// The ref of the session that filed it, if a session did and the source
+    /// can still name it.
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]

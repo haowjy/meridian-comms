@@ -8,8 +8,9 @@ pub mod router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -28,11 +29,18 @@ use crate::model::{
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one saved machine may take to list its sessions. Measured: about
+/// 2 s for one that answers; `ssh` itself gives up connecting after 10.
+const MACHINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// What this program calls itself in an inbox item's `via` and in a claim.
 const PROGRAM: &str = "meridian-comms";
 
 pub struct Meridian {
-    machine: String,
+    /// This machine's name, as Meridian gives it in every row: asked once.
+    name: OnceLock<String>,
+    /// The config's `machine`: the name where Meridian has none to give
+    /// (before 0.28).
+    fallback: String,
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
@@ -77,6 +85,9 @@ struct Row {
     project_id: Option<String>,
     #[serde(default)]
     project_root: Option<String>,
+    /// From 0.28: the machine the session runs on.
+    #[serde(default)]
+    machine: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +124,8 @@ impl Meridian {
             })
             .collect();
         Ok(Self {
-            machine: cfg.machine().to_string(),
+            name: OnceLock::new(),
+            fallback: cfg.machine().to_string(),
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
@@ -121,43 +133,82 @@ impl Meridian {
         })
     }
 
+    /// The daemon and the client both ask, so a session's own ref and the
+    /// listing's ref for it are one string.
+    fn machine(&self) -> &str {
+        self.name.get_or_init(|| {
+            let mut cmd = meridian_command(None).into_std();
+            cmd.args(["machine", "name"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter(|name| is_id(name))
+                .unwrap_or_else(|| self.fallback.clone())
+        })
+    }
+
     fn ref_of(&self, project: &str, id: &str) -> String {
-        format!("{}/{project}/{id}", self.machine)
+        format!("{}/{project}/{id}", self.machine())
     }
 
-    /// `machine/project/spawn-id` of any Meridian ref on this machine. A project
-    /// ID may itself hold a `/`, so the spawn ID is split off the end.
-    fn split_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
-        let rest = r.strip_prefix(self.machine.as_str())?.strip_prefix('/')?;
+    /// The machine, project and spawn ID of a Meridian ref. A project ID may
+    /// itself hold a `/`, so the machine comes off the front and the spawn ID
+    /// off the end.
+    fn split_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str, &'a str)> {
+        let (machine, rest) = r.split_once('/')?;
         let (project, id) = rest.rsplit_once('/')?;
-        is_id(id).then_some((project, id))
+        (is_id(machine) && is_id(id)).then_some((machine, project, id))
     }
 
-    /// The project and spawn ID of a ref in a configured project.
+    /// The project and spawn ID of a ref on this machine, in a configured
+    /// project: the only sessions this source wakes.
     fn parse_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
-        self.split_ref(r).filter(|(project, _)| self.projects.contains_key(*project))
+        let (machine, project, id) = self.split_ref(r)?;
+        (machine == self.machine() && self.projects.contains_key(project)).then_some((project, id))
     }
 
-    /// One project's running primaries, or with no project every project's.
-    async fn primaries(&self, project: Option<&str>) -> Result<Rows> {
-        let out = match project {
-            Some(p) => {
-                run(
-                    Some(&self.projects[p].root),
-                    &["spawn", "list", "--primary", "--json", "--limit", "200"],
-                )
-                .await?
-            }
-            None => run(None, &["spawn", "list", "--global", "--primary", "--json"]).await?,
-        };
-        if !out.status.success() {
-            bail!("meridian spawn list failed: {}", tail(&out.stderr));
+    /// How a Meridian command on this machine names the session of a ref: the
+    /// spawn ID, with its machine in front when that is another one.
+    pub(super) fn target(&self, r: &str) -> Option<String> {
+        let (machine, _, id) = self.split_ref(r)?;
+        Some(if machine == self.machine() {
+            id.to_string()
+        } else {
+            format!("{machine}/{id}")
+        })
+    }
+
+    /// One project's running primaries.
+    async fn primaries(&self, project: &str) -> Result<Rows> {
+        let root = &self.projects[project].root;
+        rows(run(Some(root), &["spawn", "list", "--primary", "--json", "--limit", "200"]).await?)
+    }
+
+    /// Every project's running primaries, on this machine or a saved one.
+    async fn everywhere(&self, machine: Option<&str>) -> Result<Rows> {
+        let mut args = vec!["spawn", "list", "--global", "--primary", "--json"];
+        if let Some(m) = machine {
+            args.extend(["--machine", m]);
         }
-        serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
+        rows(run(None, &args).await?)
     }
 
-    fn candidate(&self, project: &str, row: Row) -> Candidate {
-        let configured = self.projects.get(project);
+    /// The machines Meridian has saved, by name. None on a Meridian without them.
+    async fn saved_machines(&self) -> Vec<String> {
+        let Ok(out) = run(None, &["machine", "list", "--json"]).await else {
+            return vec![];
+        };
+        let listed: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let names = listed["machines"].as_array().into_iter().flatten();
+        names.filter_map(|m| field(&m["name"])).filter(|n| is_id(n)).collect()
+    }
+
+    /// `machine` is where the listing ran; a row that names its own machine wins.
+    fn candidate(&self, machine: &str, project: &str, row: Row) -> Candidate {
+        let machine = row.machine.as_deref().filter(|m| is_id(m)).unwrap_or(machine);
+        let here = machine == self.machine();
+        let configured = self.projects.get(project).filter(|_| here);
         let own = configured.and_then(|p| p.default.clone());
         let default = row.agent.is_some() && row.agent == own.or_else(|| self.default.clone());
         // `idle` is measured from the last turn the user's loop ended, so a row
@@ -177,16 +228,22 @@ impl Meridian {
             }),
         };
         Candidate {
-            ref_: self.ref_of(project, &row.spawn_id),
+            ref_: format!("{machine}/{project}/{}", row.spawn_id),
             id: Some(row.spawn_id),
             person: self.owner.clone(),
+            machine: Some(machine.to_string()),
             project: Some(project.to_string()),
             group: row.work_id,
             label: row.agent,
             model: row.model,
             default,
             activity,
-            root: row.project_root.map(PathBuf::from).or_else(|| configured.map(|p| p.root.clone())),
+            // A path on another machine is no use to a command run here.
+            root: row
+                .project_root
+                .filter(|_| here)
+                .map(PathBuf::from)
+                .or_else(|| configured.map(|p| p.root.clone())),
         }
     }
 }
@@ -209,6 +266,13 @@ fn meridian_command(root: Option<&Path>) -> Command {
     };
     cmd.stdin(Stdio::null()).kill_on_drop(true);
     cmd
+}
+
+fn rows(out: std::process::Output) -> Result<Rows> {
+    if !out.status.success() {
+        bail!("meridian spawn list failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+    }
+    serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
 }
 
 async fn run(root: Option<&Path>, args: &[&str]) -> Result<std::process::Output> {
@@ -299,13 +363,38 @@ impl Source for Meridian {
 
     async fn list(&self, req: &ListRequest) -> Result<ListResponse> {
         let for_owner = req.person.as_deref() == Some(self.owner.as_str());
-        if req.any_project {
+        if req.offerable {
             let mut out = ListResponse::default();
-            if for_owner {
-                let rows = self.primaries(None).await?;
+            if !for_owner {
+                return Ok(out);
+            }
+            // Every machine is asked at once, and each saved one has its own
+            // limit: one that is down or slow contributes none, and holds the
+            // listing no longer than that.
+            let elsewhere = async {
+                let saved = self.saved_machines().await;
+                join_all(saved.into_iter().map(|m| async move {
+                    let asked = Instant::now();
+                    let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
+                        Ok(rows) => rows,
+                        Err(_) => Err(anyhow::anyhow!("no answer")),
+                    };
+                    let took = asked.elapsed().as_secs_f32();
+                    match &rows {
+                        Ok(r) => tracing::debug!("{m} listed {} session(s) in {took:.1} s", r.spawns.len()),
+                        Err(e) => tracing::warn!("no sessions listed from {m} after {took:.1} s: {e:#}"),
+                    }
+                    Some((m, rows.ok()?))
+                }))
+                .await
+            };
+            let (here, there) = tokio::join!(self.everywhere(None), elsewhere);
+            let mut listed = vec![(self.machine().to_string(), here?)];
+            listed.extend(there.into_iter().flatten());
+            for (machine, rows) in listed {
                 for mut row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
                     if let Some(project) = row.project_id.take() {
-                        out.candidates.push(self.candidate(&project, row));
+                        out.candidates.push(self.candidate(&machine, &project, row));
                     }
                 }
             }
@@ -326,7 +415,7 @@ impl Source for Meridian {
             }
         }
 
-        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(Some(p)).await) })).await;
+        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(p).await) })).await;
         let mut out = ListResponse::default();
         for (project, rows) in answers {
             let rows = match rows {
@@ -347,7 +436,7 @@ impl Source for Meridian {
             for row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
                 let r = self.ref_of(project, &row.spawn_id);
                 if for_owner || own.contains(r.as_str()) {
-                    out.candidates.push(self.candidate(project, row));
+                    out.candidates.push(self.candidate(self.machine(), project, row));
                 }
             }
         }
@@ -480,6 +569,12 @@ impl Source for Meridian {
         Ok(())
     }
 
+    /// Refs once began with the config's `machine`; they begin with the name
+    /// Meridian gives this machine.
+    fn renamed(&self) -> Option<(String, String)> {
+        (self.fallback != self.machine()).then(|| (format!("{}/", self.fallback), format!("{}/", self.machine())))
+    }
+
     async fn file(&self, req: &FileRequest) -> Result<Option<Filed>> {
         if !self.inbox.load(Ordering::Relaxed) {
             return Ok(None);
@@ -512,7 +607,7 @@ impl Source for Meridian {
         let item = field(&v["message"])
             .filter(|m| is_id(m))
             .context("meridian message inbox gave no message ID")?;
-        let machine = field(&v["machine"]).unwrap_or_else(|| self.machine.clone());
+        let machine = field(&v["machine"]).unwrap_or_else(|| self.machine().to_string());
         Ok(Some(Filed {
             item,
             place: format!("{machine}'s inbox"),
@@ -532,28 +627,42 @@ impl Source for Meridian {
             Err(kind) if kind == "not_found" => return Ok(None),
             Err(kind) => bail!("meridian inbox read: {kind}"),
         };
-        // `from` names the sender's chat; a candidate is named by its spawn ID.
+        // `from` names the sender's chat and machine; a candidate is named by
+        // its spawn ID, so the sender's ref takes one more call, on its machine.
         // A chat Meridian does not find is taken as gone, so not a candidate;
-        // any other failure fails the read, or the sender would be offered
-        // its own message. Meridian prints this error as JSON on stderr.
+        // any other failure, a machine that can't be reached among them, fails
+        // the read, or the sender would be offered its own message. A local
+        // `spawn show` prints its error as JSON on stderr, one through
+        // `--machine` on stdout.
         let mut from = None;
-        if let Some(chat) = field(&v["from"]["id"]).filter(|id| v["from"]["kind"] == "session" && is_id(id)) {
-            let out = run(None, &["spawn", "show", &chat, "--json"]).await?;
-            from = serde_json::from_slice::<Value>(&out.stdout)
-                .ok()
-                .and_then(|s| field(&s["spawn_id"]));
+        let sender = &v["from"];
+        if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
+            let machine = field(&sender["machine"]).filter(|m| is_id(m) && m != self.machine());
+            let mut args = vec!["spawn", "show", &chat, "--json"];
+            if let Some(m) = &machine {
+                args.extend(["--machine", m]);
+            }
+            let out = run(None, &args).await?;
+            let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
             let gone = || {
                 let errors = String::from_utf8_lossy(&out.stderr);
-                errors
-                    .lines()
-                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                    .any(|e| e["error"].as_str().is_some_and(|e| e.contains("not found")))
+                shown["error"]["kind"] == "not_found"
+                    || errors
+                        .lines()
+                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                        .any(|e| e["error"].as_str().is_some_and(|e| e.contains("not found")))
             };
-            if from.is_none() && !gone() {
-                bail!(
-                    "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}",
+            match field(&shown["spawn_id"]).filter(|id| is_id(id)) {
+                Some(id) => {
+                    let machine = machine.as_deref().unwrap_or(self.machine());
+                    from = field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}"));
+                }
+                None if gone() => {}
+                None => bail!(
+                    "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
+                    tail(&out.stdout),
                     tail(&out.stderr)
-                );
+                ),
             }
         }
         Ok(Some(InboxItem {
@@ -572,18 +681,22 @@ impl Source for Meridian {
             bail!("this Meridian has no inbox");
         }
         // The spawn ID alone names the session, whether or not its project is configured.
-        let (_, id) = self.split_ref(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
+        let target = self.target(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
-        let out = run(None, &["inbox", "offer", item, id, "--json"]).await?;
+        // The item is on this machine, so the offer runs here whatever machine
+        // the session is on: never through `--machine`.
+        let out = run(None, &["inbox", "offer", item, &target, "--json"]).await?;
         Ok(match answer(&out)? {
             Ok(_) => OfferResult {
                 offered: Offered::Yes,
                 detail: String::new(),
             },
             // Only this kind means the notice may have arrived; every other
-            // (`refused`, `not_running`, `cold`, `taken`) sent nothing.
+            // sent nothing: `refused`, `not_running`, `cold`, `taken`, and from
+            // a machine that is down or too old for the inbox `unreachable`,
+            // `usage` or `version`.
             Err(kind) => OfferResult {
                 offered: if kind == "maybe_delivered" { Offered::Maybe } else { Offered::No },
                 detail: kind,

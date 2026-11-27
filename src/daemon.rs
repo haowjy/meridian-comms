@@ -75,6 +75,18 @@ pub async fn run() -> Result<()> {
     if cfg.sources.meridian.is_some() {
         meridian::router::sweep();
     }
+    // After the bind too: only the one daemon rewrites its threads' refs.
+    for s in &sources {
+        if let Some((old, new)) = s.renamed() {
+            let threads = store.rename_refs(&old, &new)?;
+            if threads > 0 {
+                tracing::info!(
+                    "{} names its sessions {new}… where it wrote {old}…: {threads} thread(s) updated",
+                    s.name()
+                );
+            }
+        }
+    }
     let surface: Arc<dyn Surface> = slack;
     let routes = routes::Log::open(&paths::state_dir())?;
     let core = Core::new(cfg, surface.clone(), sources, store, who.bot, jev, routes)?;

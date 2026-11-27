@@ -214,7 +214,7 @@ impl Core {
                 person: Some(owner.clone()),
                 project: project.clone(),
                 refs,
-                any_project: false,
+                offerable: false,
             })
             .await;
 
@@ -403,7 +403,7 @@ impl Core {
                 person: Some(self.cfg.owner.clone()),
                 project: project.clone(),
                 refs,
-                any_project: false,
+                offerable: false,
             })
             .await;
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();

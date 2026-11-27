@@ -212,6 +212,34 @@ impl Store {
             .collect()
     }
 
+    /// Rewrites every stored ref that starts with `old` to start with `new`:
+    /// a source names its sessions anew, and a thread keeps the sessions it
+    /// chose. Run before any message is handled. Gives the threads changed.
+    pub fn rename_refs(&self, old: &str, new: &str) -> Result<usize> {
+        let mut changed = 0;
+        for mut st in self.all_threads() {
+            let before = serde_json::to_vec(&st)?;
+            let picked = st
+                .pending
+                .iter_mut()
+                .flat_map(|p| p.picks.values_mut())
+                .filter_map(|pick| match pick {
+                    Pick::Refs(refs) => Some(refs),
+                    Pick::Rule => None,
+                });
+            for r in st.scope.values_mut().chain(st.woken.values_mut()).chain(picked).flatten() {
+                if let Some(rest) = r.strip_prefix(old) {
+                    *r = format!("{new}{rest}");
+                }
+            }
+            if serde_json::to_vec(&st)? != before {
+                self.save_thread(&st)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn load_cursor(&self) -> BTreeMap<String, String> {
         let path = self.dir.join("cursor.json");
         match fs::read(&path) {

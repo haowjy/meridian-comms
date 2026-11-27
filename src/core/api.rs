@@ -328,7 +328,7 @@ impl Core {
                     person: Some(name.clone()),
                     project: project.clone(),
                     refs: vec![],
-                    any_project: false,
+                    offerable: false,
                 })
                 .await;
             let mut candidates: Vec<_> = l.candidates.into_iter().map(|(_, c)| c).filter(|c| c.person == *name).collect();
