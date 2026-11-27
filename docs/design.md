@@ -243,7 +243,8 @@ carries the decision out; the agent can't message, start or offer anything.
   `meridian-comms read`. This routing may offer or leave the item; an `ask` from it is
   `none`. It counts toward the cap, and its log line carries `again`, never the reply.
   When it comes to an end the question becomes `answered`, and later replies route
-  nothing; after a failed or capped run it stays `asked`, so the next reply tries again.
+  nothing. If it ended with no offer, the daemon posts "The router found no session for
+  m412; choose one with to: or the picker."; after a failed or capped run it stays `asked`, so the next reply tries again.
 
 **What a hostile message can do.** The text is a stranger's. It goes to Jev, which can
 only return one of the options the daemon listed, so the worst it does there is pick the

@@ -193,12 +193,18 @@ impl Core {
                 tracing::error!("cannot write the routing log: {e:#}");
             }
             // The question is spent only by a routing that came to an end: after
-            // a failed one, the next reply tries again.
-            if route.again
-                && route.outcome.is_final()
-                && let Err(e) = core.set_question(&key.0, &key.1, Question::Answered, None).await
-            {
-                tracing::warn!("cannot record that the question about {} was answered: {e:#}", key.1);
+            // a failed one, the next reply tries again. The person who answered
+            // is told when the answer found nobody; an offer has its own note.
+            if route.again && route.outcome.is_final() {
+                let nobody = matches!(route.outcome, Outcome::None | Outcome::NotOffered).then(|| {
+                    format!(
+                        "The router found no session for {}; choose one with to: or the picker.",
+                        text::clean(&key.1)
+                    )
+                });
+                if let Err(e) = core.set_question(&key.0, &key.1, Question::Answered, nobody).await {
+                    tracing::warn!("cannot close the question about {}: {e:#}", key.1);
+                }
             }
             let mut r = core.routing.lock().unwrap();
             r.flying.remove(&key);
@@ -374,18 +380,26 @@ impl Core {
             Decision::Ask(_) if req.reply.is_some() => none("the second step asked again, and an item gets one question"),
             Decision::Ask(_) if !req.may_ask => none("the second step asked a question, and the item has no thread to ask in"),
             Decision::Ask(q) => {
-                self.set_question(source.name(), &route.item, Question::Asked, Some(&q)).await?;
+                // The agent's words after reading a stranger's message: cut
+                // down, under the daemon's own label, never logged or kept.
+                let question = text::question(&q);
+                if question.is_empty() {
+                    bail!("the second step's question was empty once cleaned");
+                }
+                let post = format!(
+                    "The router asks about {}: {question}\nReply here and the router will try once more to find a session for it, or choose one yourself with to: or the picker.",
+                    text::clean(&route.item)
+                );
+                self.set_question(source.name(), &route.item, Question::Asked, Some(post)).await?;
                 Ok(Second::End(Outcome::Asked, "asked the second step's question in the thread".into()))
             }
         }
     }
 
     /// Moves the question of the thread `item` was filed from to `to`, under the
-    /// thread's lock. Moving it to `Asked` posts `asking`, the second step's
-    /// question: the agent's words after reading a stranger's message, so it
-    /// is cut down, posted as plain text under the daemon's own label, and
-    /// never logged or kept.
-    async fn set_question(&self, source: &str, item: &str, to: Question, asking: Option<&str>) -> Result<()> {
+    /// thread's lock, and posts `post` there as plain text. `Asked` is saved
+    /// only once its post is up: the state says a person can see a question.
+    async fn set_question(&self, source: &str, item: &str, to: Question, post: Option<String>) -> Result<()> {
         let named = |t: &ThreadState| t.filed.as_ref().is_some_and(|f| f.source == source && f.item == item);
         let Some(t) = self.store.all_threads().into_iter().find(named) else {
             bail!("the item is no longer its thread's waiting message");
@@ -394,27 +408,26 @@ impl Core {
         let Some(mut st) = self.store.load_thread(&t.conversation, &t.thread)?.filter(named) else {
             bail!("the item left its thread while it was routed");
         };
-        if let Some(asking) = asking {
-            let question = text::question(asking);
-            if question.is_empty() {
-                bail!("the second step's question was empty once cleaned");
-            }
-            let req = PostRequest {
-                conversation: t.conversation.clone(),
-                thread: Some(t.thread.clone()),
-                text: format!(
-                    "The router asks about {}: {question}\nReply here and the router will try once more to find a session for it, or choose one yourself with to: or the picker.",
-                    text::clean(item)
-                ),
-                menu: None,
-                plain: true,
-            };
-            self.surface.post(req).await.context("the question could not be posted")?;
-        }
         if let Some(f) = st.filed.as_mut() {
             f.question = to;
         }
-        self.store.save_thread(&st)
+        if to != Question::Asked {
+            self.store.save_thread(&st)?;
+        }
+        if let Some(text) = post {
+            let req = PostRequest {
+                conversation: t.conversation.clone(),
+                thread: Some(t.thread.clone()),
+                text,
+                menu: None,
+                plain: true,
+            };
+            self.surface.post(req).await.context("the post in the item's thread failed")?;
+        }
+        if to == Question::Asked {
+            self.store.save_thread(&st)?;
+        }
+        Ok(())
     }
 
     /// Says in the thread an item was filed from who was offered it: on the
