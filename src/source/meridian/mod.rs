@@ -265,6 +265,19 @@ fn meridian_command(root: Option<&Path>) -> Command {
     cmd
 }
 
+/// Whether this Meridian has the command group `name`, which says what the
+/// daemon may do for its whole life. Only an answer that the command is not
+/// there says no: a Meridian that can't be run, or doesn't answer, is unknown,
+/// and the start fails instead of taking it for an older build.
+async fn has_command(name: &str) -> Result<bool> {
+    let asked = format!("`meridian {name} --help`, which tells whether this Meridian has `{name}`,");
+    let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &[name, "--help"]))
+        .await
+        .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))?
+        .with_context(|| format!("{asked} could not be run"))?;
+    Ok(out.status.success())
+}
+
 /// Whether a failed `spawn show` says the session does not exist. Meridian has
 /// said it three ways, on either stream: `{"error": "… not found"}`, the same
 /// with a top-level `"kind": "not_found"`, and through `--machine`
@@ -578,8 +591,7 @@ impl Source for Meridian {
         // Meridian names its machines from 0.28. Where it does, its name is the
         // one every ref carries, and a daemon that can't learn it must not
         // guess: its refs would match nothing Meridian or another start wrote.
-        let has = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "--help"])).await;
-        if matches!(has, Ok(Ok(out)) if out.status.success()) {
+        if has_command("machine").await? {
             let asked = "`meridian machine name`, which every session's ref starts with,";
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name"]))
                 .await
@@ -592,8 +604,7 @@ impl Source for Meridian {
         }
         // An older Meridian has no `inbox` command: say so once, here, instead
         // of failing a command for every message.
-        let has = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["inbox", "--help"])).await;
-        if !matches!(has, Ok(Ok(out)) if out.status.success()) {
+        if !has_command("inbox").await? {
             self.inbox = false;
             tracing::warn!(
                 "this Meridian has no `inbox` command (it came with 0.28), so it can't file or route: a Slack message nobody is woken for waits in `meridian-comms list`"
