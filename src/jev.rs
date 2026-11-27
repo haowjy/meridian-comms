@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -60,9 +60,9 @@ impl Jev {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("no answer from the model: {}", e.without_url()))?;
+            .map_err(failure)?;
         let status = resp.status();
-        let text = resp.text().await.context("the model's answer broke off")?;
+        let text = resp.text().await.map_err(failure)?;
         if !status.is_success() {
             tracing::warn!("the model answered {status}, with a body of {} bytes", text.len());
             bail!("the model answered HTTP {}", status.as_u16());
@@ -83,5 +83,16 @@ impl Jev {
                 bail!("the model's answer could not be read")
             }
         }
+    }
+}
+
+/// Why a request got no answer, without its URL: that could carry a key.
+fn failure(e: reqwest::Error) -> anyhow::Error {
+    if e.is_timeout() {
+        anyhow::anyhow!("the model did not answer in {} s", TIMEOUT.as_secs())
+    } else if e.is_connect() {
+        anyhow::anyhow!("could not connect to the model: {}", e.without_url())
+    } else {
+        anyhow::anyhow!("no answer from the model: {}", e.without_url())
     }
 }
