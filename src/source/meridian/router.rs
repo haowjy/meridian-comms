@@ -287,8 +287,10 @@ impl Meridian {
         let give_up = Instant::now() + LIMIT_TIME + WAIT_SLACK;
         loop {
             // The wait only blocks: what happened is read from the spawn itself.
-            let _ = tokio::time::timeout(
-                LIMIT_TIME + WAIT_SLACK,
+            // It is cut off at `give_up`, so a spawn that outlives its own
+            // limit is seen, and cancelled, then.
+            let _ = tokio::time::timeout_at(
+                give_up.into(),
                 run(Some(&dir), &["spawn", "wait", id, "--timeout", LIMIT, "--no-observe", "--json"]),
             )
             .await;
