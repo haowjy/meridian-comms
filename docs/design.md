@@ -464,10 +464,19 @@ machines are saved.
 Two machines can each have a `p41`. Their refs differ, the model's options are numbered,
 and the second step's agent names a session on another machine as `<machine>/p41`,
 which is also what `meridian inbox offer` takes. The offer always runs on this machine,
-where the item is. A sender on another machine is left out of the candidates as a local
-one is: `spawn show <chat> --machine <its machine>` gives its spawn ID. If that machine
-can't be reached the routing fails and the item waits, since its sender could not be
-told from the candidates.
+where the item is.
+
+A saved machine has two names: the one it is saved under here and the one it calls
+itself. They differ when Meridian could not take over a rename because the name is
+taken. Refs carry the saved name, because that is the one `--machine` and
+`<machine>/p41` resolve; what a row says its machine is called is not read.
+
+A sender on another machine is left out of the candidates as a local one is. Its
+machine is found among the saved ones by `from.machine_id`, which no rename changes,
+and `spawn show <chat> --machine <saved name>` gives its spawn ID. A sender whose
+machine is not saved is looked up here, where its chat names nobody. If the sender's
+machine can't be reached the routing fails and the item waits, since its sender could
+not be told from the candidates.
 
 An offer that crosses machines can fail in more ways, and the log carries Meridian's
 word for each. `maybe_delivered` means the notice may have arrived: the routing is

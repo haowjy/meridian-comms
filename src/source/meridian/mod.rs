@@ -50,6 +50,13 @@ pub struct Meridian {
     inbox: bool,
 }
 
+/// A machine Meridian has saved: the ID that never changes, and the name
+/// it is saved under, which is what `--machine` and `<machine>/<id>` take.
+struct Saved {
+    id: String,
+    name: String,
+}
+
 struct Project {
     root: PathBuf,
     default: Option<String>,
@@ -176,14 +183,21 @@ impl Meridian {
         rows(run(None, &args).await?)
     }
 
-    /// The machines Meridian has saved, by name. None on a Meridian without them.
-    async fn saved_machines(&self) -> Vec<String> {
+    /// The machines Meridian has saved. None on a Meridian without them.
+    async fn saved_machines(&self) -> Vec<Saved> {
         let Ok(out) = run(None, &["machine", "list", "--json"]).await else {
             return vec![];
         };
         let listed: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-        let names = listed["machines"].as_array().into_iter().flatten();
-        names.filter_map(|m| field(&m["name"])).filter(|n| is_id(n)).collect()
+        let machines = listed["machines"].as_array().into_iter().flatten();
+        machines
+            .filter_map(|m| {
+                Some(Saved {
+                    id: field(&m["id"])?,
+                    name: field(&m["name"]).filter(|n| is_id(n))?,
+                })
+            })
+            .collect()
     }
 
     /// `machine` is the name the listing was asked by: this machine's, or the
@@ -356,7 +370,7 @@ impl Source for Meridian {
             // listing no longer than that.
             let elsewhere = async {
                 let saved = self.saved_machines().await;
-                join_all(saved.into_iter().map(|m| async move {
+                join_all(saved.into_iter().map(|Saved { name: m, .. }| async move {
                     let asked = Instant::now();
                     let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
                         Ok(rows) => rows,
@@ -633,6 +647,10 @@ impl Source for Meridian {
         };
         // `from` names the sender's chat and machine; a candidate is named by
         // its spawn ID, so the sender's ref takes one more call, on its machine.
+        // That machine is found by its ID, which no rename changes, among the
+        // saved ones, and the ref takes the saved name as a candidate's does.
+        // Any other sender is looked up here: the chat of a machine nobody
+        // saved names no candidate, wherever it is looked for.
         // A chat Meridian does not find is taken as gone, so not a candidate;
         // any other failure, a machine that can't be reached among them, fails
         // the read, or the sender would be offered its own message. A local
@@ -641,7 +659,13 @@ impl Source for Meridian {
         let mut from = None;
         let sender = &v["from"];
         if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
-            let machine = field(&sender["machine"]).filter(|m| is_id(m) && *m != self.machine);
+            // Before the ID was written, an item carried the saved name alone.
+            let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
+            let saved = self.saved_machines().await.into_iter().find(|m| match &id {
+                Some(id) => m.id == *id,
+                None => Some(&m.name) == name.as_ref(),
+            });
+            let machine = saved.map(|m| m.name);
             let mut args = vec!["spawn", "show", &chat, "--json"];
             if let Some(m) = &machine {
                 args.extend(["--machine", m]);
