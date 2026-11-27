@@ -22,7 +22,8 @@ pub struct Jev {
 
 pub struct Answer {
     pub choice: String,
-    /// Per option, 0 to 1. Empty when the service sent none.
+    /// Per option, 0 to 1. An option the service gave no probability counts
+    /// as 0; its `confidence` is another number and is not read.
     pub probabilities: BTreeMap<String, f64>,
 }
 
@@ -69,13 +70,10 @@ impl Jev {
         let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
             let a = &v["answers"][QUESTION];
             let choice = a["choice"].as_str()?.to_string();
-            let mut probabilities: BTreeMap<String, f64> = a["probabilities"]
+            let probabilities = a["probabilities"]
                 .as_object()
                 .map(|m| m.iter().filter_map(|(k, p)| Some((k.clone(), p.as_f64()?))).collect())
                 .unwrap_or_default();
-            if let (false, Some(c)) = (probabilities.contains_key(&choice), a["confidence"].as_f64()) {
-                probabilities.insert(choice.clone(), c);
-            }
             Some(Answer { choice, probabilities })
         });
         match parsed {
