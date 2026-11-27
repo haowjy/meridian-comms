@@ -218,7 +218,18 @@ impl Meridian {
                 // An ID on a Meridian that does not tell this machine's own:
                 // any sender not on a saved machine is taken as here.
                 None if id.is_some() && self.id.is_none() => None,
-                None => return Ok(None),
+                None => {
+                    // The ID is read once, at start: this machine got a new
+                    // one since (its machine.json was replaced), and until a
+                    // restart no sender here can be told from the candidates.
+                    if id.is_some() && name.as_ref() == Some(&self.machine) {
+                        tracing::warn!(
+                            "an inbox item's sender is on {} under a machine ID this daemon does not know: this machine's ID changed since the daemon started, so a session here can be offered its own message. Restart the daemon",
+                            self.machine
+                        );
+                    }
+                    return Ok(None);
+                }
             }
         };
         let mut args = vec!["spawn", "show", &chat, "--json"];
