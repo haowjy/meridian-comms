@@ -232,6 +232,7 @@ impl Core {
                     thread: requested.as_ref().map(|m| m.thread.clone()),
                     text: format!("From {}{to_part}:\n{body}", who.label()),
                     menu: None,
+                    plain: false,
                 };
                 let posted = self.surface.post(req).await?;
                 if requested.is_none() {

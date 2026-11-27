@@ -173,10 +173,24 @@ impl Surface for Slack {
     async fn post(&self, req: PostRequest) -> Result<Posted> {
         // `<!channel>` and its kin would notify everyone; text from a session
         // never gets to do that. Real user mentions (`<@U…>`) pass.
-        let text = req.text.replace("<!", "&lt;!");
+        let text = match req.plain {
+            // Slack's three control characters, escaped as it asks: nothing in
+            // the text can then be a mention, a channel ping or a link.
+            true => req.text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+            false => req.text.replace("<!", "&lt;!"),
+        };
         let mut body = json!({
             "channel": req.conversation, "text": text, "unfurl_links": false, "unfurl_media": false,
         });
+        if req.plain {
+            // Slack still links a bare URL and styles `*` and backticks in
+            // `text`, whatever `mrkdwn` says. A rich-text block with one text
+            // element is shown exactly as written; `text` is then only the
+            // fallback a notification shows.
+            body["blocks"] = json!([{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": req.text}]}
+            ]}]);
+        }
         if let Some(menu) = &req.menu
             && let Some(select) = menu_select(menu)
         {

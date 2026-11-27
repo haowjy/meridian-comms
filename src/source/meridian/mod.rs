@@ -3,6 +3,8 @@
 //! `message inbox` and `inbox read/take/offer` for the machine's inbox, and
 //! `context` for a root's project ID.
 
+pub mod router;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -20,8 +22,8 @@ use tokio::process::Command;
 use super::Source;
 use crate::config::{Config, MeridianConfig};
 use crate::model::{
-    Activity, ActivityState, CallerKind, Candidate, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListRequest,
-    ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
+    Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decided, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem,
+    ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,6 +70,8 @@ struct Row {
     /// Only in a `--global` listing.
     #[serde(default)]
     project_id: Option<String>,
+    #[serde(default)]
+    project_root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -391,6 +395,7 @@ impl Source for Meridian {
     /// Each project's key must be its root's Meridian project ID: a channel's
     /// project, a candidate's project and a filed item's project are one value.
     async fn check(&self) -> Result<()> {
+        router::sweep();
         let answers = join_all(self.projects.iter().map(|(key, p)| async move {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
             (key, p, out)
@@ -518,6 +523,10 @@ impl Source for Meridian {
         answer(&out)?
             .map(|_| ())
             .map_err(|kind| anyhow::anyhow!("meridian inbox take: {kind}"))
+    }
+
+    async fn decide(&self, req: &DecideRequest) -> Result<Option<Decided>> {
+        self.second_step(req).await
     }
 
     fn routed_item(&self, req: &IdentifyRequest) -> Option<String> {

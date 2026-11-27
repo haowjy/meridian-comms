@@ -2,6 +2,7 @@
 //! a surface without menus or buttons loses only those.
 
 use chrono::{DateTime, Local, Utc};
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::model::{Activity, ActivityState, Candidate};
 
@@ -11,6 +12,29 @@ pub fn clean(s: &str) -> String {
     s.chars()
         .map(|c| if matches!(c, '<' | '>' | '&' | '`' | '\n' | '\r') { ' ' } else { c })
         .collect()
+}
+
+const QUESTION_CHARS: usize = 300;
+
+/// A question the router's second step wrote, cut down to one short line of
+/// plain characters before it is posted: line breaks become spaces, control
+/// and format characters (the bidirectional controls among them) go, runs of
+/// spaces collapse, and the first 300 code points are kept. The surface
+/// escapes its own markup.
+pub fn question(s: &str) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| !matches!(get_general_category(*c), GeneralCategory::Control | GeneralCategory::Format))
+        .collect();
+    let words: Vec<&str> = flat.split(' ').filter(|w| !w.is_empty()).collect();
+    words.join(" ").chars().take(QUESTION_CHARS).collect()
 }
 
 pub fn duration(d: chrono::Duration) -> String {

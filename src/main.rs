@@ -96,10 +96,30 @@ enum Command {
     },
     #[command(hide = true)]
     Daemon,
-    #[command(hide = true)]
+    /// Print the Slack app manifest, or with `router` set up the router's second step.
     Setup {
+        /// The owner's name for the manifest, when there is no config yet.
         #[arg(long)]
         owner: Option<String>,
+        #[command(subcommand)]
+        what: Option<Setup>,
+    },
+}
+
+#[derive(Subcommand)]
+enum Setup {
+    /// Create the router directory and install the `inbox-router` agent there.
+    ///
+    /// The router's second step starts that agent, through Meridian, for a
+    /// message its model can't place from the session list alone. The
+    /// directory is a Meridian project of its own under the state directory.
+    /// Run this once on the daemon's machine, outside any agent session, and
+    /// again to update the agent. Without it the second step fails, the
+    /// routing log says so, and the message waits.
+    Router {
+        /// The package holding the agent, as `meridian mars add` takes it: owner/repo, a URL or a local path.
+        #[arg(long, default_value = source::meridian::router::PACKAGE)]
+        package: String,
     },
 }
 
@@ -130,7 +150,11 @@ async fn main() {
         Command::Route { item } => client::route(item).await,
         Command::Routes { of, json } => client::routes(of, json),
         Command::Daemon => daemon::run().await,
-        Command::Setup { owner } => setup::run(owner),
+        Command::Setup { what: None, owner } => setup::run(owner),
+        Command::Setup {
+            what: Some(Setup::Router { package }),
+            ..
+        } => source::meridian::router::setup(&package).await,
     };
     if let Err(e) = result {
         eprintln!("meridian-comms: {e:#}");

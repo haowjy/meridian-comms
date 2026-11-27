@@ -214,11 +214,15 @@ pub struct OfferResult {
     pub detail: String,
 }
 
-/// The second step: the candidates the core kept after its own filters.
+/// The second step: the item, and the candidates the core kept after its own
+/// filters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecideRequest {
     pub item: String,
+    pub message: InboxItem,
     pub candidates: Vec<Candidate>,
+    /// The item was filed from a thread, so a question can be posted there.
+    pub may_ask: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,8 +231,11 @@ pub enum Decision {
     /// A ref; the core offers only if it is one of the request's candidates.
     Offer(String),
     None,
-    /// A question for whoever wrote the message.
+    /// A question for whoever wrote the message, in the decider's own words:
+    /// untrusted, since what it read may have steered it.
     Ask(String),
+    /// The run started and came to no decision: why, in the source's words.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +297,9 @@ pub struct PostRequest {
     pub thread: Option<String>,
     pub text: String,
     pub menu: Option<Menu>,
+    /// The text holds words the daemon did not write: the surface shows it as
+    /// it is, making no mention, link or formatting from it.
+    pub plain: bool,
 }
 
 /// A menu of grouped options and one button that submits the selection, as

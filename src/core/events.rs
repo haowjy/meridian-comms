@@ -340,6 +340,7 @@ impl Core {
             thread: Some(thread.into()),
             text,
             menu,
+            plain: false,
         };
         self.surface
             .post(req)

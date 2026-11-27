@@ -18,10 +18,14 @@ changing how messages are routed. Slack app setup: [docs/slack-setup.md](docs/sl
   whose cache is warm.
 - **Nothing from Slack starts a session or carries text into a command line.** A
   woken session gets a one-line notice and fetches the text itself with `read`. A filed
-  message's text reaches a source on stdin.
-- **A filed message's text is a stranger's.** The router sends it to the model and
-  nowhere else: not into a post, a command line or the routing log. An offer goes only
-  to a candidate the daemon listed.
+  message's text reaches a source on stdin. The one process a message may start is the
+  router's second step: an agent that reads and reports one decision line, limited to 5
+  minutes by its own spawn, one at a time.
+- **A filed message's text is a stranger's.** The router sends it to the model and the
+  second step's agent and nowhere else: not into a post, a command line or the routing
+  log. An offer goes only to a candidate the daemon listed. The agent's question for a
+  thread is as untrusted as the message: it is posted `plain`, cut to 300 code points,
+  and never logged.
 - **The core knows no tool's vocabulary.** Meridian, Amp and Slack specifics stay in
   their source or surface module, behind the JSON shapes the spec gives. A new source
   is one module.

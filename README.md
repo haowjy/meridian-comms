@@ -41,6 +41,7 @@ meridian-comms route [ITEM]                        hand an inbox message to the 
 meridian-comms routes [ITEM | <message>]           what the router did with each message
 meridian-comms daemon                              the Slack connection (run as a user service)
 meridian-comms setup                               print the Slack app manifest
+meridian-comms setup router                        install the agent the router asks when unsure
 ```
 
 ## Setup

@@ -23,6 +23,8 @@ pub enum Decision {
     Offer,
     /// Routed, and nobody is to be offered it.
     None,
+    /// The second step's question was posted in the item's thread.
+    Ask,
     /// The router is not configured, or has no key.
     Off,
     /// Over the limit on routings a minute.
@@ -35,7 +37,7 @@ impl Decision {
     /// Routed to an end: the item is not routed again. The others leave it
     /// waiting, and a later `route` for it runs.
     pub fn is_final(self) -> bool {
-        matches!(self, Decision::Offer | Decision::None)
+        matches!(self, Decision::Offer | Decision::None | Decision::Ask)
     }
 }
 

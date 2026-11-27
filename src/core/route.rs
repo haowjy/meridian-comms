@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use super::filing::INBOX_TIMEOUT;
 use super::{Core, WAKE_TIMEOUT, text};
 use crate::jev;
-use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision as Second, InboxItem, ListRequest, Offered};
+use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision as Second, InboxItem, ListRequest, Offered, PostRequest};
 use crate::proto::RouteOut;
 use crate::routes::{Decision, Route};
 use crate::state::ThreadState;
@@ -23,6 +23,10 @@ const ROUTES_PER_MINUTE: usize = 20;
 /// Two of the model's options are `none` and `more`.
 const MAX_KEPT: usize = jev::MAX_OPTIONS - 2;
 const STATE_TEXT_BYTES: usize = 4096;
+/// How long a second step waits for the one before it.
+const SECOND_STEP_QUEUE: Duration = Duration::from_secs(15 * 60);
+/// A source's second step bounds itself; this is for one that hangs.
+const SECOND_STEP_GUARD: Duration = Duration::from_secs(10 * 60);
 const INSTRUCTIONS: &str = "Which running session should be offered this message?";
 const NONE: &str = "none";
 const MORE: &str = "more";
@@ -270,9 +274,19 @@ impl Core {
             _ => {
                 let req = DecideRequest {
                     item: route.item.clone(),
+                    message: item.clone(),
                     candidates: kept.clone(),
+                    may_ask: thread.is_some(),
                 };
-                let Some(second) = source.decide(&req).await? else {
+                // No thread lock and no gate is held here: a step takes minutes.
+                let one = tokio::time::timeout(SECOND_STEP_QUEUE, self.second.acquire())
+                    .await
+                    .context("dropped after 15 minutes waiting for another second step to finish")??;
+                let second = tokio::time::timeout(SECOND_STEP_GUARD, source.decide(&req))
+                    .await
+                    .context("the second step hung")??;
+                drop(one);
+                let Some(second) = second else {
                     let why = if chosen.is_some() {
                         "was not sure enough"
                     } else {
@@ -295,11 +309,16 @@ impl Core {
                         }
                     },
                     Second::None => return Ok((Decision::None, "nothing: the second step chose no session".into())),
-                    Second::Ask(_) => {
-                        return Ok((
-                            Decision::None,
-                            "nothing: the second step asked a question, which this build does not post".into(),
-                        ));
+                    Second::Failed(why) => bail!("the second step did not decide: {why}"),
+                    Second::Ask(q) => {
+                        let Some(t) = &thread else {
+                            return Ok((
+                                Decision::None,
+                                "nothing: the second step asked a question, and the item has no thread to ask in".into(),
+                            ));
+                        };
+                        self.ask(t, source.name(), &route.item, &q).await?;
+                        return Ok((Decision::Ask, "asked the second step's question in the thread".into()));
                     }
                 }
             }
@@ -322,6 +341,34 @@ impl Core {
             tracing::warn!("cannot say in the thread who was offered {}: {e:#}", route.item);
         }
         Ok((Decision::Offer, format!("offered to {}", target.ref_)))
+    }
+
+    /// Posts the second step's question in the thread its item was filed from.
+    /// The question is the agent's words after reading a stranger's message:
+    /// it is cut down, posted as plain text under the daemon's own label, and
+    /// never logged.
+    async fn ask(&self, t: &ThreadState, source: &str, item: &str, question: &str) -> Result<()> {
+        let question = text::question(question);
+        if question.is_empty() {
+            bail!("the second step's question was empty once cleaned");
+        }
+        let _guard = self.lock(&t.conversation, &t.thread).await;
+        let still = self.store.load_thread(&t.conversation, &t.thread)?;
+        if !still.is_some_and(|st| st.filed.is_some_and(|f| f.source == source && f.item == item)) {
+            bail!("the item left its thread before the question was posted");
+        }
+        let req = PostRequest {
+            conversation: t.conversation.clone(),
+            thread: Some(t.thread.clone()),
+            text: format!(
+                "The router asks about {}, so it can find a session for it: {question}",
+                text::clean(item)
+            ),
+            menu: None,
+            plain: true,
+        };
+        self.surface.post(req).await.context("the question could not be posted")?;
+        Ok(())
     }
 
     /// Says in the thread an item was filed from who was offered it: on the

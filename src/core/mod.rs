@@ -60,6 +60,8 @@ pub struct Core {
     /// arrive before the source has answered with the item's ID; the router
     /// takes this exclusively once before it looks for the item's thread.
     filing: tokio::sync::RwLock<()>,
+    /// One second step at a time: each starts an agent.
+    second: tokio::sync::Semaphore,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -156,6 +158,7 @@ impl Core {
             routes,
             routing,
             filing: tokio::sync::RwLock::default(),
+            second: tokio::sync::Semaphore::new(1),
         }))
     }
 
