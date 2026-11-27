@@ -44,9 +44,6 @@ pub async fn run() -> Result<()> {
     for s in &sources {
         s.check().await?;
     }
-    if cfg.sources.meridian.is_some() {
-        meridian::router::sweep();
-    }
     let jev = match (&cfg.router, tokens.router) {
         (Some(r), Some(key)) => Some(Jev::new(r.url.clone(), r.model.clone(), key)?),
         (Some(_), None) => {
@@ -73,6 +70,11 @@ pub async fn run() -> Result<()> {
 
     let store = Store::open(paths::state_dir())?;
     let listener = bind(&paths::socket_path())?;
+    // After the bind: a second daemon started by mistake stops there, before
+    // it could remove the first one's live prompt file.
+    if cfg.sources.meridian.is_some() {
+        meridian::router::sweep();
+    }
     let surface: Arc<dyn Surface> = slack;
     let routes = routes::Log::open(&paths::state_dir())?;
     let core = Core::new(cfg, surface.clone(), sources, store, who.bot, jev, routes)?;
