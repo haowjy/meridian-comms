@@ -543,9 +543,11 @@ impl Source for Meridian {
             &["inbox", "take", item, "--json", "--via-program", PROGRAM, "--via-sender", by],
         )
         .await?;
-        answer(&out)?
-            .map(|_| ())
-            .map_err(|kind| anyhow::anyhow!("meridian inbox take: {kind}"))
+        match answer(&out)? {
+            Ok(_) => Ok(()),
+            Err(kind) if kind == "taken" => Ok(()),
+            Err(kind) => bail!("meridian inbox take: {kind}"),
+        }
     }
 
     async fn decide(&self, req: &DecideRequest) -> Result<Option<Decided>> {

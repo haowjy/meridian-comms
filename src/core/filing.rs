@@ -67,17 +67,19 @@ impl Core {
         }
     }
 
-    /// A person chose a session for the thread: its filed item leaves the inbox.
+    /// A person chose a session for the thread: its filed item leaves the
+    /// inbox. The thread forgets the item only once it is out; after a failed
+    /// take it still waits there, and the thread must not file a second one.
     pub(super) async fn take_filed(&self, st: &mut ThreadState, by: &str) {
-        let Some(f) = st.filed.take() else { return };
-        let Some(s) = self.sources.iter().find(|s| s.name() == f.source) else {
-            return;
-        };
-        match tokio::time::timeout(INBOX_TIMEOUT, s.take(&f.item, by)).await {
-            Ok(Ok(())) => tracing::info!("{} taken from {}: {by} chose a session", f.item, f.place),
-            Ok(Err(e)) => tracing::warn!("{} was not taken from {}: {e:#}", f.item, f.place),
-            Err(_) => tracing::warn!("{} was not taken from {}: timed out", f.item, f.place),
+        let Some(f) = &st.filed else { return };
+        if let Some(s) = self.sources.iter().find(|s| s.name() == f.source) {
+            match tokio::time::timeout(INBOX_TIMEOUT, s.take(&f.item, by)).await {
+                Ok(Ok(())) => tracing::info!("{} is out of {}: {by} chose a session", f.item, f.place),
+                Ok(Err(e)) => return tracing::warn!("{} was not taken from {}: {e:#}", f.item, f.place),
+                Err(_) => return tracing::warn!("{} was not taken from {}: timed out", f.item, f.place),
+            }
         }
+        st.filed = None;
     }
 }
 

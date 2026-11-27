@@ -41,7 +41,7 @@ pub trait Source: Send + Sync {
         bail!("{} has no inbox", self.name())
     }
     /// Claims `item` for the daemon because `by` (a directory name) chose a
-    /// session for its thread.
+    /// session for its thread. An item someone already took is no error.
     async fn take(&self, _item: &str, _by: &str) -> Result<()> {
         bail!("{} has no inbox", self.name())
     }
