@@ -5,14 +5,14 @@
 //! project of its own that holds nothing but that profile, made once by
 //! `meridian-comms setup router` and never by the daemon.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 
 use super::{Meridian, PROGRAM, field, is_id, run, tail};
@@ -28,6 +28,8 @@ const LIMIT: &str = "5";
 /// The wait enforces `LIMIT` itself; this only bounds a `meridian` that hangs.
 const WAIT_GUARD: Duration = Duration::from_secs(6 * 60);
 const TEXT_BYTES: usize = 4096;
+const GOALS_AT_ONCE: usize = 4;
+const GOAL_TIMEOUT: Duration = Duration::from_secs(20);
 const PROMPT_PREFIX: &str = "prompt-";
 
 pub fn dir() -> PathBuf {
@@ -184,28 +186,27 @@ fn prompt(req: &DecideRequest, sessions: &[(&str, &Candidate, Option<String>)]) 
 }
 
 impl Meridian {
-    /// Each candidate's work item goal, by ref, read with `work show` in the
-    /// candidate's own project. A goal that can't be read is left out.
-    async fn goals(&self, candidates: &[Candidate]) -> BTreeMap<String, String> {
-        // A project outside the config is found through the machine's listing.
-        let mut roots: BTreeMap<String, PathBuf> = BTreeMap::new();
-        if let Ok(rows) = self.primaries(None).await {
-            roots.extend(
-                rows.spawns
-                    .into_iter()
-                    .filter_map(|r| Some((r.spawn_id, PathBuf::from(r.project_root?)))),
-            );
-        }
-        let asks = candidates.iter().filter_map(|c| {
-            let work = c.group.clone()?;
-            let root = roots.get(c.id.as_deref()?)?.clone();
-            Some(async move {
-                let out = run(Some(&root), &["work", "show", &work, "--json"]).await.ok()?;
+    /// The goal of each work item the candidates are on, by project root and
+    /// work item: one `work show` each, a few at a time, since every one is a
+    /// whole `meridian` process. A goal that can't be read is left out.
+    async fn goals(&self, candidates: &[Candidate]) -> BTreeMap<(PathBuf, String), String> {
+        let asks: BTreeSet<(PathBuf, String)> = candidates
+            .iter()
+            .filter_map(|c| Some((c.root.clone()?, c.group.clone().filter(|w| is_id(w))?)))
+            .collect();
+        stream::iter(asks)
+            .map(|(root, work)| async move {
+                let out = tokio::time::timeout(GOAL_TIMEOUT, run(Some(&root), &["work", "show", &work, "--json"]))
+                    .await
+                    .ok()?
+                    .ok()?;
                 let goal = field(&serde_json::from_slice::<Value>(&out.stdout).ok()?["goal"])?;
-                (!goal.trim().is_empty()).then(|| (c.ref_.clone(), goal))
+                (!goal.trim().is_empty()).then_some(((root, work), goal))
             })
-        });
-        join_all(asks).await.into_iter().flatten().collect()
+            .buffer_unordered(GOALS_AT_ONCE)
+            .filter_map(|g| async move { g })
+            .collect()
+            .await
     }
 
     pub(super) async fn second_step(&self, req: &DecideRequest) -> Result<Option<Decided>> {
@@ -220,7 +221,10 @@ impl Meridian {
         let listed: Vec<(&str, &Candidate, Option<String>)> = req
             .candidates
             .iter()
-            .filter_map(|c| Some((c.id.as_deref().filter(|id| is_id(id))?, c, goals.get(&c.ref_).cloned())))
+            .filter_map(|c| {
+                let goal = c.root.clone().zip(c.group.clone()).and_then(|at| goals.get(&at).cloned());
+                Some((c.id.as_deref().filter(|id| is_id(id))?, c, goal))
+            })
             .collect();
         let sessions: BTreeMap<&str, &str> = listed.iter().map(|(id, c, _)| (*id, c.ref_.as_str())).collect();
 

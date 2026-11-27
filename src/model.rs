@@ -3,6 +3,7 @@
 //! or on another machine, and these structs are what crosses.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ pub struct Candidate {
     pub default: bool,
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// The directory the session's project lives in on this machine, when
+    /// the source knows it. For the source's own later calls about the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

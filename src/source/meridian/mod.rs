@@ -151,7 +151,8 @@ impl Meridian {
     }
 
     fn candidate(&self, project: &str, row: Row) -> Candidate {
-        let own = self.projects.get(project).and_then(|p| p.default.clone());
+        let configured = self.projects.get(project);
+        let own = configured.and_then(|p| p.default.clone());
         let default = row.agent.is_some() && row.agent == own.or_else(|| self.default.clone());
         // `idle` is measured from the last turn the user's loop ended, so a row
         // can carry it while a turn runs: `activity` wins.
@@ -179,6 +180,7 @@ impl Meridian {
             model: row.model,
             default,
             activity,
+            root: row.project_root.map(PathBuf::from).or_else(|| configured.map(|p| p.root.clone())),
         }
     }
 }
