@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::{RefStart, Source};
-use crate::config::{Config, MeridianConfig};
+use crate::config::{Config, MeridianConfig, is_id};
 use crate::model::{
     Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult,
     InboxItem, ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
@@ -304,11 +304,6 @@ fn tail(bytes: &[u8]) -> String {
     let start = text.len().saturating_sub(300);
     let start = (start..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
     text[start..].replace('\n', " ")
-}
-
-/// An inbox item or spawn ID, safe as a command's argument: never an option.
-fn is_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
 }
 
 /// Meridian's rule for an inbox field (its `SAFE_FIELD`), with room left for

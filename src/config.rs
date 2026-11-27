@@ -121,6 +121,13 @@ pub fn env_path() -> PathBuf {
     paths::config_dir().join("slack.env")
 }
 
+/// What a machine name, a spawn ID or an inbox item ID may be: Meridian's own
+/// rule for them. Such a value is one part of a ref and is safe as a
+/// command's argument, never an option.
+pub fn is_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
+}
+
 impl Config {
     pub fn load() -> Result<Config> {
         let path = config_path();
@@ -141,8 +148,7 @@ impl Config {
             self.machine = Some(host.split('.').next().unwrap_or("local").to_string());
         }
         let machine = self.machine();
-        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
-        if machine.is_empty() || machine.len() > 64 || machine.starts_with('-') || !machine.chars().all(plain) {
+        if !is_id(machine) {
             bail!("machine name {machine:?} must be 1 to 64 characters from A-Z a-z 0-9 . _ - and not start with '-'");
         }
         if !self.people.contains_key(&self.owner) {
