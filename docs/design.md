@@ -117,9 +117,8 @@ explained, the line is a post of its own.
   taken by a session. After a take that failed the thread still names the item.
 - A filed message leaves `meridian-comms list`: the inbox is where a session looks for
   it. `pending` stays in the thread file, for Continue and a later choice to replay.
-- Filing fails when no source has an inbox, or Meridian is older than the inbox or does
-  not answer in 20 s. The failure is logged and the message waits as `pending` alone,
-  listed as before.
+- Filing fails when Meridian does not answer in 20 s or refuses the message. The
+  failure is logged and the message waits as `pending` alone, listed as before.
 
 The thread's lock is held while the message is filed. Filing makes Meridian start the
 `inbox.received` hook, so the route request for the item can reach the daemon before
@@ -129,8 +128,10 @@ it exclusively once before it looks for the item's thread, so it never looks too
 
 **It is routed, when the router is on:** the config has a `[router]` section and the
 daemon has `OPENCODE_API_KEY` ([Config](#config)). Otherwise each `route` is logged as
-`off` and the message waits. Filing and routing need Meridian 0.28 or later; on an older
-one both fail, are logged, and the message waits as `pending`.
+`off` and the message waits. Filing and routing need Meridian 0.28 or later. The daemon
+asks at start whether Meridian has the `inbox` command; on one without it the daemon
+says so once in its log, files and routes nothing, and each message waits as `pending`
+and shows in `meridian-comms list`.
 `meridian-comms route [ITEM]` is a thin client:
 it hands the item to the daemon and exits when the daemon has accepted it. Run as
 Meridian's hook it reads the item from `MERIDIAN_INBOX_MESSAGE_ID` (the source's

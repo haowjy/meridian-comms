@@ -8,6 +8,7 @@ pub mod router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +36,10 @@ pub struct Meridian {
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
+    /// Whether this Meridian has the machine inbox, by its `inbox` command and
+    /// not its version: builds before the release share a version. Learnt by
+    /// `check` when the daemon starts; without it nothing is filed or routed.
+    inbox: AtomicBool,
 }
 
 struct Project {
@@ -112,6 +117,7 @@ impl Meridian {
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
+            inbox: AtomicBool::new(true),
         })
     }
 
@@ -462,10 +468,22 @@ impl Source for Meridian {
                 );
             }
         }
+        // An older Meridian has no `inbox` command: say so once, here, instead
+        // of failing a command for every message.
+        let has = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["inbox", "--help"])).await;
+        if !matches!(has, Ok(Ok(out)) if out.status.success()) {
+            self.inbox.store(false, Ordering::Relaxed);
+            tracing::warn!(
+                "this Meridian has no `inbox` command (it came with 0.28), so it can't file or route: a Slack message nobody is woken for waits in `meridian-comms list`"
+            );
+        }
         Ok(())
     }
 
     async fn file(&self, req: &FileRequest) -> Result<Option<Filed>> {
+        if !self.inbox.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let mut cmd = meridian_command(None);
         cmd.args(["message", "inbox", "-", "--json", "--via-program", PROGRAM]);
         cmd.args([
@@ -502,6 +520,9 @@ impl Source for Meridian {
     }
 
     async fn inbox_item(&self, item: &str) -> Result<Option<InboxItem>> {
+        if !self.inbox.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
@@ -547,6 +568,9 @@ impl Source for Meridian {
     }
 
     async fn offer(&self, item: &str, ref_: &str) -> Result<OfferResult> {
+        if !self.inbox.load(Ordering::Relaxed) {
+            bail!("this Meridian has no inbox");
+        }
         // The spawn ID alone names the session, whether or not its project is configured.
         let (_, id) = self.split_ref(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
         if !is_id(item) {
@@ -568,6 +592,9 @@ impl Source for Meridian {
     }
 
     async fn take(&self, item: &str, by: &str) -> Result<()> {
+        if !self.inbox.load(Ordering::Relaxed) {
+            bail!("this Meridian has no inbox");
+        }
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
