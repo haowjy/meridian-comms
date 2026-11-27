@@ -16,7 +16,7 @@ use crate::jev::Jev;
 use crate::paths;
 use crate::proto::{Reply, Request};
 use crate::routes;
-use crate::source::{Source, meridian::Meridian};
+use crate::source::{Source, meridian, meridian::Meridian};
 use crate::state::Store;
 use crate::surface::{Surface, slack::Slack};
 
@@ -43,6 +43,9 @@ pub async fn run() -> Result<()> {
     }
     for s in &sources {
         s.check().await?;
+    }
+    if cfg.sources.meridian.is_some() {
+        meridian::router::sweep();
     }
     let jev = match (&cfg.router, tokens.router) {
         (Some(r), Some(key)) => Some(Jev::new(r.url.clone(), r.model.clone(), key)?),

@@ -394,8 +394,8 @@ impl Source for Meridian {
 
     /// Each project's key must be its root's Meridian project ID: a channel's
     /// project, a candidate's project and a filed item's project are one value.
+    /// A check that could not run stops the daemon too, and says what stopped it.
     async fn check(&self) -> Result<()> {
-        router::sweep();
         let answers = join_all(self.projects.iter().map(|(key, p)| async move {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
             (key, p, out)
@@ -404,12 +404,31 @@ impl Source for Meridian {
         for (key, p, out) in answers {
             let at = format!("sources.meridian.projects.{key}");
             let root = p.root.display();
-            let out = out
-                .map_err(|_| anyhow::anyhow!("timed out"))
-                .and_then(|o| o)
-                .with_context(|| format!("{at}: cannot ask Meridian for the project ID of {root}"))?;
-            let v: Value = serde_json::from_slice(&out.stdout)
-                .with_context(|| format!("{at}: `meridian -C {root} context --json` failed: {}", tail(&out.stderr)))?;
+            let unchecked = "so its project ID could not be checked against the key";
+            // Meridian answers for a directory that is not there, with an ID made from the path.
+            if !p.root.is_dir() {
+                bail!("{at}: the root {root} is not a directory on this machine, {unchecked}");
+            }
+            let out = match out {
+                Err(_) => bail!(
+                    "{at}: `meridian -C {root} context --json` gave no answer in {} seconds, {unchecked}",
+                    CHECK_TIMEOUT.as_secs()
+                ),
+                Ok(Err(e))
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    bail!("{at}: `meridian` was not found on PATH, {unchecked}")
+                }
+                Ok(Err(e)) => bail!("{at}: {e:#}, {unchecked}"),
+                Ok(Ok(out)) => out,
+            };
+            let v: Value = serde_json::from_slice(&out.stdout).with_context(|| {
+                format!(
+                    "{at}: `meridian -C {root} context --json` failed, {unchecked}: {}",
+                    tail(&out.stderr)
+                )
+            })?;
             let id = v["project_id"].as_str().unwrap_or_default();
             if v["project_identity_source"] != "meridian.toml" || id.is_empty() {
                 bail!(
