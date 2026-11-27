@@ -8,8 +8,7 @@ pub mod router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -20,26 +19,45 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::Source;
-use crate::config::{Config, MeridianConfig};
+use super::{RefStart, Source};
+use crate::config::{Config, MeridianConfig, is_id};
 use crate::model::{
     Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult,
     InboxItem, ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one saved machine may take to list its sessions. Measured: about
+/// 2 s for one that answers; `ssh` itself gives up connecting after 10.
+const MACHINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// What this program calls itself in an inbox item's `via` and in a claim.
 const PROGRAM: &str = "meridian-comms";
 
 pub struct Meridian {
+    /// What every ref to a session here starts with, for the daemon's life:
+    /// the config's `machine` until `check` asks Meridian for its own name.
+    /// A rename in Meridian while the daemon runs changes nothing here.
     machine: String,
+    /// The config's `machine`: what refs started with before the daemon kept
+    /// a record of it.
+    configured: String,
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
+    /// Whether this Meridian saves other machines (its `machine` command):
+    /// learnt by `check`, like `inbox`.
+    machines: bool,
     /// Whether this Meridian has the machine inbox, by its `inbox` command and
     /// not its version: builds before the release share a version. Learnt by
     /// `check` when the daemon starts; without it nothing is filed or routed.
-    inbox: AtomicBool,
+    inbox: bool,
+}
+
+/// A machine Meridian has saved: the ID that never changes, and the name
+/// it is saved under, which is what `--machine` and `<machine>/<id>` take.
+struct Saved {
+    id: String,
+    name: String,
 }
 
 struct Project {
@@ -114,10 +132,12 @@ impl Meridian {
             .collect();
         Ok(Self {
             machine: cfg.machine().to_string(),
+            configured: cfg.machine().to_string(),
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
-            inbox: AtomicBool::new(true),
+            machines: false,
+            inbox: true,
         })
     }
 
@@ -125,39 +145,82 @@ impl Meridian {
         format!("{}/{project}/{id}", self.machine)
     }
 
-    /// `machine/project/spawn-id` of any Meridian ref on this machine. A project
-    /// ID may itself hold a `/`, so the spawn ID is split off the end.
-    fn split_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
-        let rest = r.strip_prefix(self.machine.as_str())?.strip_prefix('/')?;
+    /// The machine, project and spawn ID of a Meridian ref. A project ID may
+    /// itself hold a `/`, so the machine comes off the front and the spawn ID
+    /// off the end.
+    fn split_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str, &'a str)> {
+        let (machine, rest) = r.split_once('/')?;
         let (project, id) = rest.rsplit_once('/')?;
-        is_id(id).then_some((project, id))
+        (is_id(machine) && is_id(id)).then_some((machine, project, id))
     }
 
-    /// The project and spawn ID of a ref in a configured project.
+    /// The project and spawn ID of a ref on this machine, in a configured
+    /// project: the only sessions this source wakes.
     fn parse_ref<'a>(&self, r: &'a str) -> Option<(&'a str, &'a str)> {
-        self.split_ref(r).filter(|(project, _)| self.projects.contains_key(*project))
+        let (machine, project, id) = self.split_ref(r)?;
+        (machine == self.machine && self.projects.contains_key(project)).then_some((project, id))
     }
 
-    /// One project's running primaries, or with no project every project's.
-    async fn primaries(&self, project: Option<&str>) -> Result<Rows> {
-        let out = match project {
-            Some(p) => {
-                run(
-                    Some(&self.projects[p].root),
-                    &["spawn", "list", "--primary", "--json", "--limit", "200"],
-                )
-                .await?
-            }
-            None => run(None, &["spawn", "list", "--global", "--primary", "--json"]).await?,
-        };
-        if !out.status.success() {
-            bail!("meridian spawn list failed: {}", tail(&out.stderr));
+    /// How a Meridian command on this machine names the session of a ref: the
+    /// spawn ID, with its machine in front when that is another one.
+    pub(super) fn target(&self, r: &str) -> Option<String> {
+        let (machine, _, id) = self.split_ref(r)?;
+        Some(if machine == self.machine {
+            id.to_string()
+        } else {
+            format!("{machine}/{id}")
+        })
+    }
+
+    /// One project's running primaries.
+    async fn primaries(&self, project: &str) -> Result<Rows> {
+        let root = &self.projects[project].root;
+        rows(run(Some(root), &["spawn", "list", "--primary", "--json", "--limit", "200"]).await?)
+    }
+
+    /// Every project's running primaries, on this machine or a saved one.
+    async fn everywhere(&self, machine: Option<&str>) -> Result<Rows> {
+        let mut args = vec!["spawn", "list", "--global", "--primary", "--json"];
+        if let Some(m) = machine {
+            args.extend(["--machine", m]);
         }
-        serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
+        rows(run(None, &args).await?)
     }
 
-    fn candidate(&self, project: &str, row: Row) -> Candidate {
-        let configured = self.projects.get(project);
+    /// The machines Meridian has saved: none on a Meridian without them. A
+    /// list that can't be read is an error, not an empty list: a caller that
+    /// took it for "nothing saved" would look for a remote session here.
+    async fn saved_machines(&self) -> Result<Vec<Saved>> {
+        if !self.machines {
+            return Ok(vec![]);
+        }
+        let out = tokio::time::timeout(MACHINE_TIMEOUT, run(None, &["machine", "list", "--json"]))
+            .await
+            .context("`meridian machine list` gave no answer")??;
+        let listed: Value = serde_json::from_slice(&out.stdout)
+            .ok()
+            .filter(|_| out.status.success())
+            .with_context(|| format!("`meridian machine list` failed: {}{}", tail(&out.stdout), tail(&out.stderr)))?;
+        let machines = listed["machines"]
+            .as_array()
+            .context("`meridian machine list` printed no `machines`")?;
+        Ok(machines
+            .iter()
+            .filter_map(|m| {
+                Some(Saved {
+                    id: field(&m["id"])?,
+                    name: field(&m["name"]).filter(|n| is_id(n))?,
+                })
+            })
+            .collect())
+    }
+
+    /// `machine` is the name the listing was asked by: this machine's, or the
+    /// one a machine is saved under, which is what Meridian's commands take.
+    /// What a row calls its own machine is not read.
+    fn candidate(&self, machine: &str, project: &str, row: Row) -> Candidate {
+        let here = machine == self.machine;
+        let configured = self.projects.get(project).filter(|_| here);
         let own = configured.and_then(|p| p.default.clone());
         let default = row.agent.is_some() && row.agent == own.or_else(|| self.default.clone());
         // `idle` is measured from the last turn the user's loop ended, so a row
@@ -177,16 +240,22 @@ impl Meridian {
             }),
         };
         Candidate {
-            ref_: self.ref_of(project, &row.spawn_id),
+            ref_: format!("{machine}/{project}/{}", row.spawn_id),
             id: Some(row.spawn_id),
             person: self.owner.clone(),
+            machine: Some(machine.to_string()),
             project: Some(project.to_string()),
             group: row.work_id,
             label: row.agent,
             model: row.model,
             default,
             activity,
-            root: row.project_root.map(PathBuf::from).or_else(|| configured.map(|p| p.root.clone())),
+            // A path on another machine is no use to a command run here.
+            root: row
+                .project_root
+                .filter(|_| here)
+                .map(PathBuf::from)
+                .or_else(|| configured.map(|p| p.root.clone())),
         }
     }
 }
@@ -211,6 +280,49 @@ fn meridian_command(root: Option<&Path>) -> Command {
     cmd
 }
 
+/// Whether this Meridian has the command group `name`, which says what the
+/// daemon may do for its whole life. Only an answer that the command is not
+/// there says no: a Meridian that can't be run, or doesn't answer, is unknown,
+/// and the start fails instead of taking it for an older build.
+async fn has_command(name: &str) -> Result<bool> {
+    let asked = format!("`meridian {name} --help`, which tells whether this Meridian has `{name}`,");
+    let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &[name, "--help"]))
+        .await
+        .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))?
+        .with_context(|| format!("{asked} could not be run"))?;
+    Ok(out.status.success())
+}
+
+/// Whether a failed `spawn show` of `chat` says the session does not exist.
+/// Meridian has said it three ways, on either stream: `{"error": "Chat '…'
+/// not found"}`, the same with a top-level `"kind": "not_found"`, and through
+/// `--machine` `{"error": {"kind", "text"}}`, where the kind was `failed`
+/// with the far side's text before it became `not_found`. Under no kind or
+/// `failed` the text must name the chat: `failed` is also a far shell that
+/// found no `meridian`, which is a machine that could not be asked. An
+/// unknown machine reads as not found too, and such a machine lists no
+/// candidates.
+fn not_found(out: &std::process::Output, chat: &str) -> bool {
+    let missing = format!("'{chat}' not found");
+    let said = |text: &Value| text.as_str().is_some_and(|t| t.contains(&missing));
+    [&out.stdout, &out.stderr]
+        .into_iter()
+        .flat_map(|stream| stream.split(|b| *b == b'\n'))
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .any(|e| match e["kind"].as_str().or(e["error"]["kind"].as_str()) {
+            Some("not_found") => true,
+            Some("failed") | None => said(&e["error"]) || said(&e["error"]["text"]),
+            Some(_) => false,
+        })
+}
+
+fn rows(out: std::process::Output) -> Result<Rows> {
+    if !out.status.success() {
+        bail!("meridian spawn list failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+    }
+    serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
+}
+
 async fn run(root: Option<&Path>, args: &[&str]) -> Result<std::process::Output> {
     meridian_command(root).args(args).output().await.context("cannot run `meridian`")
 }
@@ -222,11 +334,6 @@ fn tail(bytes: &[u8]) -> String {
     let start = text.len().saturating_sub(300);
     let start = (start..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
     text[start..].replace('\n', " ")
-}
-
-/// An inbox item or spawn ID, safe as a command's argument: never an option.
-fn is_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
 }
 
 /// Meridian's rule for an inbox field (its `SAFE_FIELD`), with room left for
@@ -299,13 +406,42 @@ impl Source for Meridian {
 
     async fn list(&self, req: &ListRequest) -> Result<ListResponse> {
         let for_owner = req.person.as_deref() == Some(self.owner.as_str());
-        if req.any_project {
+        if req.offerable {
             let mut out = ListResponse::default();
-            if for_owner {
-                let rows = self.primaries(None).await?;
+            if !for_owner {
+                return Ok(out);
+            }
+            // Every machine is asked at once, and each saved one has its own
+            // limit: one that is down or slow contributes none, and holds the
+            // listing no longer than that.
+            let elsewhere = async {
+                // The sessions here are still worth listing without the others.
+                let saved = self.saved_machines().await.unwrap_or_else(|e| {
+                    tracing::warn!("no saved machine's sessions are listed: {e:#}");
+                    vec![]
+                });
+                join_all(saved.into_iter().map(|Saved { name: m, .. }| async move {
+                    let asked = Instant::now();
+                    let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
+                        Ok(rows) => rows,
+                        Err(_) => Err(anyhow::anyhow!("no answer")),
+                    };
+                    let took = asked.elapsed().as_secs_f32();
+                    match &rows {
+                        Ok(r) => tracing::debug!("{m} listed {} session(s) in {took:.1} s", r.spawns.len()),
+                        Err(e) => tracing::warn!("no sessions listed from {m} after {took:.1} s: {e:#}"),
+                    }
+                    Some((m, rows.ok()?))
+                }))
+                .await
+            };
+            let (here, there) = tokio::join!(self.everywhere(None), elsewhere);
+            let mut listed = vec![(self.machine.to_string(), here?)];
+            listed.extend(there.into_iter().flatten());
+            for (machine, rows) in listed {
                 for mut row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
                     if let Some(project) = row.project_id.take() {
-                        out.candidates.push(self.candidate(&project, row));
+                        out.candidates.push(self.candidate(&machine, &project, row));
                     }
                 }
             }
@@ -326,7 +462,7 @@ impl Source for Meridian {
             }
         }
 
-        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(Some(p)).await) })).await;
+        let answers = join_all(projects.iter().map(|p| async move { (*p, self.primaries(p).await) })).await;
         let mut out = ListResponse::default();
         for (project, rows) in answers {
             let rows = match rows {
@@ -347,7 +483,7 @@ impl Source for Meridian {
             for row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
                 let r = self.ref_of(project, &row.spawn_id);
                 if for_owner || own.contains(r.as_str()) {
-                    out.candidates.push(self.candidate(project, row));
+                    out.candidates.push(self.candidate(&self.machine, project, row));
                 }
             }
         }
@@ -412,17 +548,34 @@ impl Source for Meridian {
         };
         IdentifyResult {
             caller: CallerKind::Session,
-            ref_: Some(self.ref_of(project, id)),
+            source: Some(self.name().to_string()),
+            session: Some(id.clone()),
             person: Some(self.owner.clone()),
             project: Some(project.clone()),
             may_post: var("MERIDIAN_SESSION_ROLE").is_some_and(|r| r == "primary"),
         }
     }
 
+    async fn elsewhere(&self, word: &str) -> bool {
+        let Some((machine, _, _)) = self.split_ref(word) else {
+            return false;
+        };
+        // A list that can't be read leaves the plain "matches no running session".
+        machine != self.machine
+            && self
+                .saved_machines()
+                .await
+                .is_ok_and(|saved| saved.iter().any(|m| m.name == machine))
+    }
+
+    fn session_ref(&self, project: &str, session: &str) -> Option<String> {
+        (self.projects.contains_key(project) && is_id(session)).then(|| self.ref_of(project, session))
+    }
+
     /// Each project's key must be its root's Meridian project ID: a channel's
     /// project, a candidate's project and a filed item's project are one value.
     /// A check that could not run stops the daemon too, and says what stopped it.
-    async fn check(&self) -> Result<()> {
+    async fn check(&mut self) -> Result<()> {
         let answers = join_all(self.projects.iter().map(|(key, p)| async move {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
             (key, p, out)
@@ -468,11 +621,25 @@ impl Source for Meridian {
                 );
             }
         }
+        // Meridian names its machines from 0.28. Where it does, its name is the
+        // one every ref carries, and a daemon that can't learn it must not
+        // guess: its refs would match nothing Meridian or another start wrote.
+        self.machines = has_command("machine").await?;
+        if self.machines {
+            let asked = "`meridian machine name`, which every session's ref starts with,";
+            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name"]))
+                .await
+                .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() || !is_id(&name) {
+                bail!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+            }
+            self.machine = name;
+        }
         // An older Meridian has no `inbox` command: say so once, here, instead
         // of failing a command for every message.
-        let has = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["inbox", "--help"])).await;
-        if !matches!(has, Ok(Ok(out)) if out.status.success()) {
-            self.inbox.store(false, Ordering::Relaxed);
+        if !has_command("inbox").await? {
+            self.inbox = false;
             tracing::warn!(
                 "this Meridian has no `inbox` command (it came with 0.28), so it can't file or route: a Slack message nobody is woken for waits in `meridian-comms list`"
             );
@@ -480,8 +647,15 @@ impl Source for Meridian {
         Ok(())
     }
 
+    fn ref_start(&self) -> Option<RefStart> {
+        Some(RefStart {
+            now: format!("{}/", self.machine),
+            unrecorded: format!("{}/", self.configured),
+        })
+    }
+
     async fn file(&self, req: &FileRequest) -> Result<Option<Filed>> {
-        if !self.inbox.load(Ordering::Relaxed) {
+        if !self.inbox {
             return Ok(None);
         }
         let mut cmd = meridian_command(None);
@@ -512,7 +686,7 @@ impl Source for Meridian {
         let item = field(&v["message"])
             .filter(|m| is_id(m))
             .context("meridian message inbox gave no message ID")?;
-        let machine = field(&v["machine"]).unwrap_or_else(|| self.machine.clone());
+        let machine = field(&v["machine"]).unwrap_or_else(|| self.machine.to_string());
         Ok(Some(Filed {
             item,
             place: format!("{machine}'s inbox"),
@@ -520,7 +694,7 @@ impl Source for Meridian {
     }
 
     async fn inbox_item(&self, item: &str) -> Result<Option<InboxItem>> {
-        if !self.inbox.load(Ordering::Relaxed) {
+        if !self.inbox {
             return Ok(None);
         }
         if !is_id(item) {
@@ -532,28 +706,43 @@ impl Source for Meridian {
             Err(kind) if kind == "not_found" => return Ok(None),
             Err(kind) => bail!("meridian inbox read: {kind}"),
         };
-        // `from` names the sender's chat; a candidate is named by its spawn ID.
+        // `from` names the sender's chat and machine; a candidate is named by
+        // its spawn ID, so the sender's ref takes one more call, on its machine.
+        // That machine is found by its ID, which no rename changes, among the
+        // saved ones, and the ref takes the saved name as a candidate's does.
+        // Any other sender is looked up here: the chat of a machine nobody
+        // saved names no candidate, wherever it is looked for.
         // A chat Meridian does not find is taken as gone, so not a candidate;
-        // any other failure fails the read, or the sender would be offered
-        // its own message. Meridian prints this error as JSON on stderr.
+        // any other failure, a machine that can't be reached among them, fails
+        // the read, or the sender would be offered its own message.
         let mut from = None;
-        if let Some(chat) = field(&v["from"]["id"]).filter(|id| v["from"]["kind"] == "session" && is_id(id)) {
-            let out = run(None, &["spawn", "show", &chat, "--json"]).await?;
-            from = serde_json::from_slice::<Value>(&out.stdout)
-                .ok()
-                .and_then(|s| field(&s["spawn_id"]));
-            let gone = || {
-                let errors = String::from_utf8_lossy(&out.stderr);
-                errors
-                    .lines()
-                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                    .any(|e| e["error"].as_str().is_some_and(|e| e.contains("not found")))
-            };
-            if from.is_none() && !gone() {
-                bail!(
-                    "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}",
+        let sender = &v["from"];
+        if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
+            // Before the ID was written, an item carried the saved name alone.
+            let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
+            let saved = self.saved_machines().await.context("cannot tell which machine sent it")?;
+            let saved = saved.into_iter().find(|m| match &id {
+                Some(id) => m.id == *id,
+                None => Some(&m.name) == name.as_ref(),
+            });
+            let machine = saved.map(|m| m.name);
+            let mut args = vec!["spawn", "show", &chat, "--json"];
+            if let Some(m) = &machine {
+                args.extend(["--machine", m]);
+            }
+            let out = run(None, &args).await?;
+            let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            match field(&shown["spawn_id"]).filter(|id| is_id(id)) {
+                Some(id) => {
+                    let machine = machine.as_deref().unwrap_or(&self.machine);
+                    from = field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}"));
+                }
+                None if not_found(&out, &chat) => {}
+                None => bail!(
+                    "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
+                    tail(&out.stdout),
                     tail(&out.stderr)
-                );
+                ),
             }
         }
         Ok(Some(InboxItem {
@@ -568,22 +757,26 @@ impl Source for Meridian {
     }
 
     async fn offer(&self, item: &str, ref_: &str) -> Result<OfferResult> {
-        if !self.inbox.load(Ordering::Relaxed) {
+        if !self.inbox {
             bail!("this Meridian has no inbox");
         }
         // The spawn ID alone names the session, whether or not its project is configured.
-        let (_, id) = self.split_ref(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
+        let target = self.target(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
-        let out = run(None, &["inbox", "offer", item, id, "--json"]).await?;
+        // The item is on this machine, so the offer runs here whatever machine
+        // the session is on: never through `--machine`.
+        let out = run(None, &["inbox", "offer", item, &target, "--json"]).await?;
         Ok(match answer(&out)? {
             Ok(_) => OfferResult {
                 offered: Offered::Yes,
                 detail: String::new(),
             },
             // Only this kind means the notice may have arrived; every other
-            // (`refused`, `not_running`, `cold`, `taken`) sent nothing.
+            // sent nothing: `refused`, `not_running`, `cold`, `taken`, and from
+            // a machine that is down or too old for the inbox `unreachable`,
+            // `usage` or `version`.
             Err(kind) => OfferResult {
                 offered: if kind == "maybe_delivered" { Offered::Maybe } else { Offered::No },
                 detail: kind,
@@ -592,7 +785,7 @@ impl Source for Meridian {
     }
 
     async fn take(&self, item: &str, by: &str) -> Result<()> {
-        if !self.inbox.load(Ordering::Relaxed) {
+        if !self.inbox {
             bail!("this Meridian has no inbox");
         }
         if !is_id(item) {

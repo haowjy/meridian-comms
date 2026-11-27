@@ -16,17 +16,40 @@ use crate::model::{
     WakeRequest, WakeResult,
 };
 
+/// What a source's refs start with.
+pub struct RefStart {
+    pub now: String,
+    /// What they started with in thread files written before the daemon
+    /// recorded it.
+    pub unrecorded: String,
+}
+
 #[async_trait]
 pub trait Source: Send + Sync {
     fn name(&self) -> &'static str;
     async fn list(&self, req: &ListRequest) -> Result<ListResponse>;
     async fn wake(&self, req: &WakeRequest) -> Result<WakeResult>;
+    /// Run in the client, on the caller's environment: it starts no process.
     fn identify(&self, req: &IdentifyRequest) -> IdentifyResult;
+    /// Run in the daemon: the ref of the session `identify` reported, or
+    /// `None` when the two are not a session this source would list.
+    fn session_ref(&self, project: &str, session: &str) -> Option<String>;
 
+    /// Whether `word` is the ref of a session this source can list and never
+    /// wakes, because it runs on another machine.
+    async fn elsewhere(&self, _word: &str) -> bool {
+        false
+    }
     /// Run once when the daemon starts; an error stops it. For what the config
     /// says about this source that only the source's tool can confirm.
-    async fn check(&self) -> Result<()> {
+    async fn check(&mut self) -> Result<()> {
         Ok(())
+    }
+    /// After `check`: what this source's refs start with. The daemon records
+    /// it, and when it changes rewrites the refs its threads hold, so a thread
+    /// keeps the sessions it chose.
+    fn ref_start(&self) -> Option<RefStart> {
+        None
     }
     /// Puts a message where this source's sessions look. `None`: no inbox.
     async fn file(&self, _req: &FileRequest) -> Result<Option<Filed>> {

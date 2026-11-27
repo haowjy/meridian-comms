@@ -110,11 +110,15 @@ fn nonce() -> String {
 
 /// The decision is the report's last non-empty line, exactly `offer <session>`,
 /// `none` or `ask <text>`. Anything else is `none`: a sentence, a fenced line,
-/// an offer with more after the ID, an `ask` with nothing to ask.
-fn decision(report: &str, sessions: &BTreeMap<&str, &str>) -> Decision {
+/// an offer with more after the ID, an `ask` with nothing to ask. `here` is
+/// this machine's name with a `/`: the list shows a session here by its bare
+/// ID beside the machine's name, and an agent may write the two together.
+fn decision(report: &str, sessions: &BTreeMap<String, &str>, here: &str) -> Decision {
     let line = report.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
     match line.split_once(' ') {
-        Some(("offer", id)) => sessions.get(id).map_or(Decision::None, |r| Decision::Offer(r.to_string())),
+        Some(("offer", id)) => sessions
+            .get(id.strip_prefix(here).unwrap_or(id))
+            .map_or(Decision::None, |r| Decision::Offer(r.to_string())),
         Some(("ask", q)) if !q.trim().is_empty() => Decision::Ask(q.trim().to_string()),
         _ => Decision::None,
     }
@@ -129,17 +133,10 @@ fn activity(c: &Candidate) -> &'static str {
     }
 }
 
-/// The candidates the agent may name, each by the ID its decision line uses.
-fn sessions(req: &DecideRequest) -> impl Iterator<Item = (&str, &Candidate)> {
-    req.candidates
-        .iter()
-        .filter_map(|c| Some((c.id.as_deref().filter(|id| is_id(id))?, c)))
-}
-
 /// What the profile expects: the message's text marked as someone else's
 /// words, who sent it, and the sessions that could take it, each by the ID
 /// the decision line must use.
-fn prompt(req: &DecideRequest, sessions: &[(&str, &Candidate, Option<String>)]) -> String {
+fn prompt(req: &DecideRequest, sessions: &[(String, &Candidate, Option<String>)]) -> String {
     let m = &req.message;
     let mut out = format!("Route inbox message {}.\n\n", req.item);
     out.push_str(match (req.may_ask, &req.reply) {
@@ -165,6 +162,7 @@ fn prompt(req: &DecideRequest, sessions: &[(&str, &Candidate, Option<String>)]) 
     out.push_str("\nRunning sessions that could take it:\n");
     for (id, c, goal) in sessions {
         let facts: Vec<String> = [
+            c.machine.as_ref().map(|m| format!("machine {m}")),
             c.project.as_ref().map(|p| format!("project {p}")),
             c.label.as_ref().map(|l| format!("agent {l}")),
             c.group.as_ref().map(|g| format!("work item {g}")),
@@ -201,6 +199,13 @@ fn prompt(req: &DecideRequest, sessions: &[(&str, &Candidate, Option<String>)]) 
 }
 
 impl Meridian {
+    /// The candidates the agent may name, each by the name its decision line
+    /// uses and Meridian's commands take: the spawn ID, behind its machine's
+    /// name when that is another machine. Two machines can each have a `p41`.
+    fn sessions<'a>(&'a self, req: &'a DecideRequest) -> impl Iterator<Item = (String, &'a Candidate)> {
+        req.candidates.iter().filter_map(|c| Some((self.target(&c.ref_)?, c)))
+    }
+
     /// The goal of each work item the candidates are on, by project root and
     /// work item: one `work show` each, a few at a time, since every one is a
     /// whole `meridian` process. A goal that can't be read is left out.
@@ -234,7 +239,8 @@ impl Meridian {
             );
         }
         let goals = self.goals(&req.candidates).await;
-        let listed: Vec<(&str, &Candidate, Option<String>)> = sessions(req)
+        let listed: Vec<(String, &Candidate, Option<String>)> = self
+            .sessions(req)
             .map(|(id, c)| {
                 let goal = c.root.clone().zip(c.group.clone()).and_then(|at| goals.get(&at).cloned());
                 (id, c, goal)
@@ -299,8 +305,9 @@ impl Meridian {
             let status = shown["status"].as_str().unwrap_or("unreadable");
             let why = match status {
                 "succeeded" => {
-                    let known: BTreeMap<&str, &str> = sessions(req).map(|(id, c)| (id, c.ref_.as_str())).collect();
-                    return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known));
+                    let known: BTreeMap<String, &str> = self.sessions(req).map(|(id, c)| (id, c.ref_.as_str())).collect();
+                    let here = format!("{}/", self.machine);
+                    return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known, &here));
                 }
                 "failed" | "cancelled" | "timed_out" => bail!("the second step ended {status}"),
                 // Still going: a wait that failed early says nothing about the spawn.

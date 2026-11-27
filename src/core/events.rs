@@ -214,7 +214,7 @@ impl Core {
                 person: Some(owner.clone()),
                 project: project.clone(),
                 refs,
-                any_project: false,
+                offerable: false,
             })
             .await;
 
@@ -249,7 +249,7 @@ impl Core {
                 self.store.save_thread(&st)?;
                 let msg = format!(
                     "I can't match it: {}\n{}",
-                    listing.why_not(bad),
+                    self.why_not(&listing, bad).await,
                     self.explain(&owner, project.as_deref(), &listing, &[], None, &[], true)
                 );
                 let menu = self.menu(&owner, &listing);
@@ -298,7 +298,7 @@ impl Core {
                 if pcfg.agent != AgentMark::Always
                     && let Some(f) = st.filed.as_mut().filter(|f| f.question == Question::Asked)
                 {
-                    if self.routed_again(&f.source, &f.item) {
+                    if self.routed_again(&f.source, &f.item, &self.message_ref(&m.conversation, &f.message)) {
                         f.question = Question::Answered;
                     } else {
                         self.route_again(&f.source, &f.item, m.text.clone());
@@ -403,7 +403,7 @@ impl Core {
                 person: Some(self.cfg.owner.clone()),
                 project: project.clone(),
                 refs,
-                any_project: false,
+                offerable: false,
             })
             .await;
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();

@@ -14,8 +14,10 @@ Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meri
 Waking sessions works with any current Meridian. Filing a message nobody was woken for,
 and the router, need Meridian 0.28 or later.
 
-**Status:** early. One machine, one Slack bot per person. Amp threads as recipients and
-several machines are not supported.
+**Status:** early. One Slack bot per person, with its daemon on one machine. The router
+can offer a filed message to a session on another machine Meridian has saved
+(`meridian machine add`); waking a session there from Slack, and Amp threads as
+recipients, are not supported.
 
 ## How it behaves
 

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::source::RefStart;
+
 pub const HANDLED_KEEP: usize = 50;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,6 +212,56 @@ impl Store {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
             .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
             .collect()
+    }
+
+    /// Makes every stored ref of `source` start the way the source starts
+    /// them now, and records that start. A source names its sessions anew (a
+    /// machine is renamed) and a thread keeps the sessions it chose. Run
+    /// before any message is handled. Gives the threads changed.
+    ///
+    /// The record is written last: a daemon killed part-way rewrites the rest
+    /// at its next start, and a ref already rewritten no longer matches.
+    pub fn settle_refs(&self, source: &str, start: &RefStart) -> Result<usize> {
+        let path = self.dir.join("ref-starts.json");
+        let mut recorded: BTreeMap<String, String> = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let old = recorded.get(source).unwrap_or(&start.unrecorded);
+        let changed = match *old == start.now {
+            true => 0,
+            false => self.rename_refs(old, &start.now)?,
+        };
+        if recorded.get(source) != Some(&start.now) {
+            recorded.insert(source.to_string(), start.now.clone());
+            write_atomic(&path, &serde_json::to_vec_pretty(&recorded)?)?;
+        }
+        Ok(changed)
+    }
+
+    fn rename_refs(&self, old: &str, new: &str) -> Result<usize> {
+        let mut changed = 0;
+        for mut st in self.all_threads() {
+            let before = serde_json::to_vec(&st)?;
+            let picked = st
+                .pending
+                .iter_mut()
+                .flat_map(|p| p.picks.values_mut())
+                .filter_map(|pick| match pick {
+                    Pick::Refs(refs) => Some(refs),
+                    Pick::Rule => None,
+                });
+            for r in st.scope.values_mut().chain(st.woken.values_mut()).chain(picked).flatten() {
+                if let Some(rest) = r.strip_prefix(old) {
+                    *r = format!("{new}{rest}");
+                }
+            }
+            if serde_json::to_vec(&st)? != before {
+                self.save_thread(&st)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     pub fn load_cursor(&self) -> BTreeMap<String, String> {
