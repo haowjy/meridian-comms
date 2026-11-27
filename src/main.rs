@@ -115,8 +115,8 @@ enum Setup {
     /// ships the agent; its model, harness and effort go in `[inbox.router]`
     /// in `~/.meridian/config.toml`. The directory is a Meridian project of
     /// its own under the state directory. Run this once on the daemon's
-    /// machine, outside any agent session, and again after upgrading from a
-    /// setup that installed the agent with Mars. Without it the second step
+    /// machine, outside any agent session, and again if an earlier version of
+    /// meridian-comms set the router up. Without it the second step
     /// fails, the routing log says so, and the message waits.
     Router,
 }

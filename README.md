@@ -79,12 +79,15 @@ Without these steps the bot works as above and a message nobody was woken for wa
    a session.
 3. Add a `[router]` section to `config.toml`. Empty is enough; its three settings and
    their defaults are in [docs/design.md](docs/design.md#config).
-4. Run `meridian-comms setup router`. It makes the router's directory and checks that
-   Meridian can start the agent the router asks when the model is unsure. Meridian ships
-   that agent from 0.X.Y on. It runs on OpenCode by default, which must be installed and
-   signed in on this machine; to change its model, harness or effort, set them in
-   `[inbox.router]` in `~/.meridian/config.toml`. Run it again after upgrading from a
-   setup that installed the agent with `--package`.
+4. Run `meridian-comms setup router`. It first checks that this Meridian ships the agent
+   the router asks when the model is unsure (it does from 0.X.Y on), and changes nothing if
+   not. Then it makes the router's directory and checks that Meridian can start the agent
+   there. The agent runs on OpenCode by default, which must be installed and signed in on
+   this machine; to change its model, harness or effort, set them in `[inbox.router]` in
+   `~/.meridian/config.toml`. If you set up the router with any earlier version of
+   meridian-comms, run setup again once Meridian is 0.X.Y or later: it removes the
+   package copy of the agent the earlier setup installed, which would otherwise replace
+   Meridian's. The daemon's log warns while that copy is there.
 5. Restart the daemon.
 6. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
    router did with it.
