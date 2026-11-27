@@ -481,9 +481,24 @@ and its chat ID is not looked up, since here it would name some other session. A
 with no `machine_id` is read by its `machine` name the same way, own names first: a
 name this machine has or had is here, a saved machine's name is there, any other name
 is no candidate, and no name at all is looked up here. On a Meridian that does not tell
-this machine's ID, a sender that is on no saved machine is looked up here. If the sender's machine can't be
-reached the routing fails and the item waits, since its sender could not be told from
-the candidates.
+this machine's ID, a sender that is on no saved machine is looked up here.
+
+Only Meridian's "not found" for the chat means the sender is gone. Any other failure
+fails the routing and the item waits: the sender's machine can't be reached or is too
+old, its shell finds no `meridian`, or `machine list` can't be read. Read as "no
+sender", each would leave the sender among the candidates whenever the listing, a
+moment later, reaches its machine, and it could be offered its own message; a waiting
+item costs only a later `meridian-comms route`. The listing, by contrast, reads a failed
+`machine list` as no saved machines, since a missing candidate offers nobody a wrong
+message. Two cases still let a sender through:
+
+- A live chat issued before Meridian's machine-wide IDs: `spawn show` answers "not
+  found" for it, so its session can be offered its own message. This fades as those
+  sessions end.
+- This machine's ID is read once at start. If `machine.json` is replaced while the
+  daemon runs, items carry an ID that is neither this machine's nor a saved one, so
+  every sender here is unknown until a restart. An unknown ID under this machine's name
+  logs a warning to restart.
 
 An offer that crosses machines can fail in more ways, and the log carries Meridian's
 word for each. `maybe_delivered` means the notice may have arrived: the routing is
@@ -501,3 +516,13 @@ on another machine and can be offered a message but not woken from Slack.
 
 The Amp source, and waking a session on another machine. The client already talks to
 the daemon in JSON.
+
+Waking across machines would be the first change to store another machine's ref in a
+thread (`scope`, `woken`, `pending.picks`). Every stored ref is this machine's today,
+and the start's rewrite depends on it: Meridian lets a machine be saved under a name
+this one used to have, or under the config's `machine`, and the rewrite would turn
+that machine's refs into this machine's at every start. That change must leave the
+saved machines' current names out of the old names, or store the machine ID beside
+each ref. A ref stored by a saved machine's name is also orphaned when that machine is
+renamed; `machine list --json` gives each saved machine's `was`, which can rewrite it
+the way this machine's refs are.
