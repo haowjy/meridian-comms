@@ -44,6 +44,9 @@ pub struct Meridian {
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
+    /// Whether this Meridian saves other machines (its `machine` command):
+    /// learnt by `check`, like `inbox`.
+    machines: bool,
     /// Whether this Meridian has the machine inbox, by its `inbox` command and
     /// not its version: builds before the release share a version. Learnt by
     /// `check` when the daemon starts; without it nothing is filed or routed.
@@ -133,6 +136,7 @@ impl Meridian {
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
+            machines: false,
             inbox: true,
         })
     }
@@ -183,21 +187,32 @@ impl Meridian {
         rows(run(None, &args).await?)
     }
 
-    /// The machines Meridian has saved. None on a Meridian without them.
-    async fn saved_machines(&self) -> Vec<Saved> {
-        let Ok(out) = run(None, &["machine", "list", "--json"]).await else {
-            return vec![];
-        };
-        let listed: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-        let machines = listed["machines"].as_array().into_iter().flatten();
-        machines
+    /// The machines Meridian has saved: none on a Meridian without them. A
+    /// list that can't be read is an error, not an empty list: a caller that
+    /// took it for "nothing saved" would look for a remote session here.
+    async fn saved_machines(&self) -> Result<Vec<Saved>> {
+        if !self.machines {
+            return Ok(vec![]);
+        }
+        let out = tokio::time::timeout(MACHINE_TIMEOUT, run(None, &["machine", "list", "--json"]))
+            .await
+            .context("`meridian machine list` gave no answer")??;
+        let listed: Value = serde_json::from_slice(&out.stdout)
+            .ok()
+            .filter(|_| out.status.success())
+            .with_context(|| format!("`meridian machine list` failed: {}{}", tail(&out.stdout), tail(&out.stderr)))?;
+        let machines = listed["machines"]
+            .as_array()
+            .context("`meridian machine list` printed no `machines`")?;
+        Ok(machines
+            .iter()
             .filter_map(|m| {
                 Some(Saved {
                     id: field(&m["id"])?,
                     name: field(&m["name"]).filter(|n| is_id(n))?,
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// `machine` is the name the listing was asked by: this machine's, or the
@@ -398,7 +413,11 @@ impl Source for Meridian {
             // limit: one that is down or slow contributes none, and holds the
             // listing no longer than that.
             let elsewhere = async {
-                let saved = self.saved_machines().await;
+                // The sessions here are still worth listing without the others.
+                let saved = self.saved_machines().await.unwrap_or_else(|e| {
+                    tracing::warn!("no saved machine's sessions are listed: {e:#}");
+                    vec![]
+                });
                 join_all(saved.into_iter().map(|Saved { name: m, .. }| async move {
                     let asked = Instant::now();
                     let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
@@ -591,7 +610,8 @@ impl Source for Meridian {
         // Meridian names its machines from 0.28. Where it does, its name is the
         // one every ref carries, and a daemon that can't learn it must not
         // guess: its refs would match nothing Meridian or another start wrote.
-        if has_command("machine").await? {
+        self.machines = has_command("machine").await?;
+        if self.machines {
             let asked = "`meridian machine name`, which every session's ref starts with,";
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name"]))
                 .await
@@ -686,7 +706,8 @@ impl Source for Meridian {
         if let Some(chat) = field(&sender["id"]).filter(|id| sender["kind"] == "session" && is_id(id)) {
             // Before the ID was written, an item carried the saved name alone.
             let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
-            let saved = self.saved_machines().await.into_iter().find(|m| match &id {
+            let saved = self.saved_machines().await.context("cannot tell which machine sent it")?;
+            let saved = saved.into_iter().find(|m| match &id {
                 Some(id) => m.id == *id,
                 None => Some(&m.name) == name.as_ref(),
             });
