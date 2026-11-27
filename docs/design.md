@@ -236,7 +236,7 @@ to. `[router].model` does not change it: that setting is Jev's, and Jev is paid 
   either way.
 - **The decision** is the last non-empty line of the report: `offer <session>` for a
   session on the list, by the name the list gave it (`p41`, or `jimyao-minibox/p41` on
-  a saved machine), `none`, or `ask <question>`. Anything else is `none`: more words
+  a saved machine; this machine's name in front of a session here is accepted too), `none`, or `ask <question>`. Anything else is `none`: more words
   after the ID, an ID not on the list, a bare `ask`, a line wrapped in backticks or a
   code fence.
 - **One at a time.** The core runs one second step at once; the next waits, and one that

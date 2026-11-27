@@ -110,11 +110,15 @@ fn nonce() -> String {
 
 /// The decision is the report's last non-empty line, exactly `offer <session>`,
 /// `none` or `ask <text>`. Anything else is `none`: a sentence, a fenced line,
-/// an offer with more after the ID, an `ask` with nothing to ask.
-fn decision(report: &str, sessions: &BTreeMap<String, &str>) -> Decision {
+/// an offer with more after the ID, an `ask` with nothing to ask. `here` is
+/// this machine's name with a `/`: the list shows a session here by its bare
+/// ID beside the machine's name, and an agent may write the two together.
+fn decision(report: &str, sessions: &BTreeMap<String, &str>, here: &str) -> Decision {
     let line = report.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
     match line.split_once(' ') {
-        Some(("offer", id)) => sessions.get(id).map_or(Decision::None, |r| Decision::Offer(r.to_string())),
+        Some(("offer", id)) => sessions
+            .get(id.strip_prefix(here).unwrap_or(id))
+            .map_or(Decision::None, |r| Decision::Offer(r.to_string())),
         Some(("ask", q)) if !q.trim().is_empty() => Decision::Ask(q.trim().to_string()),
         _ => Decision::None,
     }
@@ -302,7 +306,8 @@ impl Meridian {
             let why = match status {
                 "succeeded" => {
                     let known: BTreeMap<String, &str> = self.sessions(req).map(|(id, c)| (id, c.ref_.as_str())).collect();
-                    return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known));
+                    let here = format!("{}/", self.machine);
+                    return Ok(decision(shown["report_body"].as_str().unwrap_or_default(), &known, &here));
                 }
                 "failed" | "cancelled" | "timed_out" => bail!("the second step ended {status}"),
                 // Still going: a wait that failed early says nothing about the spawn.
