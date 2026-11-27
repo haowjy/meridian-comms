@@ -270,6 +270,9 @@ pub fn routes(of: Option<String>, as_json: bool) -> Result<()> {
     for r in &log {
         let from = r.message.as_ref().map(|m| format!(" ({m})")).unwrap_or_default();
         println!("[{}] {}{from}: {}", local(r.time), r.item, r.done);
+        if r.again {
+            println!("  routed again, for a reply to the router's question");
+        }
         if let Some(c) = &r.choice {
             let p = r.probabilities.get(c).map(|p| format!(" at {p:.2}")).unwrap_or_default();
             println!("  the model chose {c}{p} among {} session(s)", r.candidates.len());

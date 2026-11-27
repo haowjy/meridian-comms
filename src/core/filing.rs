@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::Core;
 use crate::model::{FileRequest, Msg, Posted};
-use crate::state::{FiledItem, ThreadState};
+use crate::state::{FiledItem, Question, ThreadState};
 
 /// Every inbox request but an offer. The thread's lock is held across `file`
 /// and `take`, so a source that hangs must not hold the thread for long.
@@ -55,6 +55,7 @@ impl Core {
                         place: f.place,
                         message: m.id.clone(),
                         post: None,
+                        question: Question::None,
                     });
                     if let Err(e) = self.store.save_thread(st) {
                         tracing::error!("cannot save the thread of {}: {e:#}", req.via_ref);

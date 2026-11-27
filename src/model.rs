@@ -226,8 +226,13 @@ pub struct DecideRequest {
     pub item: String,
     pub message: InboxItem,
     pub candidates: Vec<Candidate>,
-    /// The item was filed from a thread, so a question can be posted there.
+    /// A question can be posted: the item was filed from a thread, and none
+    /// was asked about it yet.
     pub may_ask: bool,
+    /// What a person answered to the question asked before: untrusted, like
+    /// the message's text.
+    #[serde(default)]
+    pub reply: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

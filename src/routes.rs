@@ -62,6 +62,9 @@ pub struct Route {
     pub choice: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub probabilities: BTreeMap<String, f64>,
+    /// A second routing, run for a reply to the router's question.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub again: bool,
     /// The source's ID for a second-step run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,

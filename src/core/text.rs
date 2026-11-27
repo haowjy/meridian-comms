@@ -16,6 +16,12 @@ pub fn clean(s: &str) -> String {
 
 const QUESTION_CHARS: usize = 300;
 
+/// The start of `s`, at most `bytes` long, cut between characters.
+pub fn head(s: &str, bytes: usize) -> &str {
+    let end = (0..=s.len().min(bytes)).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    &s[..end]
+}
+
 /// A question the router's second step wrote, cut down to one short line of
 /// plain characters before it is posted: line breaks become spaces, control
 /// and format characters (the bidirectional controls among them) go, runs of

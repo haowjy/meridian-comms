@@ -17,7 +17,7 @@ use crate::jev;
 use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision, InboxItem, ListRequest, Offered, PostRequest};
 use crate::proto::RouteOut;
 use crate::routes::{Outcome, Route};
-use crate::state::ThreadState;
+use crate::state::{Question, ThreadState};
 
 const ROUTES_PER_MINUTE: usize = 20;
 /// Two of the model's options are `none` and `more`.
@@ -94,8 +94,9 @@ fn describe(c: &Candidate, now: DateTime<Utc>) -> String {
 }
 
 /// What the model is told about the message: who sent it, through what, for
-/// which project, and the first 4 KiB of its text.
-fn state(item: &InboxItem) -> String {
+/// which project, the first 4 KiB of its text, and as much of a reply to the
+/// router's question.
+fn state(item: &InboxItem, reply: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(f) = &item.from {
         out.push_str(&format!("From: session {f}\n"));
@@ -110,12 +111,12 @@ fn state(item: &InboxItem) -> String {
     if let Some(p) = &item.project {
         out.push_str(&format!("Project: {p}\n"));
     }
-    let end = (0..=item.text.len().min(STATE_TEXT_BYTES))
-        .rev()
-        .find(|i| item.text.is_char_boundary(*i))
-        .unwrap_or(0);
     out.push('\n');
-    out.push_str(&item.text[..end]);
+    out.push_str(text::head(&item.text, STATE_TEXT_BYTES));
+    if let Some(r) = reply {
+        out.push_str("\n\nThe router asked a question about this message. The reply in its thread:\n");
+        out.push_str(text::head(r, STATE_TEXT_BYTES));
+    }
     out
 }
 
@@ -141,16 +142,29 @@ impl Core {
             accepted,
             detail: format!("{}: {detail}", key.1),
         };
-        {
-            let mut r = self.routing.lock().unwrap();
-            if r.done.contains(&key) {
-                return Ok(out(false, "already routed; `meridian-comms routes` shows what was done"));
-            }
-            if !r.flying.insert(key.clone()) {
-                return Ok(out(false, "is being routed"));
-            }
+        if self.routing.lock().unwrap().done.contains(&key) {
+            return Ok(out(false, "already routed; `meridian-comms routes` shows what was done"));
         }
-        let answer = out(true, "accepted; `meridian-comms routes` shows what was done");
+        Ok(match self.start_route(src, key.clone(), None) {
+            true => out(true, "accepted; `meridian-comms routes` shows what was done"),
+            false => out(false, "is being routed"),
+        })
+    }
+
+    /// A person answered the router's question about `item`: it is routed once
+    /// more, with the reply as more of the sender's words. The thread's
+    /// `question` allows this once, so the routed-items set is not asked.
+    pub(super) fn route_again(self: &Arc<Self>, source: &str, item: &str, reply: String) {
+        if let Some(src) = self.sources.iter().position(|s| s.name() == source) {
+            self.start_route(src, (source.to_string(), item.to_string()), Some(reply));
+        }
+    }
+
+    /// Runs one routing in its own task, unless the item is being routed now.
+    fn start_route(self: &Arc<Self>, src: usize, key: ItemKey, reply: Option<String>) -> bool {
+        if !self.routing.lock().unwrap().flying.insert(key.clone()) {
+            return false;
+        }
         let core = self.clone();
         tokio::spawn(async move {
             let mut route = Route {
@@ -161,12 +175,13 @@ impl Core {
                 candidates: vec![],
                 choice: None,
                 probabilities: BTreeMap::new(),
+                again: reply.is_some(),
                 record: None,
                 outcome: Outcome::Failed,
                 done: "nothing: the run failed".into(),
                 error: None,
             };
-            match core.run_route(src, &mut route).await {
+            match core.run_route(src, &mut route, reply.as_deref()).await {
                 Ok((outcome, done)) => (route.outcome, route.done) = (outcome, done),
                 Err(e) => route.error = Some(format!("{e:#}")),
             }
@@ -177,19 +192,27 @@ impl Core {
             if let Err(e) = core.routes.append(&route) {
                 tracing::error!("cannot write the routing log: {e:#}");
             }
+            // The question is spent only by a routing that came to an end: after
+            // a failed one, the next reply tries again.
+            if route.again
+                && route.outcome.is_final()
+                && let Err(e) = core.set_question(&key.0, &key.1, Question::Answered, None).await
+            {
+                tracing::warn!("cannot record that the question about {} was answered: {e:#}", key.1);
+            }
             let mut r = core.routing.lock().unwrap();
             r.flying.remove(&key);
             if route.outcome.is_final() {
                 r.done.insert(key);
             }
         });
-        Ok(answer)
+        true
     }
 
     /// One routing, start to end: the decision and what was done. `route`
     /// gathers what the log keeps as the steps learn it. An error is a failed
     /// run: nothing was offered and the item waits.
-    async fn run_route(&self, src: usize, route: &mut Route) -> Result<(Outcome, String)> {
+    async fn run_route(&self, src: usize, route: &mut Route, reply: Option<&str>) -> Result<(Outcome, String)> {
         let Some(jev) = &self.jev else {
             return Ok((
                 Outcome::Off,
@@ -263,7 +286,7 @@ impl Core {
         let mut criteria: BTreeMap<String, String> = kept.iter().enumerate().map(|(i, c)| (option(i), describe(c, now))).collect();
         criteria.insert(NONE.into(), "none of these sessions".into());
         criteria.insert(MORE.into(), "this needs more context or reasoning than the list gives".into());
-        let answer = jev.choose(&state(&item), INSTRUCTIONS, &criteria).await?;
+        let answer = jev.choose(&state(&item, reply), INSTRUCTIONS, &criteria).await?;
         // The log names sessions by ref; an option the daemon did not list is dropped.
         let named = |o: &str| match kept.iter().enumerate().find(|(i, _)| option(*i) == o) {
             Some((_, c)) => Some(c.ref_.clone()),
@@ -277,13 +300,19 @@ impl Core {
             Some(c) if answer.probability() >= self.cfg.router.as_ref().map_or(1.0, |r| r.floor) => c,
             None if answer.choice != MORE => return Ok((Outcome::None, "nothing: the model chose no session".into())),
             // `more`, or a session the model was not sure of.
-            _ => match self
-                .second_step(src, route, &item, &kept, thread.as_ref(), chosen.is_some())
-                .await?
-            {
-                Second::Offer(c) => c,
-                Second::End(outcome, done) => return Ok((outcome, done)),
-            },
+            _ => {
+                let req = DecideRequest {
+                    item: route.item.clone(),
+                    message: item.clone(),
+                    candidates: kept.clone(),
+                    may_ask: thread.is_some() && reply.is_none(),
+                    reply: reply.map(String::from),
+                };
+                match self.second_step(src, route, &req, &kept, chosen.is_some()).await? {
+                    Second::Offer(c) => c,
+                    Second::End(outcome, done) => return Ok((outcome, done)),
+                }
+            }
         };
 
         let offer = tokio::time::timeout(WAKE_TIMEOUT, source.offer(&route.item, &target.ref_))
@@ -312,29 +341,22 @@ impl Core {
         &self,
         src: usize,
         route: &mut Route,
-        item: &InboxItem,
+        req: &DecideRequest,
         kept: &'a [Candidate],
-        thread: Option<&ThreadState>,
         unsure: bool,
     ) -> Result<Second<'a>> {
         let source = &self.sources[src];
         let none = |why: &str| Ok(Second::End(Outcome::None, format!("nothing: {why}")));
-        let req = DecideRequest {
-            item: route.item.clone(),
-            message: item.clone(),
-            candidates: kept.to_vec(),
-            may_ask: thread.is_some(),
-        };
         let one = tokio::time::timeout(SECOND_STEP_QUEUE, self.second.acquire())
             .await
             .context("dropped after 15 minutes waiting for another second step to finish")??;
         // The run's ID goes in the log before its end is known.
         let decided = tokio::time::timeout(SECOND_STEP_GUARD, async {
-            let Some(run) = source.start_decision(&req).await? else {
+            let Some(run) = source.start_decision(req).await? else {
                 return Ok(None);
             };
             let run = route.record.insert(run);
-            source.decision(&req, run).await.map(Some)
+            source.decision(req, run).await.map(Some)
         })
         .await
         .unwrap_or_else(|_| bail!("the second step hung"));
@@ -349,42 +371,50 @@ impl Core {
                 None => none("the second step named a session that was not listed"),
             },
             Decision::None => none("the second step chose no session"),
+            Decision::Ask(_) if req.reply.is_some() => none("the second step asked again, and an item gets one question"),
+            Decision::Ask(_) if !req.may_ask => none("the second step asked a question, and the item has no thread to ask in"),
             Decision::Ask(q) => {
-                let Some(t) = thread else {
-                    return none("the second step asked a question, and the item has no thread to ask in");
-                };
-                self.ask(t, source.name(), &route.item, &q).await?;
+                self.set_question(source.name(), &route.item, Question::Asked, Some(&q)).await?;
                 Ok(Second::End(Outcome::Asked, "asked the second step's question in the thread".into()))
             }
         }
     }
 
-    /// Posts the second step's question in the thread its item was filed from.
-    /// The question is the agent's words after reading a stranger's message:
-    /// it is cut down, posted as plain text under the daemon's own label, and
-    /// never logged.
-    async fn ask(&self, t: &ThreadState, source: &str, item: &str, question: &str) -> Result<()> {
-        let question = text::question(question);
-        if question.is_empty() {
-            bail!("the second step's question was empty once cleaned");
-        }
-        let _guard = self.lock(&t.conversation, &t.thread).await;
-        let still = self.store.load_thread(&t.conversation, &t.thread)?;
-        if !still.is_some_and(|st| st.filed.is_some_and(|f| f.source == source && f.item == item)) {
-            bail!("the item left its thread before the question was posted");
-        }
-        let req = PostRequest {
-            conversation: t.conversation.clone(),
-            thread: Some(t.thread.clone()),
-            text: format!(
-                "The router asks about {}, so it can find a session for it: {question}",
-                text::clean(item)
-            ),
-            menu: None,
-            plain: true,
+    /// Moves the question of the thread `item` was filed from to `to`, under the
+    /// thread's lock. Moving it to `Asked` posts `asking`, the second step's
+    /// question: the agent's words after reading a stranger's message, so it
+    /// is cut down, posted as plain text under the daemon's own label, and
+    /// never logged or kept.
+    async fn set_question(&self, source: &str, item: &str, to: Question, asking: Option<&str>) -> Result<()> {
+        let named = |t: &ThreadState| t.filed.as_ref().is_some_and(|f| f.source == source && f.item == item);
+        let Some(t) = self.store.all_threads().into_iter().find(named) else {
+            bail!("the item is no longer its thread's waiting message");
         };
-        self.surface.post(req).await.context("the question could not be posted")?;
-        Ok(())
+        let _guard = self.lock(&t.conversation, &t.thread).await;
+        let Some(mut st) = self.store.load_thread(&t.conversation, &t.thread)?.filter(named) else {
+            bail!("the item left its thread while it was routed");
+        };
+        if let Some(asking) = asking {
+            let question = text::question(asking);
+            if question.is_empty() {
+                bail!("the second step's question was empty once cleaned");
+            }
+            let req = PostRequest {
+                conversation: t.conversation.clone(),
+                thread: Some(t.thread.clone()),
+                text: format!(
+                    "The router asks about {}: {question}\nReply here and the router will try once more to find a session for it, or choose one yourself with to: or the picker.",
+                    text::clean(item)
+                ),
+                menu: None,
+                plain: true,
+            };
+            self.surface.post(req).await.context("the question could not be posted")?;
+        }
+        if let Some(f) = st.filed.as_mut() {
+            f.question = to;
+        }
+        self.store.save_thread(&st)
     }
 
     /// Says in the thread an item was filed from who was offered it: on the

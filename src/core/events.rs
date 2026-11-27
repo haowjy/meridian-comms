@@ -13,7 +13,7 @@ use super::deliver::{How, Incoming};
 use super::{Core, ThreadKey, filing, text};
 use crate::config::AgentMark;
 use crate::model::{Action, ListRequest, Menu, Msg, PostRequest, Posted, SurfaceEvent};
-use crate::state::{Pick, ThreadState};
+use crate::state::{Pick, Question, ThreadState};
 
 /// The loop limit: this many messages in a row that woke someone and may be
 /// from agents pause the thread.
@@ -168,7 +168,7 @@ impl Core {
         }
     }
 
-    async fn handle_message(&self, m: &Msg) -> Result<Flow> {
+    async fn handle_message(self: &Arc<Self>, m: &Msg) -> Result<Flow> {
         let _guard = self.lock(&m.conversation, &m.thread).await;
         let Some((person, pcfg)) = self.cfg.person_by_slack(&m.sender.id) else {
             return Ok(Flow::Done);
@@ -293,6 +293,13 @@ impl Core {
             // A message someone named a session for was addressed: it is not filed.
             if rule {
                 self.file(&mut st, m, person).await;
+                // A person's answer to the router's question about the item
+                // that still waits: it is routed once more, with the answer.
+                if pcfg.agent != AgentMark::Always
+                    && let Some(f) = st.filed.as_ref().filter(|f| f.question == Question::Asked)
+                {
+                    self.route_again(&f.source, &f.item, m.text.clone());
+                }
             }
             let filed = filing::note(&st);
             // The picker on a thread's first message; after that, once per run of

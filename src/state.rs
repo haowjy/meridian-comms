@@ -49,6 +49,20 @@ pub struct FiledItem {
     /// The bot's post that names the item, once made: the router's note goes there.
     #[serde(default)]
     pub post: Option<String>,
+    /// The router's one question about the item.
+    #[serde(default)]
+    pub question: Question,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Question {
+    #[default]
+    None,
+    /// Posted in the thread: a person's next message there routes the item again.
+    Asked,
+    /// That second routing came to an end: later messages route nothing.
+    Answered,
 }
 
 /// What to deliver to one person: the refs chosen, or whatever the rule picks.

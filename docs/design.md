@@ -113,7 +113,8 @@ explained, the line is a post of its own.
   addressed.
 - A choice that wakes someone (`to:`, the picker, `send --to`) takes the thread's item
   out of the inbox for the daemon (`meridian inbox take --via-program meridian-comms
-  --via-sender <who chose>`) and clears `filed`.
+  --via-sender <who chose>`) and clears `filed` once it is out: taken now, or already
+  taken by a session. After a take that failed the thread still names the item.
 - A filed message leaves `meridian-comms list`: the inbox is where a session looks for
   it. `pending` stays in the thread file, for Continue and a later choice to replay.
 - Filing fails when no source has an inbox, or Meridian is older than the inbox or does
@@ -162,7 +163,7 @@ The daemon routes each accepted item in its own task (`src/core/route.rs`):
    cold, not running, not a primary, or in another project. A refusal is logged with
    Meridian's word for it and the item waits.
 8. If the item came from a thread, take the thread's lock and add "m412 offered to
-   `<ref>`, <project>, <activity>" under the post that names the item. The picker keeps
+   `<ref>` (<activity> when listed)" under the post that names the item. The picker keeps
    its menu: an offer is a guess, and a person can still choose.
 
 No thread lock is held while a source or the model is asked.
@@ -186,7 +187,8 @@ No thread lock is held while a source or the model is asked.
 ### The second step
 
 When Jev answers `more`, or picks a session under the floor, the core asks the item's
-source to decide among the kept sessions (`decide` on the seam). A source without one
+source to decide among the kept sessions (`start_decision`, which names the run for the
+log, then `decision`, which waits for it). A source without one
 ends the routing as `none`. The Meridian source's is a small agent
 (`src/source/meridian/router.rs`): a Meridian spawn of the `inbox-router` profile, on
 OpenCode with the model the profile names, which may run Meridian's read commands to see
@@ -198,19 +200,24 @@ carries the decision out; the agent can't message, start or offer anything.
   makes it with `meridian -C <dir> mars init` and `mars add <package> --agents
   inbox-router`, and is run again to update the profile. The daemon never sets it up:
   with no directory, or no OpenCode, the step fails, the log says so and the item waits.
-- **The prompt** names the item, says whether it came from Slack (only then may the
-  agent ask), gives the sender, `via` and project, lists each kept session by spawn ID
-  with its project, agent, work item, activity and the work item's goal (read with
-  `meridian -C <root> work show <work> --json`), and ends with the text (first 4 KiB)
-  between two marker lines carrying a random number, marked as someone else's words. It
+- **The prompt** names the item, says whether the agent may ask, gives the sender, `via`
+  and project, lists each kept session by spawn ID with its project, agent, work item,
+  activity and the work item's goal, and ends with the text (first 4 KiB) between two
+  marker lines carrying a random number, marked as someone else's words; a reply to the
+  router's question follows the same way. A goal is read with `meridian -C <root> work
+  show <work> --json`, once per project root and work item, four at a time, 20 seconds
+  each; the root is the one the listing gave the candidate. It
   is written to a 0600 file in the router directory and removed as soon as the launch
   command returns, whatever it returned. Files a killed daemon left are removed at the
   next start.
 - **The run:** `meridian -C <dir> spawn -a inbox-router --bg --timeout 5
   --resident-rearm-budget 0 --prompt-file F --json`, then `spawn wait <id> --timeout 5
   --no-observe`, then `spawn show <id> --json --full --no-observe`. The limit is on the
-  spawn itself, so it ends within 5 minutes even if the daemon dies. A spawn that did not
-  succeed is cancelled and the routing is a failed run.
+  spawn itself, so it ends within 5 minutes even if the daemon dies. The wait only
+  blocks: what happened is read from the spawn, and a wait that returns while the spawn
+  still runs is repeated. A spawn that ended any way but `succeeded` is a failed run; one
+  still running 30 seconds past its limit is cancelled. The spawn's ID is in the log
+  either way.
 - **The decision** is the last non-empty line of the report: `offer <spawn-id>` for a
   session on the list, `none`, or `ask <question>`. Anything else is `none`: more words
   after the ID, an ID not on the list, a bare `ask`, a line wrapped in backticks or a
@@ -218,14 +225,25 @@ carries the decision out; the agent can't message, start or offer anything.
 - **One at a time.** The core runs one second step at once; the next waits, and one that
   has waited 15 minutes is dropped as a failed run with its item left waiting. No thread
   lock and no gate is held while a step runs.
-- **`ask`** is honoured only for an item this daemon filed from a thread. The question
-  is cut down in the core (line breaks to spaces, control and format characters removed,
-  spaces collapsed, the first 300 code points) and posted in the thread under the
-  daemon's own label, "The router asks about m412, so it can find a session for it: …".
-  The post is marked `plain`: Slack shows it as one literal rich-text element, so
-  nothing in it becomes a mention, a channel ping, a link or formatting, and the
-  fallback text has `&`, `<` and `>` escaped. The question is never logged. An `ask`
-  for an item with no thread is `none`.
+- **`ask`** is honoured only for an item this daemon filed from a thread, and once per
+  item. The question is cut down in the core (line breaks to spaces, control and format
+  characters removed, spaces collapsed, the first 300 code points) and posted in the
+  thread under the daemon's own label: "The router asks about m412: …", then a fixed
+  line saying that a reply there makes the router try once more, and that a session can
+  still be chosen with `to:` or the picker. The post is marked `plain`: Slack shows it
+  as one literal rich-text element, so nothing in it becomes a mention, a channel ping,
+  a link or formatting, and the fallback text has `&`, `<` and `>` escaped. The question
+  is never logged or kept. An `ask` for an item with no thread is `none`.
+- **The reply.** Posting the question sets `filed.question` to `asked` in the thread
+  file. The next message there that the rule wakes nobody for, from a person in the
+  directory who is not an `agent = "always"` account, while the item still waits and the
+  thread is not paused, routes the item once more. The reply's text (first 4 KiB) goes to
+  Jev in `state` and to the agent in its prompt, as more of the sender's words; the
+  inbox item is not rewritten, and the session that takes it reads the reply with
+  `meridian-comms read`. This routing may offer or leave the item; an `ask` from it is
+  `none`. It counts toward the cap, and its log line carries `again`, never the reply.
+  When it comes to an end the question becomes `answered`, and later replies route
+  nothing; after a failed or capped run it stays `asked`, so the next reply tries again.
 
 **What a hostile message can do.** The text is a stranger's. It goes to Jev, which can
 only return one of the options the daemon listed, so the worst it does there is pick the
@@ -238,8 +256,8 @@ cancel a session, write a file, or take or offer an item. Nothing from the item 
 goes into a Slack post, a command line or the routing log.
 
 **What leaves the machine.** Each routing sends OpenCode, for Jev, the item's text (first
-4 KiB), sender, `via` and project ID, and for each kept session its project ID, agent
-name, work item name and activity. A second step sends the model the profile names the
+4 KiB), sender, `via` and project ID, the reply to the router's question when there is
+one, and for each kept session its project ID, agent name, work item name and activity. A second step sends the model the profile names the
 same, each session's work item goal, and whatever the agent reads.
 
 ## Config
