@@ -478,8 +478,10 @@ A sender is left out of the candidates wherever it runs. Its machine is told by
 here gives its spawn ID. A saved machine's: `spawn show <chat> --machine <saved name>`
 does. Neither: the sender is on a machine that is not saved, which lists no candidates,
 and its chat ID is not looked up, since here it would name some other session. An item
-with no `machine_id`, or a Meridian that does not tell this machine's ID, takes the
-older path: a saved machine by name, else here. If the sender's machine can't be
+with no `machine_id` is read by its `machine` name the same way, own names first: a
+name this machine has or had is here, a saved machine's name is there, any other name
+is no candidate, and no name at all is looked up here. On a Meridian that does not tell
+this machine's ID, a sender that is on no saved machine is looked up here. If the sender's machine can't be
 reached the routing fails and the item waits, since its sender could not be told from
 the candidates.
 

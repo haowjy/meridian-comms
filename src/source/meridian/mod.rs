@@ -184,10 +184,11 @@ impl Meridian {
     ///
     /// `from` names the sender's chat and machine; a candidate is named by its
     /// spawn ID, so the ref takes one more call, on the sender's machine. That
-    /// machine is told by its ID, which no rename changes: this one, a saved
-    /// one (the ref then takes the saved name, as a candidate's does), or
-    /// neither, and a machine nobody saved lists no candidates, so its chat ID
-    /// is not looked up: here it would name some other session.
+    /// machine is told by its ID, which no rename changes, or by its name on
+    /// an item that has no ID: this one, a saved one (the ref then takes the
+    /// saved name, as a candidate's does), or neither, and a machine nobody
+    /// saved lists no candidates, so its chat ID is not looked up: here it
+    /// would name some other session.
     /// A chat Meridian does not find is taken as gone, so not a candidate; any
     /// other failure, a machine that can't be reached among them, is an
     /// error, or the sender would be offered its own message.
@@ -196,21 +197,28 @@ impl Meridian {
             return Ok(None);
         };
         let (id, name) = (field(&sender["machine_id"]), field(&sender["machine"]));
-        let machine = if id.is_some() && id == self.id {
+        // An item from before the ID was written carries a name alone, and
+        // Meridian's own rule reads it: a name this machine has or had is this
+        // machine, before any saved machine that has since taken it.
+        let own = |name: &String| *name == self.machine || self.was.contains(name);
+        let here = match &id {
+            Some(_) => id == self.id,
+            None => name.as_ref().is_none_or(own),
+        };
+        let machine = if here {
             None
         } else {
             let saved = self.saved_machines().await.context("cannot tell which machine sent it")?;
-            // Before the ID was written, an item carried the saved name alone.
             let saved = saved.into_iter().find(|m| match &id {
                 Some(id) => m.id == *id,
                 None => Some(&m.name) == name.as_ref(),
             });
             match saved {
                 Some(m) => Some(m.name),
-                None if id.is_some() && self.id.is_some() => return Ok(None),
-                // No ID on the item, or a Meridian that does not tell this
-                // machine's: any sender not on a saved machine is taken as here.
-                None => None,
+                // An ID on a Meridian that does not tell this machine's own:
+                // any sender not on a saved machine is taken as here.
+                None if id.is_some() && self.id.is_none() => None,
+                None => return Ok(None),
             }
         };
         let mut args = vec!["spawn", "show", &chat, "--json"];
