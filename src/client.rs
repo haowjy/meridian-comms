@@ -76,6 +76,11 @@ async fn call<T: DeserializeOwned>(req: &Request) -> Result<T> {
     }
     let reply: Reply<T> = serde_json::from_str(&line).context("unreadable answer from the daemon")?;
     match (reply.error, reply.result) {
+        // A daemon that can't read the request is another build: after an
+        // upgrade the old one is still running.
+        (Some(e), _) if e.starts_with("bad request") => {
+            bail!("{e}. The daemon is a different build from this client: restart it (`meridian-comms daemon`)")
+        }
         (Some(e), _) => bail!("{e}"),
         (None, Some(r)) => Ok(r),
         (None, None) => bail!("the daemon answered with nothing"),
@@ -101,7 +106,7 @@ fn json<T: serde::Serialize>(v: &T) -> Result<()> {
 
 pub async fn read(message: Option<String>, channel: Option<String>, limit: Option<usize>, as_json: bool) -> Result<()> {
     let out: ReadOut = call(&Request::Read {
-        identity: identify()?,
+        caller: identify()?,
         target: target(message, channel)?,
         limit,
     })
@@ -154,7 +159,7 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
         _ => text,
     };
     let out: SendOut = call(&Request::Send {
-        identity: identify()?,
+        caller: identify()?,
         target: target(message, channel)?,
         to: to.clone(),
         text,
@@ -193,7 +198,7 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
 
 pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
     let out: ListOut = call(&Request::List {
-        identity: identify()?,
+        caller: identify()?,
         project,
     })
     .await?;

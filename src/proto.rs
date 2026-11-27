@@ -6,22 +6,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Candidate, IdentifyResult};
 
+/// `caller` was `identity` while the client composed its own ref. The name
+/// changed with the shape, so a daemon of either build refuses the other's
+/// request instead of reading a session as the owner at a terminal. Rename
+/// it again whenever a build must not read the other's request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
     Read {
-        identity: IdentifyResult,
+        caller: IdentifyResult,
         target: Target,
         limit: Option<usize>,
     },
     Send {
-        identity: IdentifyResult,
+        caller: IdentifyResult,
         target: Target,
         to: Vec<String>,
         text: Option<String>,
     },
     List {
-        identity: IdentifyResult,
+        caller: IdentifyResult,
         project: Option<String>,
     },
     /// Route one item waiting in a source's inbox. Answered when accepted, not

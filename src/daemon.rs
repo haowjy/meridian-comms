@@ -179,14 +179,9 @@ fn error(e: String) -> Reply<serde_json::Value> {
 
 async fn handle(core: &Arc<Core>, req: Request) -> Result<serde_json::Value> {
     Ok(match req {
-        Request::Read { identity, target, limit } => serde_json::to_value(core.read(&core.who(&identity)?, target, limit).await?)?,
-        Request::Send {
-            identity,
-            target,
-            to,
-            text,
-        } => serde_json::to_value(core.send(&core.who(&identity)?, target, to, text).await?)?,
-        Request::List { identity, project } => serde_json::to_value(core.list_people(&core.who(&identity)?, project).await?)?,
+        Request::Read { caller, target, limit } => serde_json::to_value(core.read(&core.who(&caller)?, target, limit).await?)?,
+        Request::Send { caller, target, to, text } => serde_json::to_value(core.send(&core.who(&caller)?, target, to, text).await?)?,
+        Request::List { caller, project } => serde_json::to_value(core.list_people(&core.who(&caller)?, project).await?)?,
         Request::Route { source, item } => serde_json::to_value(core.route(source, item)?)?,
     })
 }
