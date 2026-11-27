@@ -1,9 +1,9 @@
 //! The router's second step for Meridian: a spawn of the `inbox-router` agent
 //! profile, started from the router directory when the model asks for more.
 //! The agent looks at what the listed sessions are doing and reports one
-//! decision line; code carries it out. The router directory is a Meridian
-//! project of its own that holds nothing but that profile, made once by
-//! `meridian-comms setup router` and never by the daemon.
+//! decision line; code carries it out. Meridian ships the profile; the router
+//! directory is a Meridian project of its own that holds the prompt files,
+//! made once by `meridian-comms setup router` and never by the daemon.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -20,8 +20,21 @@ use crate::model::{ActivityState, Candidate, DecideRequest, Decision};
 use crate::paths;
 
 const PROFILE: &str = "inbox-router";
-/// The package that ships the profile, as `mars add` takes it.
-pub const PACKAGE: &str = "haowjy/meridian-base";
+/// The first Meridian that ships the profile.
+const MIN_MERIDIAN: &str = "0.X.Y";
+/// The keys `mars add` writes for a dependency, besides `agents`.
+const MARS_SOURCE_KEYS: [&str; 4] = ["url", "path", "subpath", "version"];
+/// What `mars init` and `mars add` made under `.mars/` in the router directory.
+const MARS_OUTPUTS: [&str; 8] = [
+    "agents",
+    "bootstrap",
+    "provided",
+    "skills",
+    "staging",
+    "native-agents.json",
+    "provided.lock",
+    "sync.lock",
+];
 /// Minutes: the spawn's own limit and the wait's. The spawn carries its limit
 /// itself, so it ends even if this process dies.
 const LIMIT: &str = "5";
@@ -38,33 +51,120 @@ pub fn dir() -> PathBuf {
     paths::state_dir().join("router")
 }
 
-/// Creates the router directory and installs the profile there, with
-/// Meridian's own commands. Running it again updates the install.
-pub async fn setup(package: &str) -> Result<()> {
+/// Creates the router directory, gives it a Meridian project identity, and
+/// checks that this Meridian resolves the profile there. Running it again
+/// changes nothing that is already right.
+pub async fn setup() -> Result<()> {
     let dir = dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let steps: [&[&str]; 2] = [&["mars", "init"], &["mars", "add", package, "--agents", PROFILE]];
-    for args in steps {
-        if args[1] == "init" && dir.join("mars.toml").exists() {
-            continue;
-        }
-        let out = run(Some(&dir), args).await?;
-        if !out.status.success() {
-            bail!(
-                "`meridian -C {} {}` failed: {}{}",
-                dir.display(),
-                args.join(" "),
-                tail(&out.stdout),
-                tail(&out.stderr)
-            );
-        }
+    remove_mars_project(&dir)?;
+    let at = dir.to_string_lossy();
+    let init = run(None, &["init", &at]).await?;
+    if !init.status.success() {
+        bail!("`meridian init {at}` failed: {}{}", tail(&init.stdout), tail(&init.stderr));
     }
+    let path = resolve_profile(&dir).await?;
     println!(
-        "The router directory is {}: the {PROFILE} profile is installed from {package}.",
+        "The router directory is {}: Meridian finds the {PROFILE} profile at {path}.",
         dir.display()
     );
-    println!("It needs OpenCode on this machine, signed in for the model the profile names.");
+    println!(
+        "It needs OpenCode on this machine, signed in for the model the profile names, unless [inbox.router] in ~/.meridian/config.toml names another."
+    );
     Ok(())
+}
+
+/// The profile's path as this Meridian resolves it from `dir`, from a dry run
+/// that composes the launch and starts nothing.
+async fn resolve_profile(dir: &Path) -> Result<String> {
+    let out = run(Some(dir), &["spawn", "-a", PROFILE, "--dry-run", "-p", "setup check", "--json"]).await?;
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    if shown["status"] == "dry-run"
+        && let Some(path) = field(&shown["agent_path"])
+    {
+        return Ok(path);
+    }
+    let why = shown["message"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}{}", tail(&out.stdout), tail(&out.stderr)));
+    bail!(
+        "Meridian can't start the {PROFILE} agent in the router directory: {why}\nMeridian ships that agent from {MIN_MERIDIAN} on; `meridian --version` shows which this is."
+    )
+}
+
+/// An earlier setup made the router directory a Mars project that installed
+/// the profile from a package. Once the package drops it a sync there fails,
+/// and while it has it the copy shadows Meridian's. Removes what that setup
+/// made, `mars.toml` last so a re-run after a crash still recognises the rest,
+/// and leaves anything else, saying so. `meridian.toml` is the project's
+/// identity, which Meridian wrote, and stays.
+fn remove_mars_project(dir: &Path) -> Result<()> {
+    let toml = dir.join("mars.toml");
+    let Ok(text) = std::fs::read_to_string(&toml) else { return Ok(()) };
+    if !made_by_setup(&text) {
+        println!(
+            "Left {}, {} and {} in place: this mars.toml is not the one an earlier setup wrote. An agent named {PROFILE} it installs replaces Meridian's.",
+            toml.display(),
+            dir.join("mars.lock").display(),
+            dir.join(".mars").display()
+        );
+        return Ok(());
+    }
+    let mars = dir.join(".mars");
+    let mut left = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&mars) {
+        for e in rd {
+            let e = e?;
+            let name = e.file_name();
+            if !MARS_OUTPUTS.iter().any(|known| name == *known) {
+                left.push(e.path());
+                continue;
+            }
+            let path = e.path();
+            let gone = if e.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            gone.with_context(|| format!("cannot remove {}", path.display()))?;
+        }
+        if left.is_empty() {
+            std::fs::remove_dir(&mars).with_context(|| format!("cannot remove {}", mars.display()))?;
+        }
+    }
+    for path in [dir.join("mars.lock"), toml] {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("cannot remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    println!("Removed the Mars project an earlier setup made in {}.", dir.display());
+    for path in left {
+        println!("Left {}: an earlier setup did not make it.", path.display());
+    }
+    Ok(())
+}
+
+/// Whether `mars.toml` is what `mars init` and `mars add <package> --agents
+/// inbox-router` wrote: one dependency, a source, and that one agent.
+fn made_by_setup(text: &str) -> bool {
+    let Ok(doc) = text.parse::<toml::Table>() else { return false };
+    let Some(deps) = doc.get("dependencies").and_then(|d| d.as_table()) else {
+        return false;
+    };
+    let [(_, dep)] = deps.iter().collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    let Some(dep) = dep.as_table() else { return false };
+    doc.len() == 1
+        && dep
+            .get("agents")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| a.len() == 1 && a[0].as_str() == Some(PROFILE))
+        && dep.keys().all(|k| k == "agents" || MARS_SOURCE_KEYS.contains(&k.as_str()))
 }
 
 /// Removes prompt files a killed daemon left: they hold a stranger's text.
@@ -232,7 +332,8 @@ impl Meridian {
     /// Starts the agent on `req` and gives its spawn ID.
     pub(super) async fn launch_router(&self, req: &DecideRequest) -> Result<String> {
         let dir = dir();
-        if !dir.join("mars.toml").exists() {
+        // `setup router` makes it with `meridian init`.
+        if !dir.join("meridian.toml").exists() {
             bail!(
                 "the router directory {} is not set up: run `meridian-comms setup router`",
                 dir.display()

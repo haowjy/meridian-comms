@@ -47,7 +47,7 @@ meridian-comms route [ITEM]                        hand an inbox message to the 
 meridian-comms routes [ITEM | <message>]           what the router did: all, one inbox item (m412), or one message
 meridian-comms daemon                              the Slack connection (run as a user service)
 meridian-comms setup                               print the Slack app manifest
-meridian-comms setup router                        install the agent the router asks when unsure
+meridian-comms setup router                        set up the agent the router asks when unsure
 ```
 
 ## Setup
@@ -79,11 +79,12 @@ Without these steps the bot works as above and a message nobody was woken for wa
    a session.
 3. Add a `[router]` section to `config.toml`. Empty is enough; its three settings and
    their defaults are in [docs/design.md](docs/design.md#config).
-4. Install the agent the router asks when the model is unsure:
-   `meridian-comms setup router --package <path to meridian-base>`, with the
-   `meridian-base` directory of a checkout of Meridian's prompts. Until those prompts are
-   released, the default package does not have the agent. It runs on OpenCode, which
-   must be installed and signed in on this machine.
+4. Run `meridian-comms setup router`. It makes the router's directory and checks that
+   Meridian can start the agent the router asks when the model is unsure. Meridian ships
+   that agent from 0.X.Y on. It runs on OpenCode by default, which must be installed and
+   signed in on this machine; to change its model, harness or effort, set them in
+   `[inbox.router]` in `~/.meridian/config.toml`. Run it again after upgrading from a
+   setup that installed the agent with `--package`.
 5. Restart the daemon.
 6. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
    router did with it.
