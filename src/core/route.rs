@@ -465,7 +465,8 @@ impl Core {
         let note = format!(
             "{} offered to `{}` ({} when listed)",
             text::clean(item),
-            c.ref_,
+            // Its project is whatever a repository on some machine calls itself.
+            text::clean(&c.ref_),
             text::activity(c.activity.as_ref(), now)
         );
         match &f.post {
