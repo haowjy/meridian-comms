@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -10,9 +10,10 @@ use futures_util::future::join_all;
 
 use super::Listing;
 use super::deliver::{How, Incoming};
+use super::online::{By, Reader};
 use super::{Core, ThreadKey, filing, text};
 use crate::config::AgentMark;
-use crate::model::{Action, ListRequest, Menu, Msg, PostRequest, Posted, SurfaceEvent};
+use crate::model::{Action, Menu, Msg, PostRequest, Posted, SurfaceEvent};
 use crate::state::{Pick, Question, ThreadState};
 
 /// The loop limit: this many messages in a row that woke someone and may be
@@ -30,12 +31,16 @@ pub enum Job {
 /// What handling a message came to.
 enum Flow {
     Done,
-    /// A `to:` line names something no answering source resolves while a source
-    /// is down, so it may not be a choice or may not be text yet. Waits for a retry.
+    /// A `to:` line names something the listing doesn't have, and it could be
+    /// on a machine or source that did not answer, so it may not be a choice
+    /// or may not be text yet. Waits for a retry.
     SourceDown(String),
 }
 
 const SOURCE_RETRY: Duration = Duration::from_secs(30);
+/// How long a `to:` line waits for a machine that does not answer: one can
+/// be off for days. Then the word is taken as matching nothing.
+const SOURCE_PATIENCE: Duration = Duration::from_secs(300);
 
 impl Job {
     fn key(&self) -> ThreadKey {
@@ -62,6 +67,41 @@ fn to_words(text: &str) -> Option<Vec<String>> {
             .map(String::from)
             .collect(),
     )
+}
+
+/// What a `to:` line's words choose, as far as they resolve in `listing`.
+struct Choice<'a> {
+    chosen: BTreeMap<String, Vec<String>>,
+    all: bool,
+    /// The words taken: the rest is the message.
+    used: usize,
+    /// The word that ended the choice.
+    unresolved: Option<&'a String>,
+}
+
+/// Words are taken while each one names a listed session or is `all`.
+fn to_choice<'a>(listing: &Listing, words: &'a [String]) -> Choice<'a> {
+    let mut out = Choice {
+        chosen: BTreeMap::new(),
+        all: false,
+        used: 0,
+        unresolved: None,
+    };
+    for w in words {
+        if w.eq_ignore_ascii_case("all") {
+            out.all = true;
+        } else if let Some((_, c)) = listing.resolve(w) {
+            let e = out.chosen.entry(c.person.clone()).or_default();
+            if !e.contains(&c.ref_) {
+                e.push(c.ref_.clone());
+            }
+        } else {
+            out.unresolved = Some(w);
+            break;
+        }
+        out.used += 1;
+    }
+    out
 }
 
 fn ts_now() -> String {
@@ -139,7 +179,9 @@ impl Core {
             }
         };
         let key = (m.conversation.clone(), m.id.clone());
-        let result = self.handle_message(&m).await;
+        let waited = self.awaiting.lock().unwrap().get(&key).copied();
+        let patient = waited.is_none_or(|since| since.elapsed() < SOURCE_PATIENCE);
+        let result = self.handle_message(&m, patient).await;
         if !matches!(result, Ok(Flow::SourceDown(_))) {
             self.awaiting.lock().unwrap().remove(&key);
         }
@@ -150,12 +192,18 @@ impl Core {
             Ok(Flow::Done) => self.finish(&m),
             Ok(Flow::SourceDown(word)) => {
                 // One retry loop per message, however often it is delivered.
-                let first = self.awaiting.lock().unwrap().insert(key);
+                let first = {
+                    let mut awaiting = self.awaiting.lock().unwrap();
+                    let first = !awaiting.contains_key(&key);
+                    awaiting.entry(key).or_insert_with(Instant::now);
+                    first
+                };
                 if first {
                     let text = format!(
-                        "A session source did not answer, so I can't tell whether `{}` names a session. I'll try again every {} s.",
+                        "A machine or source of sessions did not answer, so I can't tell whether `{}` names a session. I'll try again every {} s for {} minutes.",
                         text::clean(&word),
-                        SOURCE_RETRY.as_secs()
+                        SOURCE_RETRY.as_secs(),
+                        SOURCE_PATIENCE.as_secs() / 60
                     );
                     self.say(&m.conversation, &m.thread, text).await;
                 }
@@ -170,7 +218,9 @@ impl Core {
         }
     }
 
-    async fn handle_message(self: &Arc<Self>, m: &Msg) -> Result<Flow> {
+    /// `patient`: a `to:` word that could be on a machine that did not answer
+    /// waits for a retry. Once that has gone on too long, it matches nothing.
+    async fn handle_message(self: &Arc<Self>, m: &Msg, patient: bool) -> Result<Flow> {
         let _guard = self.lock(&m.conversation, &m.thread).await;
         let Some((person, pcfg)) = self.cfg.person_by_slack(&m.sender.id) else {
             return Ok(Flow::Done);
@@ -208,56 +258,43 @@ impl Core {
             return Ok(Flow::Done);
         }
 
-        // One listing per event: Meridian's costs 1.4 s and 300 MB.
-        let mut refs = self.known_refs(&st);
-        refs.extend(words.iter().flatten().cloned());
-        let listing = self
-            .list(&ListRequest {
-                person: Some(owner.clone()),
-                project: project.clone(),
-                refs,
-                offerable: false,
-            })
-            .await;
+        // A listing no older than 15 s for every handled message: the rule
+        // needs the thread's sessions and the defaults as they are now.
+        let refs = self.known_refs(&st);
+        let reader = Reader::Thread {
+            project: project.as_deref(),
+            refs: &refs,
+        };
+        let mut listing = self.reach(&*self.fresh(By::Thread).await, reader);
 
         // A choice: replace the scope of each person whose refs are named.
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut all = false;
         if let Some(words) = &words {
-            let mut used = 0;
-            let mut unresolved = None;
-            for w in words {
-                if w.eq_ignore_ascii_case("all") {
-                    all = true;
-                } else if let Some((_, c)) = listing.resolve(w) {
-                    let e = chosen.entry(c.person.clone()).or_default();
-                    if !e.contains(&c.ref_) {
-                        e.push(c.ref_.clone());
-                    }
-                } else {
-                    unresolved = Some(w);
-                    break;
-                }
-                used += 1;
+            let mut choice = to_choice(&listing, words);
+            // A first word that names nothing is reported, which waits for
+            // one listing started after the miss: a session may just have started.
+            if choice.used == 0 && !self.unchecked(&listing, &words[0]) {
+                listing = self.reach(&*self.listed_after(Instant::now(), By::Thread).await, reader);
+                choice = to_choice(&listing, words);
             }
-            // A word nothing answering resolves may belong to the source that is
-            // down: it is neither text nor a miss yet.
-            if let (Some(w), true) = (unresolved, listing.failed) {
+            if let Some(w) = choice.unresolved.filter(|w| patient && self.unchecked(&listing, w)) {
                 return Ok(Flow::SourceDown(w.clone()));
             }
-            if used == 0 {
+            if choice.used == 0 {
                 let bad = words.first().map(String::as_str).unwrap_or("");
                 st.mark_handled(&m.id);
                 self.store.save_thread(&st)?;
                 let msg = format!(
                     "I can't match it: {}\n{}",
-                    self.why_not(&listing, bad).await,
+                    self.why_not(&listing, bad),
                     self.explain(&owner, project.as_deref(), &listing, &[], None, &[], true)
                 );
                 let menu = self.menu(&owner, &listing);
                 self.say_with(&m.conversation, &m.thread, msg, menu).await;
                 return Ok(Flow::Done);
             }
+            (chosen, all) = (choice.chosen, choice.all);
         }
 
         if all {
@@ -363,7 +400,7 @@ impl Core {
             .ok()
     }
 
-    async fn handle_action(&self, a: &Action) -> Result<()> {
+    async fn handle_action(self: &Arc<Self>, a: &Action) -> Result<()> {
         if !matches!(a.name.as_str(), "continue" | "choose") {
             return Ok(());
         }
@@ -377,18 +414,21 @@ impl Core {
             return Ok(());
         };
         let project = self.cfg.channel(&a.conversation).and_then(|c| c.project.clone());
+        let mut refs = self.known_refs(&st);
         if a.name == "continue" {
             let was_paused = st.paused;
             st.streak = 0;
             st.paused = false;
             if let (true, Some(p)) = (was_paused, st.pending.clone()) {
-                let persons: Vec<String> = p.picks.keys().cloned().collect();
-                let mut refs = self.known_refs(&st);
                 refs.extend(p.picks.values().flat_map(|k| match k {
                     Pick::Refs(r) => r.clone(),
                     Pick::Rule => vec![],
                 }));
-                let listing = self.list_for(&persons, project.clone(), refs).await;
+                let reader = Reader::Thread {
+                    project: project.as_deref(),
+                    refs: &refs,
+                };
+                let listing = self.reach(&*self.fresh(By::Thread).await, reader);
                 let picks: Vec<(String, Pick)> = p.picks.into_iter().collect();
                 self.replay(&mut st, a, clicker, &p.message, picks, &listing, project.as_deref())
                     .await?;
@@ -398,39 +438,36 @@ impl Core {
 
         // The picker's menu: a choice, as a `to:` line from whoever clicked. It is
         // delivered for the message that waits, or else the thread's first one.
+        // Its values are refs the picker listed: an old click's are name-based,
+        // and resolve by the names that still answer to them.
         tracing::info!("{who} chose {} session(s) in {}/{}", a.values.len(), a.conversation, a.thread);
-        let mut refs = self.known_refs(&st);
-        refs.extend(a.values.iter().cloned());
-        let listing = self
-            .list(&ListRequest {
-                person: Some(self.cfg.owner.clone()),
-                project: project.clone(),
-                refs,
-                offerable: false,
-            })
-            .await;
+        let reader = Reader::Thread {
+            project: project.as_deref(),
+            refs: &refs,
+        };
+        let mut listing = self.reach(&*self.fresh(By::Thread).await, reader);
+        // A choice that names something gone is reported after one listing
+        // started since: a session may just have started.
+        if a.values.iter().any(|v| listing.resolve(v).is_none() && !self.unchecked(&listing, v)) {
+            listing = self.reach(&*self.listed_after(Instant::now(), By::Thread).await, reader);
+        }
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut gone = vec![];
         for v in &a.values {
             match listing.resolve(v) {
                 Some((_, c)) => chosen.entry(c.person.clone()).or_default().push(c.ref_.clone()),
-                None => gone.push(format!("`{}`", text::clean(v))),
+                None => gone.push(self.missing(&listing, v)),
             }
         }
         if !gone.is_empty() {
-            let why = if listing.failed { "not checkable" } else { "no longer running" };
-            self.say(
-                &a.conversation,
-                &a.thread,
-                format!("{} ({why}): left out of the choice.", gone.join(", ")),
-            )
-            .await;
+            self.say(&a.conversation, &a.thread, format!("{}: left out of the choice.", gone.join("; ")))
+                .await;
         }
         if chosen.is_empty() {
             return Ok(());
         }
         let message = st.pending.as_ref().map_or(a.thread.clone(), |p| p.message.clone());
-        let named: Vec<String> = chosen.values().flatten().map(|r| format!("`{r}`")).collect();
+        let named: Vec<String> = chosen.values().flatten().map(|r| format!("`{}`", self.show(&listing, r))).collect();
         let picks: Vec<(String, Pick)> = chosen.into_iter().map(|(p, r)| (p, Pick::Refs(r))).collect();
         st.streak = 0;
         self.replay(&mut st, a, clicker, &message, picks, &listing, project.as_deref())

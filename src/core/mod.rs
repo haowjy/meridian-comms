@@ -25,7 +25,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::config::Config;
 use crate::jev::Jev;
-use crate::model::{Candidate, FailKind, Failure, Group, ListRequest, Machine, Msg, SurfaceEvent, WakeRequest, WakeResult};
+use crate::model::{Candidate, FailKind, Failure, Group, ListResponse, Machine, Msg, SurfaceEvent, WakeRequest, WakeResult};
 use crate::routes;
 use crate::source::Source;
 use crate::state::Store;
@@ -33,11 +33,12 @@ use crate::surface::Surface;
 use cursor::Cursor;
 use events::Job;
 
-const LIST_TIMEOUT: Duration = Duration::from_secs(15);
-/// For a listing across machines (`offerable`): a source asks each one in turn
-/// for its list of machines, then all of them at once.
-const EVERYWHERE_TIMEOUT: Duration = Duration::from_secs(30);
-const WAKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// For one source's listing across machines: it asks for its list of
+/// machines, then all of them at once.
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A wake on another machine is a Meridian call over SSH, which Meridian
+/// gives up to 15 s to connect and 75 s to answer.
+const WAKE_TIMEOUT: Duration = Duration::from_secs(100);
 
 type ThreadKey = (String, String);
 
@@ -55,8 +56,9 @@ pub struct Core {
     cursor: Cursor,
     /// Channels whose recovery is failing and being retried.
     recovering: Mutex<BTreeSet<String>>,
-    /// Messages (conversation, id) waiting for a source to answer, each with one retry loop.
-    awaiting: Mutex<BTreeSet<ThreadKey>>,
+    /// Messages (conversation, id) waiting for a source to answer, each with
+    /// one retry loop, and since when.
+    awaiting: Mutex<BTreeMap<ThreadKey, std::time::Instant>>,
     /// The router's model. `None`: routing is off.
     jev: Option<Jev>,
     routes: routes::Log,
@@ -68,43 +70,47 @@ pub struct Core {
     filing: tokio::sync::RwLock<()>,
     /// One second step at a time: each starts an agent.
     second: tokio::sync::Semaphore,
-    snapshots: online::Snapshots,
+    snapshot: online::Snapshot,
     forms: form::Sent,
     publisher: view::Publisher,
 }
 
-/// What the sources answered, with the index of the source that listed each candidate.
-#[derive(Default)]
+/// What the sources answered, with the index of the source that listed each
+/// candidate and machine.
+#[derive(Default, Clone)]
 pub struct Listing {
     pub candidates: Vec<(usize, Candidate)>,
-    pub unreachable: Vec<String>,
-    /// Only in a listing across machines.
     pub groups: Vec<Group>,
-    pub machines: Vec<Machine>,
-    /// A source failed or timed out: what is missing may only be unchecked.
-    pub failed: bool,
+    pub machines: Vec<(usize, Machine)>,
+    /// The sources that failed or timed out: whatever they reach is unchecked.
+    pub failed: Vec<usize>,
 }
 
 impl Listing {
-    fn merge(&mut self, src: usize, r: crate::model::ListResponse) {
+    fn merge(&mut self, src: usize, r: ListResponse) {
         for c in r.candidates {
-            if !self.candidates.iter().any(|(_, o)| o.ref_ == c.ref_) {
+            if self.find(&c.ref_).is_none() {
                 self.candidates.push((src, c));
             }
         }
-        self.unreachable.extend(r.unreachable);
         self.groups.extend(r.groups);
-        self.machines.extend(r.machines);
+        self.machines.extend(r.machines.into_iter().map(|m| (src, m)));
     }
 
-    pub fn absorb(&mut self, other: Listing) {
-        for (i, c) in other.candidates {
-            if self.find(&c.ref_).is_none() {
-                self.candidates.push((i, c));
-            }
+    /// A listing in which every source failed.
+    fn unanswered(sources: usize) -> Listing {
+        Listing {
+            failed: (0..sources).collect(),
+            ..Listing::default()
         }
-        self.unreachable.extend(other.unreachable);
-        self.failed |= other.failed;
+    }
+
+    /// The same listing with only the candidates `keep` takes.
+    fn keep(&self, keep: impl Fn(usize, &Candidate) -> bool) -> Listing {
+        Listing {
+            candidates: self.candidates.iter().filter(|(i, c)| keep(*i, c)).cloned().collect(),
+            ..self.clone()
+        }
     }
 
     fn find(&self, ref_: &str) -> Option<&(usize, Candidate)> {
@@ -115,48 +121,87 @@ impl Listing {
         self.candidates.iter().filter(move |(_, c)| c.person == person)
     }
 
-    /// A `to:` or `--to` word: a ref, or a short ID that exactly one candidate has.
-    pub fn resolve(&self, word: &str) -> Option<&(usize, Candidate)> {
+    /// The candidates `word` names by one of their `names`.
+    fn named<'a>(&'a self, word: &'a str) -> impl Iterator<Item = &'a (usize, Candidate)> + 'a {
+        self.candidates.iter().filter(move |(_, c)| c.names.iter().any(|n| n == word))
+    }
+
+    /// A `to:` or `--to` word: a ref, or a name exactly one candidate has.
+    pub fn resolve<'a>(&'a self, word: &'a str) -> Option<&'a (usize, Candidate)> {
         if let Some(c) = self.find(word) {
             return Some(c);
         }
-        let mut by_id = self.candidates.iter().filter(|(_, c)| c.id.as_deref() == Some(word));
-        match (by_id.next(), by_id.next()) {
+        let mut named = self.named(word);
+        match (named.next(), named.next()) {
             (Some(c), None) => Some(c),
             _ => None,
         }
     }
 
-    /// Why `resolve` found nothing for `word`, as far as the listing can tell.
-    fn why_not(&self, word: &str) -> String {
-        let ids: Vec<&str> = self
-            .candidates
+    /// The word to type for `c` here: its first name no other candidate
+    /// has, else its ref.
+    fn typable<'a>(&'a self, c: &'a Candidate) -> &'a str {
+        c.names
             .iter()
-            .filter(|(_, c)| c.id.as_deref() == Some(word))
-            .map(|(_, c)| c.ref_.as_str())
-            .collect();
-        if ids.len() > 1 {
-            format!("`{}` is ambiguous: it is {}. Use a full ref.", text::clean(word), ids.join(", "))
-        } else if self.failed {
-            format!("`{}` could not be checked: a source did not answer.", text::clean(word))
-        } else {
-            format!("`{}` matches no running session.", text::clean(word))
-        }
+            .find(|n| self.named(n).count() == 1)
+            .map_or(c.ref_.as_str(), String::as_str)
+    }
+
+    /// The machines of source `src` that did not answer.
+    fn missing(&self, src: usize) -> Vec<Machine> {
+        self.machines.iter().filter(|(i, m)| *i == src && !m.ok).map(|(_, m)| m.clone()).collect()
     }
 }
 
 impl Core {
-    /// Why `listing` resolved nothing for the `to:` or `--to` word `word`.
-    async fn why_not(&self, listing: &Listing, word: &str) -> String {
-        for s in &self.sources {
-            if s.elsewhere(word).await {
-                return format!(
-                    "`{}` is on another machine: sessions there can be offered a message but not woken from Slack.",
-                    text::clean(word)
-                );
-            }
+    /// Whether `word` could name a session the listing could not see: on a
+    /// source that failed, or on a machine that did not answer.
+    fn unchecked(&self, listing: &Listing, word: &str) -> bool {
+        !listing.failed.is_empty()
+            || self.sources.iter().enumerate().any(|(i, s)| {
+                let missing = listing.missing(i);
+                !missing.is_empty() && s.could_be_unchecked(word, &missing)
+            })
+    }
+
+    /// How people see the ref `r`, cleaned for a post: in the words of the
+    /// source it belongs to, with the machines of the listing it came from.
+    fn show(&self, listing: &Listing, r: &str) -> String {
+        let shown = self.sources.iter().enumerate().find_map(|(i, s)| {
+            let machines: Vec<Machine> = listing.machines.iter().filter(|(j, _)| *j == i).map(|(_, m)| m.clone()).collect();
+            s.show(r, &machines)
+        });
+        text::clean(&shown.unwrap_or_else(|| r.to_string()))
+    }
+
+    /// A candidate in a post: how it is shown, and its label.
+    fn label(&self, listing: &Listing, c: &Candidate) -> String {
+        let shown = self.show(listing, &c.ref_);
+        match &c.label {
+            Some(l) => format!("`{shown}` ({})", text::clean(l)),
+            None => format!("`{shown}`"),
         }
-        listing.why_not(word)
+    }
+
+    /// Why `listing` resolved nothing for the `to:` or `--to` word `word`, in
+    /// Slack's words: an ambiguous one lists what to type instead.
+    fn why_not(&self, listing: &Listing, word: &str) -> String {
+        let named: Vec<String> = listing.named(word).map(|(_, c)| format!("`{}`", text::clean(listing.typable(c)))).collect();
+        let w = text::clean(word);
+        if named.len() > 1 {
+            format!("`{w}` is ambiguous: it is {}. Use one of those.", named.join(", "))
+        } else if self.unchecked(listing, word) {
+            let silent: Vec<String> = listing
+                .machines
+                .iter()
+                .filter(|(_, m)| !m.ok)
+                .map(|(_, m)| m.name.as_deref().map_or_else(|| "the saved machines".to_string(), |n| format!("`{}`", text::clean(n))))
+                .chain((!listing.failed.is_empty()).then(|| "a source".to_string()))
+                .collect();
+            format!("{} didn't answer, and `{w}` isn't running on the machines that did.", silent.join(" and "))
+        } else {
+            format!("`{w}` matches no running session.")
+        }
     }
 
     pub fn new(
@@ -186,7 +231,7 @@ impl Core {
             routing,
             filing: tokio::sync::RwLock::default(),
             second: tokio::sync::Semaphore::new(1),
-            snapshots: online::Snapshots::default(),
+            snapshot: online::Snapshot::default(),
             forms: form::Sent::default(),
             publisher: view::Publisher::default(),
         }))
@@ -211,19 +256,17 @@ impl Core {
     }
 
     /// Asks every source, side by side. A source that fails or times out
-    /// returns nothing and sets `failed`. A listing across machines is
-    /// `everywhere`'s to start.
-    async fn list(&self, req: &ListRequest) -> Listing {
-        let limit = if req.offerable { EVERYWHERE_TIMEOUT } else { LIST_TIMEOUT };
+    /// gives nothing and is named in `failed`. `online` starts it.
+    async fn list(&self) -> Listing {
         let answers = join_all(self.sources.iter().enumerate().map(|(i, s)| async move {
-            match tokio::time::timeout(limit, s.list(req)).await {
+            match tokio::time::timeout(LIST_TIMEOUT, s.list()).await {
                 Ok(Ok(r)) => (i, Some(r)),
                 Ok(Err(e)) => {
                     tracing::warn!("{} list failed: {e:#}", s.name());
                     (i, None)
                 }
                 Err(_) => {
-                    tracing::warn!("{} list timed out after {} s", s.name(), limit.as_secs());
+                    tracing::warn!("{} list timed out after {} s", s.name(), LIST_TIMEOUT.as_secs());
                     (i, None)
                 }
             }
@@ -233,47 +276,22 @@ impl Core {
         for (i, r) in answers {
             match r {
                 Some(r) => l.merge(i, r),
-                None => l.failed = true,
+                None => l.failed.push(i),
             }
         }
         l
     }
 
-    /// The owner's listing, plus each of `persons`' own sessions.
-    async fn list_for(&self, persons: &[String], project: Option<String>, refs: Vec<String>) -> Listing {
-        let owner = self.cfg.owner.clone();
-        let mut listing = self
-            .list(&ListRequest {
-                person: Some(owner.clone()),
-                project: project.clone(),
-                refs,
-                offerable: false,
-            })
-            .await;
-        for p in persons.iter().filter(|p| **p != owner) {
-            listing.absorb(
-                self.list(&ListRequest {
-                    person: Some(p.clone()),
-                    project: project.clone(),
-                    refs: vec![],
-                    offerable: false,
-                })
-                .await,
-            );
-        }
-        listing
-    }
-
     async fn wake(&self, src: usize, req: &WakeRequest) -> WakeResult {
         let failed = |detail: String| WakeResult {
             woken: false,
-            ref_: req.ref_.clone(),
+            ref_: req.to.ref_.clone(),
             detail,
         };
         match tokio::time::timeout(WAKE_TIMEOUT, self.sources[src].wake(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => failed(format!("{e:#}")),
-            Err(_) => failed("timed out".into()),
+            Err(_) => failed(format!("no answer in {} s: it may have reached the session", WAKE_TIMEOUT.as_secs())),
         }
     }
 

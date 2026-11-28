@@ -260,7 +260,11 @@ pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
             println!("  no running sessions");
         }
         for c in &p.candidates {
-            println!("  {}", crate::core::candidate_line(c, now).replace('`', ""));
+            let head = match &c.id {
+                Some(id) => format!("{} ({id})", c.ref_),
+                None => c.ref_.clone(),
+            };
+            println!("  {}", crate::core::candidate_line(&head, c, now).replace('`', ""));
         }
         for u in &p.unreachable {
             println!("  {u}: not checkable");

@@ -10,7 +10,7 @@ use crate::paths;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub owner: String,
-    /// No longer read: refs start with Meridian's name for the machine. Kept
+    /// No longer read: Meridian names and identifies the machine. Kept
     /// so the daemon can say so to a config that still sets it.
     #[serde(default)]
     pub machine: Option<serde::de::IgnoredAny>,
@@ -108,9 +108,14 @@ pub struct MeridianConfig {
     pub projects: BTreeMap<String, MeridianProject>,
 }
 
+/// A project, by its Meridian project ID (the key): its agents may run on
+/// any machine the bot reaches.
 #[derive(Debug, Deserialize)]
 pub struct MeridianProject {
-    pub root: PathBuf,
+    /// Deprecated and unused: read so a config that sets it still loads,
+    /// with a warning, for one minor release.
+    #[serde(default)]
+    pub root: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub default: Option<String>,
 }

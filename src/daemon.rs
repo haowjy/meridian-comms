@@ -35,7 +35,7 @@ pub async fn run() -> Result<()> {
     let tokens = Tokens::load()?;
     if cfg.machine.is_some() {
         tracing::warn!(
-            "the config's `machine` is no longer read: refs start with Meridian's name for this machine (`meridian machine name`). Remove it from {}",
+            "the config's `machine` is no longer read: Meridian names this machine (`meridian machine name`). Remove it from {}",
             config::config_path().display()
         );
     }
