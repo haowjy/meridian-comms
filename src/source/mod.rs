@@ -1,6 +1,7 @@
 //! Sources: where agents run. A source answers `list` (who could take a
-//! message) and `wake` (send one of them a notice); one whose sessions run on
-//! this machine also answers `identify`. A source may also keep an inbox, where
+//! message) and `wake` (send one of them a notice), and checks the sessions
+//! it claimed (`session`). Its claim (`claim`, below) runs in the client, on
+//! whatever machine that is, with no config. A source may also keep an inbox, where
 //! its sessions look for messages nobody was woken for: `file`, `inbox_item`,
 //! `offer`, `take` and the second step are optional, and their defaults say "not
 //! supported". A source never starts a session, touches the surface, or keeps
@@ -13,8 +14,25 @@ use async_trait::async_trait;
 
 use crate::model::{
     Candidate, DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult, InboxItem, ListResponse, Machine, OfferResult,
-    WakeRequest, WakeResult,
+    Session, WakeRequest, WakeResult,
 };
+
+/// Who the client was run for: the first compiled-in source that claims the
+/// environment, else the owner at a terminal. A source claims a process by
+/// its own session's variables, whatever this machine's config holds, so a
+/// session never falls through to the owner. `fresh`: ask again what the
+/// claim may have cached.
+pub async fn claim(req: &IdentifyRequest, fresh: bool) -> Result<IdentifyResult> {
+    match meridian::claim(req, fresh).await? {
+        Some(id) => Ok(id),
+        None => Ok(IdentifyResult::none()),
+    }
+}
+
+/// The inbox item a `route` run from this environment was called for.
+pub fn routed_item(req: &IdentifyRequest) -> Option<(&'static str, String)> {
+    meridian::routed_item(req).map(|item| ("meridian", item))
+}
 
 /// What a source's refs start with.
 pub struct RefStart {
@@ -30,11 +48,10 @@ pub trait Source: Send + Sync {
     /// core filters for itself.
     async fn list(&self) -> Result<ListResponse>;
     async fn wake(&self, req: &WakeRequest) -> Result<WakeResult>;
-    /// Run in the client, on the caller's environment: it starts no process.
-    fn identify(&self, req: &IdentifyRequest) -> IdentifyResult;
-    /// Run in the daemon: the ref of the session `identify` reported, or
-    /// `None` when the two are not a session this source would list.
-    fn session_ref(&self, project: &str, session: &str) -> Option<String>;
+    /// The session this source's claim reported, checked: `None` when the
+    /// claim is another source's. An error says why it can't be named, as a
+    /// `Failure`: a session no `wake` could reach must never be stored.
+    async fn session(&self, caller: &IdentifyResult) -> Result<Option<Session>>;
 
     /// What people call the machine this source runs on. Known after `check`.
     fn machine(&self) -> Option<&str> {
@@ -88,9 +105,5 @@ pub trait Source: Send + Sync {
     /// run bounds itself; an error is a run that came to no decision.
     async fn decision(&self, _req: &DecideRequest, _run: &str) -> Result<Decision> {
         bail!("{} has no second step", self.name())
-    }
-    /// The item a `route` run from this environment was called for.
-    fn routed_item(&self, _req: &IdentifyRequest) -> Option<String> {
-        None
     }
 }

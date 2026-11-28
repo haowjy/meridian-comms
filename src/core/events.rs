@@ -448,7 +448,10 @@ impl Core {
         let mut listing = self.reach(&*self.fresh(By::Thread).await, reader);
         // A choice that names something gone is reported after one listing
         // started since: a session may just have started.
-        if a.values.iter().any(|v| listing.resolve(v).is_none() && !self.unchecked(&listing, v)) {
+        if a.values
+            .iter()
+            .any(|v| listing.resolve(v).is_none() && !self.unchecked(&listing, v))
+        {
             listing = self.reach(&*self.listed_after(Instant::now(), By::Thread).await, reader);
         }
         let mut chosen: BTreeMap<String, Vec<String>> = BTreeMap::new();

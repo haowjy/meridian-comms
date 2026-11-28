@@ -149,7 +149,11 @@ impl Listing {
 
     /// The machines of source `src` that did not answer.
     fn missing(&self, src: usize) -> Vec<Machine> {
-        self.machines.iter().filter(|(i, m)| *i == src && !m.ok).map(|(_, m)| m.clone()).collect()
+        self.machines
+            .iter()
+            .filter(|(i, m)| *i == src && !m.ok)
+            .map(|(_, m)| m.clone())
+            .collect()
     }
 }
 
@@ -186,7 +190,10 @@ impl Core {
     /// Why `listing` resolved nothing for the `to:` or `--to` word `word`, in
     /// Slack's words: an ambiguous one lists what to type instead.
     fn why_not(&self, listing: &Listing, word: &str) -> String {
-        let named: Vec<String> = listing.named(word).map(|(_, c)| format!("`{}`", text::clean(listing.typable(c)))).collect();
+        let named: Vec<String> = listing
+            .named(word)
+            .map(|(_, c)| format!("`{}`", text::clean(listing.typable(c))))
+            .collect();
         let w = text::clean(word);
         if named.len() > 1 {
             format!("`{w}` is ambiguous: it is {}. Use one of those.", named.join(", "))
@@ -195,10 +202,17 @@ impl Core {
                 .machines
                 .iter()
                 .filter(|(_, m)| !m.ok)
-                .map(|(_, m)| m.name.as_deref().map_or_else(|| "the saved machines".to_string(), |n| format!("`{}`", text::clean(n))))
+                .map(|(_, m)| {
+                    m.name
+                        .as_deref()
+                        .map_or_else(|| "the saved machines".to_string(), |n| format!("`{}`", text::clean(n)))
+                })
                 .chain((!listing.failed.is_empty()).then(|| "a source".to_string()))
                 .collect();
-            format!("{} didn't answer, and `{w}` isn't running on the machines that did.", silent.join(" and "))
+            format!(
+                "{} didn't answer, and `{w}` isn't running on the machines that did.",
+                silent.join(" and ")
+            )
         } else {
             format!("`{w}` matches no running session.")
         }
@@ -291,7 +305,10 @@ impl Core {
         match tokio::time::timeout(WAKE_TIMEOUT, self.sources[src].wake(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => failed(format!("{e:#}")),
-            Err(_) => failed(format!("no answer in {} s: it may have reached the session", WAKE_TIMEOUT.as_secs())),
+            Err(_) => failed(format!(
+                "no answer in {} s: it may have reached the session",
+                WAKE_TIMEOUT.as_secs()
+            )),
         }
     }
 

@@ -168,23 +168,29 @@ pub struct IdentifyRequest {
 #[serde(rename_all = "lowercase")]
 pub enum CallerKind {
     Session,
+    /// A source's session that can't be named: the daemon refuses it.
     Unlisted,
     None,
 }
 
+/// Who a client was run for, as a source claimed it from the client's
+/// environment, on whatever machine the client runs. The daemon checks the
+/// claim and makes the ref: the client names nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentifyResult {
     pub caller: CallerKind,
     /// The source that claimed the caller, and that source's own ID for the
-    /// session. The daemon makes the ref from them: the client names nothing.
+    /// session.
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
-    pub person: Option<String>,
-    #[serde(default)]
     pub project: Option<String>,
+    /// The ID of the machine the session runs on. `None` from a client older
+    /// than machine IDs, which ran on the daemon's machine.
+    #[serde(default)]
+    pub machine: Option<String>,
     #[serde(default)]
     pub may_post: bool,
 }
@@ -195,11 +201,19 @@ impl IdentifyResult {
             caller: CallerKind::None,
             source: None,
             session: None,
-            person: None,
             project: None,
+            machine: None,
             may_post: false,
         }
     }
+}
+
+/// A claimed session the daemon's source checked: its ref, how people see
+/// it, and whose it is.
+pub struct Session {
+    pub ref_: String,
+    pub shown: String,
+    pub person: String,
 }
 
 // ---- a source's inbox ----
@@ -460,6 +474,9 @@ pub enum FailKind {
     TooLarge,
     /// The client could not reach the daemon.
     Unreachable,
+    /// The caller's session runs on a machine the daemon's source doesn't
+    /// know: a client that cached its machine's ID asks again, once.
+    UnknownMachine,
     NotSent,
     MaybeSent,
 }

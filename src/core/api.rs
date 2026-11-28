@@ -9,7 +9,7 @@ use chrono::Utc;
 
 use super::deliver::{Author, How, Incoming};
 use super::online::{By, Reader};
-use super::{Core, Listing};
+use super::{Core, Listing, text};
 use crate::config::Channel;
 use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, Msg, PostRequest, Posted};
 use crate::proto::{ListOut, MessageOut, PersonOut, PostTo, ReadOut, SendOut, Target, WaitingOut};
@@ -57,18 +57,32 @@ fn ts_secs(id: &str) -> chrono::DateTime<Utc> {
 }
 
 impl Core {
-    pub fn who(&self, id: &IdentifyResult) -> Result<Who> {
+    /// The caller a client claimed, checked by the source that claimed it.
+    pub async fn who(&self, id: &IdentifyResult) -> Result<Who> {
         match id.caller {
             CallerKind::Unlisted => bail!(Failure::new(
                 FailKind::NotAllowed,
-                "this session's project is not in the config, so it cannot use meridian-comms"
+                "this agent session can't be named: its environment has no spawn ID or project, so it cannot use meridian-comms"
             )),
             CallerKind::Session => {
-                let r = self.session_ref(id)?;
+                let source = self.sources.iter().find(|s| Some(s.name()) == id.source.as_deref());
+                let session = match source {
+                    Some(s) => s.session(id).await?,
+                    None => None,
+                };
+                let Some(session) = session else {
+                    bail!(Failure::new(
+                        FailKind::NotAllowed,
+                        format!(
+                            "this session's source ({}) is not in the bot's config, so it cannot use meridian-comms",
+                            id.source.as_deref().unwrap_or("none named")
+                        )
+                    ))
+                };
                 Ok(Who {
-                    shown: self.show(&Listing::default(), &r),
-                    ref_: Some(r),
-                    person: id.person.clone().unwrap_or_else(|| self.cfg.owner.clone()),
+                    ref_: Some(session.ref_),
+                    shown: text::clean(&session.shown),
+                    person: session.person,
                     project: id.project.clone(),
                     may_post: id.may_post,
                 })
@@ -81,15 +95,6 @@ impl Core {
                 may_post: true,
             }),
         }
-    }
-
-    fn session_ref(&self, id: &IdentifyResult) -> Result<String> {
-        let source = self.sources.iter().find(|s| Some(s.name()) == id.source.as_deref());
-        let named = id.project.as_deref().zip(id.session.as_deref());
-        source
-            .zip(named)
-            .and_then(|(s, (project, session))| s.session_ref(project, session))
-            .context("the daemon cannot name this session: its project or source is not in the daemon's config, or the client and the daemon are different builds (restart the daemon)")
     }
 
     /// A session reads its own project's channels and the channels with no project.
@@ -189,7 +194,14 @@ impl Core {
     /// Posts `text` (naming `mention`, a person as the surface notifies them)
     /// and wakes whom `to` names. Everything is resolved before the post, and
     /// any error after it is `MaybeSent`.
-    pub async fn send(self: &Arc<Self>, who: &Who, target: Target, to: Vec<String>, text: Option<String>, mention: Option<String>) -> Result<SendOut> {
+    pub async fn send(
+        self: &Arc<Self>,
+        who: &Who,
+        target: Target,
+        to: Vec<String>,
+        text: Option<String>,
+        mention: Option<String>,
+    ) -> Result<SendOut> {
         let prep = self.prepare_send(who, target, to, text, mention).await?;
         let posted = match &prep.post {
             Some(req) => Some(self.surface.post(req.clone()).await?),

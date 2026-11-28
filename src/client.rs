@@ -12,36 +12,21 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::config::Config;
-use crate::daemon;
-use crate::model::{CallerKind, FailKind, Failure, IdentifyRequest, IdentifyResult};
-use crate::paths;
+use crate::model::{FailKind, Failure, IdentifyRequest, IdentifyResult};
 use crate::proto::{ListOut, MAX_REQUEST, PostTo, ReadOut, Reply, Request, RouteOut, SendOut, Target};
-use crate::routes;
+use crate::{paths, routes, source};
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Who is calling: the first source that claims the environment, else the
-/// owner at a terminal. A session never falls through to the owner.
-fn identify() -> Result<IdentifyResult> {
-    let cfg = Config::load()?;
-    let req = environment();
-    for s in daemon::sources(&cfg)? {
-        let id = s.identify(&req);
-        match id.caller {
-            CallerKind::None => continue,
-            CallerKind::Unlisted => bail!(Failure::new(
-                FailKind::NotAllowed,
-                format!(
-                    "this session's project is not listed in {}: add it under [sources.{}.projects] to let this session use meridian-comms",
-                    crate::config::config_path().display(),
-                    s.name()
-                )
-            )),
-            CallerKind::Session => return Ok(id),
-        }
+/// Asks the daemon `make(caller)` for the caller this environment is. A
+/// claim whose machine the daemon doesn't know is made once more without what
+/// it cached: the daemon refused it before doing anything.
+async fn ask<T: DeserializeOwned>(make: impl Fn(IdentifyResult) -> Request, wait: Duration) -> Result<T> {
+    let env = environment();
+    match call(&make(source::claim(&env, false).await?), wait).await {
+        Err(e) if Failure::kind_of(&e) == FailKind::UnknownMachine => call(&make(source::claim(&env, true).await?), wait).await,
+        answered => answered,
     }
-    Ok(IdentifyResult::none())
 }
 
 /// What a source reads to learn who, or what, the client was run for.
@@ -133,10 +118,11 @@ fn json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 pub async fn read(message: Option<String>, channel: Option<String>, limit: Option<usize>, as_json: bool) -> Result<()> {
-    let out: ReadOut = call(
-        &Request::Read {
-            caller: identify()?,
-            target: target(message, channel)?,
+    let target = target(message, channel)?;
+    let out: ReadOut = ask(
+        |caller| Request::Read {
+            caller,
+            target: target.clone(),
             limit,
         },
         ANSWER_TIMEOUT,
@@ -189,12 +175,13 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
         }
         _ => text,
     };
-    let out: SendOut = call(
-        &Request::Send {
-            caller: identify()?,
-            target: target(message, channel)?,
+    let target = target(message, channel)?;
+    let out: SendOut = ask(
+        |caller| Request::Send {
+            caller,
+            target: target.clone(),
             to: to.clone(),
-            text,
+            text: text.clone(),
         },
         ANSWER_TIMEOUT,
     )
@@ -233,15 +220,22 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
 /// Posts `text` for a person or in a thread and wakes nobody. Every error is
 /// a `Failure`.
 pub async fn post(to: PostTo, text: String, wait: Duration) -> Result<SendOut> {
-    let caller = identify()?;
-    call(&Request::Post { caller, to, text }, wait).await
+    ask(
+        |caller| Request::Post {
+            caller,
+            to: to.clone(),
+            text: text.clone(),
+        },
+        wait,
+    )
+    .await
 }
 
 pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
-    let out: ListOut = call(
-        &Request::List {
-            caller: identify()?,
-            project,
+    let out: ListOut = ask(
+        |caller| Request::List {
+            caller,
+            project: project.clone(),
         },
         ANSWER_TIMEOUT,
     )
@@ -293,13 +287,9 @@ pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
 pub async fn route(item: Option<String>) -> Result<()> {
     let (source, item) = match item {
         Some(item) => (None, item),
-        None => {
-            let env = environment();
-            daemon::sources(&Config::load()?)?
-                .iter()
-                .find_map(|s| Some((Some(s.name().to_string()), s.routed_item(&env)?)))
-                .context("no item to route: name one, or run this as a source's hook for a new inbox message")?
-        }
+        None => source::routed_item(&environment())
+            .map(|(source, item)| (Some(source.to_string()), item))
+            .context("no item to route: name one, or run this as a source's hook for a new inbox message")?,
     };
     let out: RouteOut = call(&Request::Route { source, item }, ANSWER_TIMEOUT).await?;
     println!("{}", out.detail);

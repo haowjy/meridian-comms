@@ -57,6 +57,7 @@ fn kind(k: FailKind) -> &'static str {
         FailKind::NotAllowed => "refused",
         FailKind::TooLarge => "too_large",
         FailKind::Unreachable => "unreachable",
+        FailKind::UnknownMachine => "refused",
         FailKind::NotSent => "failed",
         FailKind::MaybeSent => "maybe_delivered",
     }
