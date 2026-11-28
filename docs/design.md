@@ -46,7 +46,7 @@ candidates (one `list` per event) and takes:
   so a new thread wakes nobody;
 - of those, every one that is not **cold** (idle, with a `warm_until` that has passed).
 
-All three ways in (a message in a thread, `send`, the Continue click) go through one
+All the ways in (a message in a thread, `send`, the Wake and Continue clicks, the form) go through one
 function, `deliver` in `src/core/deliver.rs`. It takes, per person, either the refs chosen
 or "run the rule"; wakes each ref once however many picks name it; records the ref each
 wake *returned* (a source may open a new thread per wake) in `scope` and `woken`; and
@@ -76,6 +76,70 @@ like a `to:` line from whoever clicked (they must be in the directory and not
 bot then edits the picker post: the menu and button go, and a line says who chose what.
 Refs the sources no longer list are named in a reply and left out. A click in a paused
 thread takes the choice and wakes nobody, as a `to:` line does.
+
+**The form** starts a thread for one session. A person opens it in a configured channel
+(on Slack, `/agent`). It has a line naming the machines whose sessions it lists, a session
+field the bot fills as they type, and a message box. Sending it opens a thread in the
+channel with the message and delivers it through `deliver` as that person's choice of the
+session, the way a `to:` line opening a thread is: the session is woken, cold or not, and
+becomes the person's scope, so later messages in the thread go to it. The bot reacts 👀
+when it woke someone, and otherwise posts the picker with the reason. Only a person in the
+directory who is not `agent = "always"` may open or send it, and only in a configured
+channel; anyone else gets a reply only they see, never a post. Replies in the thread keep
+`to:` and the picker: Slack refuses slash commands in threads without calling the app.
+
+The form is opened for one channel or for several to choose from, all of one project, and
+optionally with a session already chosen. `/agent` passes the channel it was typed in and
+no session. A later "Message" button on the Home tab, whose click names no channel, passes
+the channels configured for the session's project (with exactly one, that one; with
+several, the form offers them; with none, there is no button). On Slack the modal carries
+its channels and that session to the submission in `private_metadata`, and the submission
+checks the channel and the person again and the session against the listing.
+
+The bot posts the thread's first message, since it can't post as the person. The post
+shows the person's name above their text, and its `text` is their words alone. The
+thread file's `authors` maps that post's ID to the person, and `author` in
+`src/core/mod.rs` reads it, so `read`, Continue and `send --to` without text take the post
+as the person's message. The delivery counts it toward the loop limit as theirs (by their
+`agent` mark).
+
+**Answering within seconds.** Slack waits 3 s for the acknowledgement of the command, of
+each request for the session field's options, and of the submission, and the answer
+travels in that acknowledgement: the options, errors that keep the form open, or a reply
+only the person sees. So the socket acknowledges those envelopes only once they are
+answered. They reach the core on a channel of their own, apart from the event stream, and
+each is answered in its own task, so none waits behind another or behind recovery. The
+core answers within 2.2 s, and the socket gives up at 2.5 s with its own "try again". For
+the command, the socket opens the form (`views.open` with the command's `trigger_id`)
+before it acknowledges, and says so if that failed.
+
+Listing sessions is too slow to do on demand (one project's listing costs seconds of CPU
+on a small machine), so the options come from `online` in `src/core/online.rs`: the
+owner's sessions in a project (every configured project for a channel with none), cold
+ones included, as their source describes them, and the machines they cover, by the name
+each source gives its own. It answers from the newest finished listing for that project,
+waits up to a given time for the first, and starts a new listing when the newest is over
+15 s old and none is running; opening the form starts one. Until the first is done, the
+field shows one option saying it is still listing; with no sessions, it says none are
+running on that machine, and so does the line above the fields once that is known. A listing over 5 minutes old counts as none, and callers wait for the
+new one as for the first.
+
+A submission is checked against the newest listing, and a session missing from it is an
+error on the form. The post is made before the answer, and a post that fails, or is still
+running when the time is up, is an error on the form that says to send again. Sending
+again is safe: each send names the open form (on Slack, the view's ID, the same each time
+it is sent), and the core remembers the forms it posted for an hour, so a form sent again,
+because the first answer was lost or late, gets that send's outcome and is never posted
+or woken twice. A post known not to have gone out (`not_sent`, `too_large`) is forgotten, so
+sending again posts. One that may have gone out (`maybe_sent`) stays remembered, and the
+error tells the person to look in the channel before using the form again. The wake runs after
+the answer, against the listing the submission was checked with, since listing again
+would leave the post unwoken for seconds; a session that ended in between fails its wake
+and is named in the thread as left out. On a `disconnect` frame the socket sends the
+acknowledgements it holds before it reconnects. Waking stays
+on this machine (below), so the form lists this machine's sessions only; `online` takes
+the machines from the sources, so a source that reaches more machines adds them without a
+change to its callers. A status view of who is online would call `online` too.
 
 **A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
@@ -385,7 +449,9 @@ per thread. A thread's events run in arrival order. A `send` that opens a thread
 its lock and writes its file as soon as Slack returns the post, before it wakes, so a
 reply that arrives mid-wake waits its turn and finds the scope. Wakes happen before
 the final write, so a crash repeats a notice and never loses one. `handled` holds the last 50 message IDs,
-so a redelivery is dropped.
+so a redelivery is dropped. `authors` names the person each of the bot's posts made for
+one (the form's) belongs to. A build older than the form drops `authors` the next time it
+saves the file, and that post then reads as the bot's.
 
 A `to:` line that names a word no answering source resolves while a source is down is
 neither text nor a miss yet. The daemon says once in the thread that a source did not
@@ -413,8 +479,9 @@ handled again at the next recovery. A channel's first run starts at now.
 ## Slack
 
 Hand-rolled, no SDK. Socket Mode: `apps.connections.open`, then a websocket of JSON
-envelopes, each acknowledged by `envelope_id` before it is handled. A `disconnect`
-frame or a silent link (120 s) means reconnect.
+envelopes, each acknowledged by `envelope_id` before it is handled, except the form's,
+which are acknowledged with their answer (above). A `disconnect` frame or a silent link
+(120 s) means reconnect.
 
 **One bot, one daemon.** Slack hands each event to any one of an app's connections, so
 a second daemon on the same bot would take some of the events. Each connection's `hello`
@@ -425,8 +492,8 @@ own refresh briefly overlaps the old connection with the new one. After a crash,
 may count the dead connection for a while, so a restart can be refused until Slack
 drops it; run the service with a restart delay. Web API calls: `chat.postMessage`,
 `reactions.add`, `conversations.replies`, `conversations.history`, `auth.test`,
-`conversations.info`; a 429 waits out `Retry-After`. A post replaces `<!` with `&lt;!`
-so text from a session can't ping a channel. A post over Slack's 40,000 characters,
+`conversations.info`, `views.open`; a 429 waits out `Retry-After`. A post replaces `<!` with
+`&lt;!` so text from a session can't ping a channel. A post over Slack's 40,000 characters,
 which Slack would cut, is refused before it is sent, for `send` as for `deliver`. A
 channel shared with another
 organization is refused at start unless its entry says `external = true`.

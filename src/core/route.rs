@@ -459,6 +459,7 @@ impl Core {
                 text,
                 menu: None,
                 plain: true,
+                by: None,
             };
             self.surface.post(req).await.context("the post in the item's thread failed")?;
         }

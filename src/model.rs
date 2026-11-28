@@ -294,6 +294,77 @@ pub struct Action {
     pub values: Vec<String>,
 }
 
+/// Something a person did that the surface must answer at once, with the
+/// answer in hand, within seconds. Each comes with the channel its
+/// `Response` goes back on.
+#[derive(Debug, Clone)]
+pub enum Interaction {
+    /// A person asked for the form that opens a thread for one session, in
+    /// one of `conversations` (the person chooses when there are several);
+    /// `session` is a ref already chosen.
+    Form {
+        conversations: Vec<String>,
+        sender: Sender,
+        session: Option<String>,
+    },
+    /// The form's session field asks what to offer for what was typed, for
+    /// the form's first conversation.
+    Suggest {
+        conversation: String,
+        sender: Sender,
+        query: String,
+    },
+    /// The form was sent. `form` names the open form, the same each time it
+    /// is sent again; `session` is the chosen ref.
+    Submit {
+        form: String,
+        conversation: String,
+        sender: Sender,
+        session: Option<String>,
+        text: String,
+    },
+}
+
+pub type Interacted = (Interaction, tokio::sync::oneshot::Sender<Response>);
+
+#[derive(Debug, Clone)]
+pub enum Response {
+    /// Nothing to show: the surface acknowledges and closes what is open.
+    Done,
+    /// A short answer only the person who asked sees. Never a post.
+    Private(String),
+    /// Open the form.
+    Form(Form),
+    /// The session field's options. With none, `note` says why, in the
+    /// field's place.
+    Options { groups: Vec<MenuGroup>, note: Option<String> },
+    /// The form stays open, with `error` beside `field`.
+    Invalid { field: FormField, error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct Form {
+    /// The option the session field starts on.
+    pub session: Option<MenuOption>,
+    /// Where sending opens the thread: one, or several to choose from.
+    pub conversations: Vec<FormConversation>,
+    /// One line above the fields: which machines the sessions are on.
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormConversation {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormField {
+    Conversation,
+    Session,
+    Text,
+}
+
 #[derive(Debug, Clone)]
 pub enum SurfaceEvent {
     Message(Msg),
@@ -312,6 +383,9 @@ pub struct PostRequest {
     /// The text holds words the daemon did not write: the surface shows it as
     /// it is, making no mention, link or formatting from it.
     pub plain: bool,
+    /// The person (a display name) the bot posts this for: the surface shows
+    /// it beside the text, and the text is theirs alone.
+    pub by: Option<String>,
 }
 
 /// A menu of grouped options and one button that submits the selection, as

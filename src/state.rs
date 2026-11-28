@@ -38,6 +38,10 @@ pub struct ThreadState {
     /// The thread's message that waits in a source's inbox. At most one.
     #[serde(default)]
     pub filed: Option<FiledItem>,
+    /// The bot's posts in this thread that it made for a person, by message
+    /// ID: each is that person's message (`read`, Continue, the loop limit).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

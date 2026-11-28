@@ -345,13 +345,14 @@ impl Core {
         self.say_with(conversation, thread, text, None).await
     }
 
-    async fn say_with(&self, conversation: &str, thread: &str, text: String, menu: Option<Menu>) -> Option<Posted> {
+    pub(super) async fn say_with(&self, conversation: &str, thread: &str, text: String, menu: Option<Menu>) -> Option<Posted> {
         let req = PostRequest {
             conversation: conversation.into(),
             thread: Some(thread.into()),
             text,
             menu,
             plain: false,
+            by: None,
         };
         self.surface
             .post(req)
@@ -467,8 +468,8 @@ impl Core {
         let Some(msg) = thread.iter().find(|m| m.id == message) else {
             return Ok(());
         };
-        let sender = self.cfg.person_by_slack(&msg.sender.id).map(|(n, _)| n);
-        let author = sender.map(|n| self.cfg.display(n)).unwrap_or_default();
+        let sender = self.author(&st.authors, msg);
+        let author = sender.as_deref().map(|n| self.cfg.display(n)).unwrap_or_default();
         let inc = Incoming {
             conversation: a.conversation.clone(),
             thread: a.thread.clone(),
@@ -496,7 +497,7 @@ impl Core {
         if paused {
             // The pause notice already said the message waits for Continue.
         } else if out.woken.is_empty() {
-            if let (Some(sender), true) = (sender, picks.iter().all(|(_, p)| matches!(p, Pick::Rule))) {
+            if let (Some(sender), true) = (&sender, picks.iter().all(|(_, p)| matches!(p, Pick::Rule))) {
                 self.file(st, msg, sender).await;
             }
             st.explained = true;

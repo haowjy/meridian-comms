@@ -8,16 +8,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::model::{Msg, PostRequest, Posted, SurfaceEvent, WhoAmI};
+use crate::model::{Interacted, Msg, PostRequest, Posted, SurfaceEvent, WhoAmI};
 
 #[async_trait]
 pub trait Surface: Send + Sync {
     /// Holds the connection open and reconnects until the process ends. Each
     /// event is acknowledged to the product before it is sent here. The
-    /// surface never sends the bot's own posts, edits or deletions.
-    async fn run(&self, events: mpsc::Sender<SurfaceEvent>);
+    /// surface never sends the bot's own posts, edits or deletions. An
+    /// interaction is acknowledged only with its answer, so each goes on
+    /// `interactions` with the channel the answer comes back on; one not
+    /// answered in time gets the surface's own "try again".
+    async fn run(&self, events: mpsc::Sender<SurfaceEvent>, interactions: mpsc::Sender<Interacted>);
     /// Posts as the bot, with the post's menu if the surface has menus. Never retried by the core.
-    /// An error is a `Failure`: `MaybeDelivered` when the post may have gone out.
+    /// An error is a `Failure`: `MaybeSent` when the post may have gone out.
     async fn post(&self, req: PostRequest) -> Result<Posted>;
     /// Adds `note` under the bot's post `post`, keeping its text. Its menu and
     /// buttons go unless `keep_menu`: a choice was made with them, or (kept)

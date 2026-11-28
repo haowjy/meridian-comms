@@ -1,5 +1,7 @@
 //! The client's requests: `read`, `send`, `post` and `list`.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
@@ -98,9 +100,9 @@ impl Core {
         Ok((conv.clone(), ch))
     }
 
-    fn message_out(&self, m: &Msg) -> MessageOut {
-        let person = self.cfg.person_by_slack(&m.sender.id).map(|(n, _)| n.clone());
-        let bot = m.sender.id == self.bot;
+    fn message_out(&self, m: &Msg, authors: &BTreeMap<String, String>) -> MessageOut {
+        let person = self.author(authors, m);
+        let bot = person.is_none() && m.sender.id == self.bot;
         let outsider = person.is_none() && !bot;
         MessageOut {
             message: self.message_ref(&m.conversation, &m.id),
@@ -127,7 +129,18 @@ impl Core {
                     channel: ch.name.clone(),
                     thread: None,
                     requested: None,
-                    messages: msgs.iter().map(|m| self.message_out(m)).collect(),
+                    messages: msgs
+                        .iter()
+                        .map(|m| {
+                            // Each top-level message is its own thread, with its own file.
+                            let authors = if m.sender.id == self.bot {
+                                self.authors(&conv, &m.thread)
+                            } else {
+                                BTreeMap::new()
+                            };
+                            self.message_out(m, &authors)
+                        })
+                        .collect(),
                     omitted: 0,
                 })
             }
@@ -145,6 +158,7 @@ impl Core {
                 let Some(root) = msgs.first().map(|m| m.thread.clone()) else {
                     bail!(not_found(&r))
                 };
+                let authors = self.authors(&conv, &root);
                 let keep = limit.unwrap_or(30).max(2);
                 let omitted = msgs.len().saturating_sub(keep);
                 if omitted > 0 {
@@ -155,7 +169,7 @@ impl Core {
                     channel: ch.name.clone(),
                     thread: Some(self.message_ref(&conv, &root)),
                     requested: Some(r),
-                    messages: msgs.iter().map(|m| self.message_out(m)).collect(),
+                    messages: msgs.iter().map(|m| self.message_out(m, &authors)).collect(),
                     omitted,
                 })
             }
@@ -292,6 +306,7 @@ impl Core {
                 text: format!("From {}{to_part}:\n{body}", who.label()),
                 menu: None,
                 plain: false,
+                by: None,
             }
         });
         Ok(Prepared {
@@ -339,9 +354,8 @@ impl Core {
             }
             (None, None, Some(m)) => {
                 let from = self
-                    .cfg
-                    .person_by_slack(&m.sender.id)
-                    .map(|(n, _)| self.cfg.display(n))
+                    .author(&st.authors, m)
+                    .map(|n| self.cfg.display(&n))
                     .unwrap_or_else(|| format!("{}-agents", self.cfg.owner));
                 (m.id.clone(), from, m.time, m.text.clone())
             }
