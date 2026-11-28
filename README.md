@@ -10,8 +10,9 @@ itself, and answers there. Later messages in the thread go to the same session. 
 can start threads and hand work to each other the same way, with `meridian-comms send`.
 
 To start a thread for one session without the picker, type `/agent` in a channel the bot
-is set up for. A form opens: the session field lists the sessions running on the bot's
-machine as you type (the form names that machine), and a message box. Send it, and the
+is set up for. A form opens: the session field lists, as you type, the sessions running in the
+channel's project on every machine the bot reaches (the form names those machines), and
+a message box. Send it, and the
 bot opens a thread in the channel with your message, under your name, and wakes the
 session you chose. Reply in that thread as usual, `to:` included: Slack doesn't allow
 slash commands in threads, so the form only starts one.
@@ -30,10 +31,11 @@ Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meri
 needs Meridian 0.28.1 or later (`meridian --version`): the daemon and `setup router`
 refuse an older one.
 
-**Status:** early. One Slack bot per person, with its daemon on one machine. The router
-can offer a filed message to a session on another machine Meridian has saved
-(`meridian machine add`); waking a session there from Slack, and Amp threads as
-recipients, are not supported.
+**Status:** early. One Slack bot per person, with its daemon on one machine. Sessions on
+the other machines Meridian has saved there (`meridian machine add`) are listed, woken,
+offered messages and can read and post, the same as the daemon's own; a session is shown
+as `p41 on homebox`, and `homebox/p41` names it when two machines each have a `p41`.
+Amp threads as recipients are not supported.
 
 ## How it behaves
 
@@ -101,6 +103,32 @@ waiting. `meridian message @meridian-cli/1731600123.000200 "..."`
 answers in that message's thread instead. Either way nobody is woken, and a child spawn
 may not post.
 
+## Agents on another machine
+
+The daemon runs on one machine. On each other machine whose agents use the bot:
+
+1. On the bot's machine, save this machine in Meridian (`meridian machine add`), so the
+   bot lists and wakes its sessions.
+2. Install this build of meridian-comms here (`cargo install --path .`), the same version
+   as the bot's: the two check that they speak the same handshake.
+3. Check that `ssh <target>` reaches the bot's machine with no prompt: a key loaded or
+   without passphrase, and its host key already in `~/.ssh/known_hosts` (run `ssh <target>`
+   once in a terminal).
+4. Write `~/.config/meridian-comms/config.toml` here with only:
+
+   ```toml
+   [bot]
+   ssh = "jimmy@raspberrypi"
+   # command = "/home/jimmy/.cargo/bin/meridian-comms"   # if it isn't on PATH there
+   ```
+
+5. For `meridian message @alice`, add the `[message] people` lines below to this
+   machine's `~/.meridian/config.toml` too.
+
+`read`, `send`, `list` and `deliver` then reach the daemon over SSH, and a child spawn may
+still read but not post. Run no daemon here. A session in a sandbox that blocks network
+access can't reach the bot: its commands say so, and nothing is sent.
+
 ## Turn the router on
 
 Without these steps the bot works as above and a message nobody was woken for waits.
@@ -145,6 +173,13 @@ this order:
    meridian-comms installed its own copy of the agent through Mars, which would replace
    Meridian's; setup removes it.
 4. Restart the daemon.
+
+**From a build before machine-wide refs:** the daemon rewrites its thread files to the new
+refs at its first start, and old picker clicks, retry lines and `--to` refs still work for
+one minor release. A project's `root` in `config.toml` is no longer read: remove it (the
+daemon warns until you do). A project is its Meridian project ID, and its agents may run
+on any machine the bot reaches. Other machines need the same meridian-comms build and a
+`[bot]` config, as in [Agents on another machine](#agents-on-another-machine).
 
 **A Slack app made before `/agent` and the Home tab** needs four changes in its settings
 at <https://api.slack.com/apps>, then one reinstall: add the `/agent` slash command, make
