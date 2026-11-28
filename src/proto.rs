@@ -4,7 +4,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Candidate, IdentifyResult};
+use crate::model::{Candidate, FailKind, IdentifyResult};
+
+/// The longest request line the daemon reads.
+pub const MAX_REQUEST: usize = 4 << 20;
 
 /// `caller` was `identity` while the client composed its own ref. The name
 /// changed with the shape, so a daemon of either build refuses the other's
@@ -28,6 +31,12 @@ pub enum Request {
         caller: IdentifyResult,
         project: Option<String>,
     },
+    /// Post `text` for a person or in a thread, waking nobody.
+    Post {
+        caller: IdentifyResult,
+        to: PostTo,
+        text: String,
+    },
     /// Route one item waiting in a source's inbox. Answered when accepted, not
     /// when routed. No source named: the first one.
     Route {
@@ -43,10 +52,37 @@ pub enum Target {
     Channel(String),
 }
 
+/// Who a `Post` is for.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostTo {
+    /// A name in the directory: a new thread in the caller's channel names them.
+    Person(String),
+    /// A message ref: the post goes in that message's thread.
+    Thread(String),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Reply<T> {
     pub error: Option<String>,
+    /// The error's kind; a daemon older than `post` sends none.
+    #[serde(default, deserialize_with = "kind_or_maybe")]
+    pub kind: Option<FailKind>,
     pub result: Option<T>,
+}
+
+/// A kind this build doesn't know, from a newer daemon, may mean anything:
+/// read as `MaybeSent`, the one that never invites sending again.
+fn kind_or_maybe<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<FailKind>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.map(|v| serde_json::from_value(v).unwrap_or(FailKind::MaybeSent)))
+}
+
+impl Request {
+    /// Whether the request posts or wakes, so an unanswered one may have.
+    pub fn posts(&self) -> bool {
+        matches!(self, Request::Send { .. } | Request::Post { .. })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

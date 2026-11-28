@@ -66,6 +66,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Post the text on stdin for an address, as `meridian message @…` asks, and wake nobody.
+    ///
+    /// `@person` opens a thread in the caller's project's channel that mentions
+    /// them; `@<message ref>` answers in that message's thread. Prints one line
+    /// of JSON, `{"ok": true, "delivery": "acknowledged", "note": LINK}` or
+    /// `{"ok": false, "error": {"kind": KIND, "text": TEXT}}`, and exits 1
+    /// unless ok. Only kind `maybe_delivered` means the post may have gone out.
+    /// Run by Meridian with `[message] people = ["meridian-comms", "deliver"]`
+    /// in `~/.meridian/config.toml`.
+    Deliver {
+        /// `@<person>` or `@<channel>/<message id>`.
+        address: String,
+    },
     /// Print the people, the sessions that could take a message, and waiting messages.
     List {
         /// A project to list instead of the caller's own.
@@ -144,6 +157,10 @@ async fn main() {
             message_text,
             json,
         } => client::send(message, channel, to, message_text, json).await,
+        Command::Deliver { address } => {
+            source::meridian::people::deliver(address).await;
+            Ok(())
+        }
         Command::List { project, json } => client::list(project, json).await,
         Command::Route { item } => client::route(item).await,
         Command::Routes { of, json } => client::routes(of, json),

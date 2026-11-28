@@ -22,7 +22,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::config::Config;
 use crate::jev::Jev;
-use crate::model::{Candidate, ListRequest, SurfaceEvent, WakeRequest, WakeResult};
+use crate::model::{Candidate, FailKind, Failure, ListRequest, SurfaceEvent, WakeRequest, WakeResult};
 use crate::routes;
 use crate::source::Source;
 use crate::state::Store;
@@ -266,10 +266,13 @@ impl Core {
 
     fn parse_message_ref(&self, r: &str) -> Result<(String, String)> {
         let Some((name, id)) = r.split_once('/') else {
-            bail!("{r:?} is not a message ref: expected <channel>/<id>")
+            bail!(Failure::new(
+                FailKind::Invalid,
+                format!("{r:?} is not a message ref: expected <channel>/<id>")
+            ))
         };
         let Some((conv, _)) = self.cfg.channel_by_name(name) else {
-            bail!("no configured channel is named {name:?}")
+            bail!(Failure::new(FailKind::NotFound, format!("no configured channel is named {name:?}")))
         };
         Ok((conv.clone(), id.to_string()))
     }

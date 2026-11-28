@@ -1,4 +1,4 @@
-//! The client's three requests: `read`, `send` and `list`.
+//! The client's requests: `read`, `send`, `post` and `list`.
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -6,9 +6,23 @@ use chrono::Utc;
 use super::deliver::{Author, How, Incoming};
 use super::{Core, Listing};
 use crate::config::Channel;
-use crate::model::{CallerKind, IdentifyResult, ListRequest, Msg, PostRequest};
-use crate::proto::{ListOut, MessageOut, PersonOut, ReadOut, SendOut, Target, WaitingOut};
+use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, ListRequest, Msg, PostRequest, Posted};
+use crate::proto::{ListOut, MessageOut, PersonOut, PostTo, ReadOut, SendOut, Target, WaitingOut};
 use crate::state::{Pick, ThreadState};
+
+/// A `send` resolved up to the post: nothing has gone out yet.
+struct Prepared {
+    conv: String,
+    requested: Option<Msg>,
+    to: Vec<String>,
+    text: Option<String>,
+    persons: Vec<String>,
+    words: Vec<String>,
+    listing: Listing,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    st: ThreadState,
+    post: Option<PostRequest>,
+}
 
 /// The caller after `identify`: a session, or the owner at a terminal.
 pub struct Who {
@@ -38,7 +52,10 @@ fn ts_secs(id: &str) -> chrono::DateTime<Utc> {
 impl Core {
     pub fn who(&self, id: &IdentifyResult) -> Result<Who> {
         match id.caller {
-            CallerKind::Unlisted => bail!("this session's project is not in the config, so it cannot use meridian-comms"),
+            CallerKind::Unlisted => bail!(Failure::new(
+                FailKind::NotAllowed,
+                "this session's project is not in the config, so it cannot use meridian-comms"
+            )),
             CallerKind::Session => Ok(Who {
                 ref_: Some(self.session_ref(id)?),
                 person: id.person.clone().unwrap_or_else(|| self.cfg.owner.clone()),
@@ -73,10 +90,10 @@ impl Core {
 
     fn resolve_channel(&self, who: &Who, name: &str) -> Result<(String, &Channel)> {
         let Some((conv, ch)) = self.cfg.channel_by_name(name) else {
-            bail!("no configured channel is named {name:?}")
+            bail!(Failure::new(FailKind::NotFound, format!("no configured channel is named {name:?}")))
         };
         if !Self::can_see(who, ch) {
-            bail!("channel {name:?} belongs to another project");
+            bail!(another_project(name));
         }
         Ok((conv.clone(), ch))
     }
@@ -118,7 +135,7 @@ impl Core {
                 let (conv, id) = self.parse_message_ref(&r)?;
                 let ch = self.cfg.channel(&conv).expect("parsed from the config");
                 if !Self::can_see(who, ch) {
-                    bail!("channel {:?} belongs to another project", ch.name);
+                    bail!(another_project(&ch.name));
                 }
                 let mut msgs = self
                     .surface
@@ -126,7 +143,7 @@ impl Core {
                     .await
                     .with_context(|| format!("cannot read message {r}"))?;
                 let Some(root) = msgs.first().map(|m| m.thread.clone()) else {
-                    bail!("message {r} not found")
+                    bail!(not_found(&r))
                 };
                 let keep = limit.unwrap_or(30).max(2);
                 let omitted = msgs.len().saturating_sub(keep);
@@ -145,22 +162,47 @@ impl Core {
         }
     }
 
-    pub async fn send(&self, who: &Who, target: Target, to: Vec<String>, text: Option<String>) -> Result<SendOut> {
-        if !who.may_post {
-            bail!("only a primary session, or the owner at a terminal, may post; a child spawn reads and reports to its parent");
-        }
+    /// Posts `text` (naming `mention`, a person as the surface notifies them)
+    /// and wakes whom `to` names. Everything is resolved before the post, and
+    /// any error after it is `MaybeSent`.
+    pub async fn send(&self, who: &Who, target: Target, to: Vec<String>, text: Option<String>, mention: Option<String>) -> Result<SendOut> {
+        let prep = self.prepare_send(who, target, to, text, mention).await?;
+        let posted = match &prep.post {
+            Some(req) => Some(self.surface.post(req.clone()).await?),
+            None => None,
+        };
+        self.finish_send(who, prep, posted)
+            .await
+            .map_err(|e| Failure::new(FailKind::MaybeSent, format!("the post or wake went out, then: {e:#}")).into())
+    }
+
+    async fn prepare_send(
+        &self,
+        who: &Who,
+        target: Target,
+        to: Vec<String>,
+        text: Option<String>,
+        mention: Option<String>,
+    ) -> Result<Prepared> {
+        Self::may_post(who)?;
         if text.is_none() && to.is_empty() {
-            bail!("nothing to send: give --message (or stdin), or --to to wake someone about an existing message");
+            bail!(Failure::new(
+                FailKind::Invalid,
+                "nothing to send: give --message (or stdin), or --to to wake someone about an existing message"
+            ));
         }
         // Resolve where it goes.
         let (conv, ch, requested): (String, &Channel, Option<Msg>) = match &target {
             Target::Channel(name) => {
                 let (conv, ch) = self.resolve_channel(who, name)?;
                 if text.is_none() {
-                    bail!("opening a thread needs --message");
+                    bail!(Failure::new(FailKind::Invalid, "opening a thread needs --message"));
                 }
                 if ch.project.is_none() && !ch.post {
-                    bail!("channel {name:?} has no project and does not allow sessions to open threads (post = true)");
+                    bail!(Failure::new(
+                        FailKind::NotAllowed,
+                        format!("channel {name:?} has no project and does not allow sessions to open threads (post = true)")
+                    ));
                 }
                 (conv, ch, None)
             }
@@ -168,11 +210,11 @@ impl Core {
                 let (conv, id) = self.parse_message_ref(r)?;
                 let ch = self.cfg.channel(&conv).expect("parsed from the config");
                 if !Self::can_see(who, ch) {
-                    bail!("channel {:?} belongs to another project", ch.name);
+                    bail!(another_project(&ch.name));
                 }
                 let msgs = self.surface.thread(&conv, &id, None).await?;
                 let Some(msg) = msgs.into_iter().find(|m| m.id == id) else {
-                    bail!("message {r} not found")
+                    bail!(not_found(r))
                 };
                 (conv, ch, Some(msg))
             }
@@ -185,15 +227,18 @@ impl Core {
         for w in &to {
             match w.strip_prefix('@') {
                 Some(p) if self.cfg.people.contains_key(p) => persons.push(p.to_string()),
-                Some(p) => bail!("{p:?} is not in the directory; `meridian-comms list` names the people"),
+                Some(p) => bail!(Failure::new(
+                    FailKind::NotFound,
+                    format!("{p:?} is not in the directory; `meridian-comms list` names the people")
+                )),
                 None => words.push(w.clone()),
             }
         }
 
-        let mut _held = None;
-        let mut st = match &requested {
+        let mut held = None;
+        let st = match &requested {
             Some(m) => {
-                _held = Some(self.lock(&conv, &m.thread).await);
+                held = Some(self.lock(&conv, &m.thread).await);
                 self.store
                     .load_thread(&conv, &m.thread)?
                     .unwrap_or_else(|| ThreadState::new(&conv, &m.thread))
@@ -201,10 +246,13 @@ impl Core {
             None => ThreadState::new(&conv, ""),
         };
         if !to.is_empty() && st.paused {
-            bail!(
-                "this thread is paused after {} messages in a row that may be from agents; a person presses Continue on the thread",
-                super::events::LOOP_LIMIT
-            );
+            bail!(Failure::new(
+                FailKind::NotAllowed,
+                format!(
+                    "this thread is paused after {} messages in a row that may be from agents; a person presses Continue on the thread",
+                    super::events::LOOP_LIMIT
+                )
+            ));
         }
 
         let mut listing = Listing::default();
@@ -220,35 +268,67 @@ impl Core {
             listing = self.list_for(&persons, project.clone(), refs).await;
             for w in &words {
                 if listing.resolve(w).is_none() {
-                    bail!(
-                        "{} Use a ref or short ID from `meridian-comms list`, or @person.",
-                        self.why_not(&listing, w).await
-                    );
+                    bail!(Failure::new(
+                        FailKind::NotFound,
+                        format!(
+                            "{} Use a ref or short ID from `meridian-comms list`, or @person.",
+                            self.why_not(&listing, w).await
+                        )
+                    ));
                 }
             }
         }
 
-        // Post.
-        let (message_id, from, sent, text_out) = match (&text, &requested) {
-            (Some(body), _) => {
-                let to_part = if to.is_empty() {
-                    String::new()
-                } else {
-                    format!(" to {}", to.join(", "))
-                };
-                let req = PostRequest {
-                    conversation: conv.clone(),
-                    thread: requested.as_ref().map(|m| m.thread.clone()),
-                    text: format!("From {}{to_part}:\n{body}", who.label()),
-                    menu: None,
-                    plain: false,
-                };
-                let posted = self.surface.post(req).await?;
+        let post = text.as_ref().map(|body| {
+            let named: Vec<&str> = mention.iter().chain(&to).map(String::as_str).collect();
+            let to_part = if named.is_empty() {
+                String::new()
+            } else {
+                format!(" to {}", named.join(", "))
+            };
+            PostRequest {
+                conversation: conv.clone(),
+                thread: requested.as_ref().map(|m| m.thread.clone()),
+                text: format!("From {}{to_part}:\n{body}", who.label()),
+                menu: None,
+                plain: false,
+            }
+        });
+        Ok(Prepared {
+            conv,
+            requested,
+            to,
+            text,
+            persons,
+            words,
+            listing,
+            held,
+            st,
+            post,
+        })
+    }
+
+    /// The wakes and the thread file, after the post (if any) went out.
+    async fn finish_send(&self, who: &Who, prep: Prepared, posted: Option<Posted>) -> Result<SendOut> {
+        let Prepared {
+            conv,
+            requested,
+            to,
+            text,
+            persons,
+            words,
+            listing,
+            mut held,
+            mut st,
+            ..
+        } = prep;
+        let (message_id, from, sent, text_out) = match (posted, &text, &requested) {
+            (Some(posted), Some(body), _) => {
                 if requested.is_none() {
                     // The thread exists now: a reply can arrive while the wakes run. Take
                     // its lock and write its file before waking, so the reply waits its
                     // turn and finds the scope.
-                    _held = Some(self.lock(&conv, &posted.id).await);
+                    held = Some(self.lock(&conv, &posted.id).await);
                     st = self
                         .store
                         .load_thread(&conv, &posted.id)?
@@ -257,7 +337,7 @@ impl Core {
                 }
                 (posted.id, who.label(), Utc::now(), body.clone())
             }
-            (None, Some(m)) => {
+            (None, None, Some(m)) => {
                 let from = self
                     .cfg
                     .person_by_slack(&m.sender.id)
@@ -265,8 +345,9 @@ impl Core {
                     .unwrap_or_else(|| format!("{}-agents", self.cfg.owner));
                 (m.id.clone(), from, m.time, m.text.clone())
             }
-            (None, None) => unreachable!("a channel target requires text"),
+            _ => unreachable!("a post exactly when there is text, and a target message when there is none"),
         };
+        let _held = held;
         let message = self.message_ref(&conv, &message_id);
         let inc = Incoming {
             conversation: conv.clone(),
@@ -323,6 +404,80 @@ impl Core {
         })
     }
 
+    fn may_post(who: &Who) -> Result<()> {
+        if !who.may_post {
+            bail!(Failure::new(
+                FailKind::NotAllowed,
+                "only a primary session, or the owner at a terminal, may post; a child spawn reads and reports to its parent"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Posts `text` for a person or in a thread, and wakes nobody. For a
+    /// person it opens a thread naming them in the caller's channel.
+    pub async fn post_to(&self, who: &Who, to: PostTo, text: String) -> Result<SendOut> {
+        Self::may_post(who)?;
+        if text.trim().is_empty() {
+            bail!(Failure::new(FailKind::Invalid, "nothing to send: the message text is empty"));
+        }
+        let name = match to {
+            PostTo::Thread(r) => return self.send(who, Target::Message(r), vec![], Some(text), None).await,
+            PostTo::Person(name) => name,
+        };
+        let Some(person) = self.cfg.people.get(&name) else {
+            bail!(Failure::new(
+                FailKind::NotFound,
+                format!("no person {name:?} in the directory; `meridian-comms list` names the people")
+            ))
+        };
+        let mention = self.surface.mention(&person.slack);
+        let channel = self.channel_for(who)?;
+        self.send(who, Target::Channel(channel), vec![], Some(text), Some(mention)).await
+    }
+
+    /// Where a post for a person opens its thread: the caller's project's channel, else
+    /// the one channel with no project and `post = true`. For the owner at a
+    /// terminal, the one channel they may open threads in.
+    fn channel_for(&self, who: &Who) -> Result<String> {
+        let names = |keep: &dyn Fn(&Channel) -> bool| -> Vec<String> {
+            self.cfg.channels().filter(|(_, c)| keep(c)).map(|(_, c)| c.name.clone()).collect()
+        };
+        let open = |c: &Channel| c.project.is_none() && c.post;
+        let found = match &who.project {
+            Some(p) => match names(&|c| c.project.as_ref() == Some(p)) {
+                mine if mine.is_empty() => names(&open),
+                mine => mine,
+            },
+            None => names(&|c| c.project.is_some() || c.post),
+        };
+        let config = crate::config::config_path();
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => bail!(Failure::new(
+                FailKind::NoChannel,
+                match &who.project {
+                    Some(p) => format!(
+                        "no channel takes a new thread from project {p}: in {}, give one channel `project = \"{p}\"`, or one channel with no project `post = true`",
+                        config.display()
+                    ),
+                    None => format!(
+                        "no channel takes a new thread: in {}, give a channel a project or `post = true`",
+                        config.display()
+                    ),
+                }
+            )),
+            many => bail!(Failure::new(
+                FailKind::Ambiguous,
+                format!(
+                    "channels {} could each take a new thread: answer in an existing thread by its message ref instead, or change {} so that only one can",
+                    many.join(", "),
+                    config.display()
+                )
+            )),
+        }
+    }
+
     pub async fn list_people(&self, who: &Who, project: Option<String>) -> Result<ListOut> {
         let project = project.or_else(|| who.project.clone());
         if let (Some(mine), Some(asked)) = (&who.project, &project)
@@ -372,4 +527,12 @@ impl Core {
         waiting.sort_by_key(|w| w.time);
         Ok(ListOut { project, people, waiting })
     }
+}
+
+fn another_project(channel: &str) -> Failure {
+    Failure::new(FailKind::NotAllowed, format!("channel {channel:?} belongs to another project"))
+}
+
+fn not_found(message: &str) -> Failure {
+    Failure::new(FailKind::NotFound, format!("message {message} not found"))
 }

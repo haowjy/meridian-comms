@@ -3,6 +3,7 @@
 //! `message inbox` and `inbox read/take/offer` for the machine's inbox, and
 //! `context` for a root's project ID.
 
+pub mod people;
 pub mod router;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -4,7 +4,8 @@ use crate::config::Config;
 
 const GUIDE: &str = include_str!("../docs/slack-setup.md");
 
-/// Prints the Slack app manifest from the setup guide, with the owner filled in.
+/// Prints the Slack app manifest from the setup guide, with the owner filled
+/// in, and on stderr what Meridian's config needs for `deliver`.
 pub fn run(owner: Option<String>) -> Result<()> {
     let owner = match owner {
         Some(o) => o,
@@ -30,5 +31,6 @@ pub fn run(owner: Option<String>) -> Result<()> {
             .replace("jimmy-agents", &format!("{owner}-agents"))
             .replace("Jimmy's", &format!("{cap}'s"))
     );
+    eprintln!("\n{}", crate::source::meridian::people::SETUP);
     Ok(())
 }
