@@ -619,7 +619,9 @@ made where the session runs, with no config (`source::claim`): a Meridian primar
 its project ID (`MERIDIAN_PROJECT_ID`, else `meridian context --json` in
 `MERIDIAN_PROJECT_DIR`), its spawn ID and depth, and its machine's ID
 (`MERIDIAN_MACHINE_ID`, else `meridian machine name --json`, cached per `MERIDIAN_HOME`
-in the state directory's `machine-ids.json`, written whole). The daemon's source turns
+in the state directory's `machine-ids.json`, written whole). Meridian sets both
+variables in every session it launches from 0.29.0 on; with an older Meridian they are
+unset and the two calls run. The daemon's source turns
 it into a session (`Source::session`): a ref, how it is shown, and the person. A child
 spawn may read but not post. A session whose project is not in the config is refused
 with what to add and where; one in an ad-hoc project (an ID that names a folder on one

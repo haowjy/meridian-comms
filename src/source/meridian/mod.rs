@@ -977,7 +977,8 @@ pub fn routed_item(req: &IdentifyRequest) -> Option<String> {
 
 /// Claims a process that has Meridian's session variables, on any machine:
 /// its spawn ID and role from them, and its project and machine IDs from
-/// `MERIDIAN_PROJECT_ID` and `MERIDIAN_MACHINE_ID` where Meridian sets them,
+/// `MERIDIAN_PROJECT_ID` and `MERIDIAN_MACHINE_ID` where Meridian sets them
+/// (every session it launches, from 0.29.0 on),
 /// else from `meridian context` and `meridian machine name` (the machine's
 /// ID cached per `MERIDIAN_HOME`; `fresh` asks again). `None`: no session.
 pub async fn claim(req: &IdentifyRequest, fresh: bool) -> Result<Option<IdentifyResult>> {
