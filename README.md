@@ -145,3 +145,10 @@ this order:
    meridian-comms installed its own copy of the agent through Mars, which would replace
    Meridian's; setup removes it.
 4. Restart the daemon.
+
+**A Slack app made before `/agent` and the Home tab** needs four changes in its settings
+at <https://api.slack.com/apps>, then one reinstall: add the `/agent` slash command, make
+sure the `commands` scope is listed, switch the Home tab on under App Home, and subscribe
+to the `app_home_opened` bot event. Then reinstall the app to the workspace; the tokens
+don't change. `meridian-comms setup` prints the full manifest, and
+[docs/slack-setup.md](docs/slack-setup.md) has the steps.
