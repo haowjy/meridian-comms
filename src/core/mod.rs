@@ -147,7 +147,6 @@ impl Listing {
             .map_or(c.ref_.as_str(), String::as_str)
     }
 
-    /// The machines of source `src` that did not answer.
     /// The machines source `src` looked on.
     fn machines_of(&self, src: usize) -> Vec<Machine> {
         self.machines.iter().filter(|(i, _)| *i == src).map(|(_, m)| m.clone()).collect()
