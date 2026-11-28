@@ -44,8 +44,8 @@ impl Core {
             return;
         }
         let listing = match refresh {
-            true => self.listing(Scope::Everywhere, Need::YoungerThan(Duration::ZERO), By::ViewRefresh),
-            false => self.listing(Scope::Everywhere, Need::YoungerThan(REFRESH_AFTER), By::ViewOpen),
+            true => self.listing(Scope::Everywhere, Need::YoungerThan(Duration::ZERO), Some(By::ViewRefresh)),
+            false => self.listing(Scope::Everywhere, Need::YoungerThan(REFRESH_AFTER), Some(By::ViewOpen)),
         };
         let mut publisher = self.publisher.0.lock().unwrap();
         if let Some(again) = publisher.as_ref() {

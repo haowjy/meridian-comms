@@ -143,15 +143,15 @@ change to its callers.
 
 **One listing across machines.** Beside the per-project listings, `online.rs` keeps one
 listing of everything the sources reach on every machine (`ListRequest.offerable`), for
-the router and the Home tab, so raspberry never runs two such listings at once. Each
-caller says what it needs (`Need`): the Home tab takes the newest at once and starts a new
-one only when that is over a minute old (or always, for Refresh), and joins one that runs;
-the router needs one that started after its attempt began, so it joins the running one
-only if it started after that, and otherwise the next starts as soon as the running one
-ends. Which candidates each caller uses is written once (`Core::reach`), as is which
-channels a form may open a thread for a candidate in (`Core::form_conversations`: its
-project's, for a candidate its source marks `wakeable`). The core's limit for this
-listing is 30 s; the per-project one keeps 15.
+the router and the Home tab, so the bot's machine never runs two such listings at once.
+Each caller says what it needs (`Need`): the Home tab takes the newest at once and starts
+a new one only when that is over a minute old (or always, for Refresh), and joins one
+that runs; the router needs one that started after its attempt began, so it joins the
+running one only if it started after that, and otherwise the next starts as soon as the
+running one ends. Which candidates each caller uses is written once (`Core::reach`), as
+is which channels a form may open a thread for a candidate in
+(`Core::form_conversations`: its project's, for a candidate its source marks
+`wakeable`). The core's limit for this listing is 30 s; the per-project one keeps 15.
 
 **A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
@@ -666,12 +666,13 @@ older name.
 For an offer and the Home tab the Meridian source also lists the sessions of every
 machine Meridian has saved (`meridian machine list`): one `spawn list --global --json
 --machine M` each, all at once, beside the local listing. `machine list` and then each
-machine have 12 seconds. A design review measured raspberry (Meridian 0.28.3) asking
-homebox: about 4.9 s alone, 9.5 s beside five local listings. One that is down, too old
-or slow contributes no sessions, and is named in the answer's `machines` with why. Each
-listing logs at info who started and joined it, how long it took, and how long
-`machine list` and each saved machine took and whether it answered. The whole listing stays under the core's
-30-second limit however many machines are saved.
+machine have 12 seconds. A design review measured a Raspberry Pi (raspberry, Meridian
+0.28.3) asking a desktop (homebox): about 4.9 s alone, 9.5 s beside five local listings.
+One that is down, too old or slow contributes no sessions, and is named in the answer's
+`machines` with why. Each listing logs at info who started and joined it, how long it
+took, and how long `machine list` and each saved machine took and whether it answered.
+The whole listing stays under the core's 30-second limit however many machines are
+saved.
 
 That answer carries more than candidates. Each candidate has `wakeable`: whether `wake`
 from this daemon reaches it, which for Meridian is a running primary in a configured
@@ -682,10 +683,10 @@ is the name of the project's folder: the configured root here; elsewhere the fol
 of its primaries run in, since Meridian's rows give each session's own folder, which can
 be a worktree's, and no command gives a project's main checkout. A folder inside
 `<name>.worktrees/` is named `<name>`. A primary that is starting or ending is counted
-nowhere. The view adds the project ID to each of two projects whose labels are the same. `machines`
-has each machine looked on, by ID and name, and whether it answered; a `machine list`
-that fails is one entry with no name. A row's `desc` (a spawn's prompt opening) is
-never read.
+nowhere. The view adds the project ID to each of two projects whose labels are the
+same. `machines` has each machine looked on, by ID and name, and whether it answered; a
+`machine list` that fails is one entry with no name. A row's `desc` (a spawn's prompt
+opening) is never read.
 
 Two machines can each have a `p41`. Their refs differ, the model's options are numbered,
 and the second step's agent names a session on another machine as `<machine>/p41`,
