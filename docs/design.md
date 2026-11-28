@@ -199,7 +199,7 @@ ends the routing as `none`. The Meridian source's is a small agent
 (`src/source/meridian/router.rs`): a Meridian spawn of the `inbox-router` profile, which
 may run Meridian's read commands to see what the listed sessions are doing and ends its
 report with one decision line. Code carries the decision out; the agent can't message,
-start or offer anything. Meridian ships the profile from 0.X.Y on, and finds it in any
+start or offer anything. Meridian ships the profile from 0.28.1 on, and finds it in any
 directory after the project's and the user's own Mars agents, so nothing installs it. By
 default it runs on OpenCode with the model the profile names (`opencode-go/hy4-flash-free`
 today), on the OpenCode account this machine is signed in to. Its `model`, `harness` and
@@ -209,27 +209,25 @@ that setting is Jev's, and Jev is paid for by `OPENCODE_API_KEY`.
 
 - **The router directory** is `~/.local/state/meridian-comms/router/`: a Meridian project
   of its own, which holds the prompt files. `meridian-comms setup router` checks, makes
-  and checks again. The first check runs `meridian -C <tmp> spawn -a inbox-router
-  --dry-run`, which composes the launch and starts nothing, from a new empty temp
-  directory, so no package copy can answer for Meridian; it runs before anything in the
-  router directory changes, so with an older Meridian a router that worked keeps working.
-  When it fails because the agent isn't found, setup names the Meridian version that
-  ships the profile beside Meridian's own error. Setup then gives the directory a
-  project identity with `meridian init <dir>` and runs the same dry run there, printing
-  the path the profile resolved to and saying when that is a package copy under the
-  directory's `.mars/agents/`. Without an identity Meridian keeps the router's spawns as
-  state for that path alone and prunes it once idle, losing spawns the routing log names;
-  `init` keeps the identity a directory already has. Earlier setups made the directory a
-  Mars project that installed the profile from `meridian-base`; once that package drops
-  it a sync there fails, and while it has it the copy shadows Meridian's. When
-  `mars.toml` is exactly what that setup wrote (one dependency, a source and
-  `agents = ["inbox-router"]`), setup runs `meridian -C <dir> mars remove <key>` with the
+  and checks again. The first check is the daemon's version check (below): it runs before
+  anything in the router directory changes, so with a Meridian that doesn't ship the
+  profile a router that worked keeps working. Setup then gives the directory a project
+  identity with `meridian init <dir>` and runs `meridian -C <dir> spawn -a inbox-router
+  --dry-run`, which composes the launch and starts nothing, printing the path the profile
+  resolved to and saying when that is a package copy under the directory's
+  `.mars/agents/`. Without an identity Meridian keeps the router's spawns as state for
+  that path alone and prunes it once idle, losing spawns the routing log names; `init`
+  keeps the identity a directory already has. Earlier setups made the directory a Mars
+  project that installed the profile from `meridian-base`; once that package drops it a
+  sync there fails, and while it has it the copy shadows Meridian's. When `mars.toml` is
+  exactly what that setup wrote (one dependency, a source and `agents =
+  ["inbox-router"]`), setup runs `meridian -C <dir> mars remove <key>` with the
   dependency's key. That leaves an empty `mars.toml`, a `mars.lock` and `.mars/`, which
-  install nothing; setup creates no Mars project. Any other `mars.toml` is left alone,
-  and an unreadable one stops setup. While `.mars/agents/inbox-router.md` exists,
-  each launch logs a warning to run setup, and still launches. The daemon never sets the
-  directory up: with no `meridian.toml` there the step fails, and so it does with no
-  OpenCode; the log says so and the item waits.
+  install nothing; setup creates no Mars project. Any other `mars.toml` is left alone, and
+  an unreadable one stops setup. While `.mars/agents/inbox-router.md` exists, each launch
+  logs a warning to run setup, and still launches. The daemon never sets the directory up:
+  with no `meridian.toml` there the step fails, and so it does with no OpenCode; the log
+  says so and the item waits.
 - **The prompt** names the item, says whether the agent may ask, gives the sender, `via`
   and project, lists each kept session by spawn ID with its project, agent, work item,
   activity and the work item's goal, and ends with the text (first 4 KiB) between two
@@ -299,17 +297,18 @@ goal, and whatever the agent reads.
 `~/.config/meridian-comms/config.toml`, mode 0600. The Slack tokens sit beside it in
 `slack.env` ([slack-setup.md](slack-setup.md)), and so does the router's key,
 `OPENCODE_API_KEY`: an API key from the OpenCode Console, which pays for Jev. The daemon
-refuses to start if either file can be read by anyone but the owner. It starts without
-the router's key, and then routes nothing: filed messages wait, and `meridian-comms
-routes` shows each as `off`. It starts with no
-`[sources.meridian]` too, on a machine without Meridian: threads are read and posted,
-nobody is woken, and every message waits and shows in `meridian-comms list`. A
-`[sources.meridian]` that is there is checked when the daemon starts: a Meridian older
-than 0.28.0 (`meridian --version`), a project key that is not its root's Meridian project
-ID, or a root or a `meridian` that can't be asked, stops it with an error that says
-which and what to do. 0.28.0 is the first Meridian with the machine inbox, machine names
-and IDs, and a `kind` on every JSON error, and the source relies on all three. A
-`machine` key, which older builds read, is ignored with a warning.
+refuses to start if either file can be read by anyone but the owner. It starts without the
+router's key, and then routes nothing: filed messages wait, and `meridian-comms routes`
+shows each as `off`. It starts with no `[sources.meridian]` too, on a machine without
+Meridian: threads are read and posted, nobody is woken, and every message waits and shows
+in `meridian-comms list`. A `[sources.meridian]` that is there is checked when the daemon
+starts: a Meridian older than 0.28.1 (`meridian --version`), a project key that is not its
+root's Meridian project ID, or a root or a `meridian` that can't be asked, stops it with
+an error that says which and what to do. 0.28.0 is the first Meridian with the machine
+inbox, machine names and IDs, and a `kind` on every JSON error, and the source relies on
+all three; 0.28.1 is the first that ships the `inbox-router` profile the second step
+starts. One minimum covers both, so a daemon that passes the check can run every step it
+is configured for. A `machine` key, which older builds read, is ignored with a warning.
 
 ```toml
 owner = "jimmy"                  # the person whose agents this daemon wakes
@@ -451,7 +450,7 @@ directory with no `-C`: `--version` and `machine name --json` (once each, at sta
 item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it
 adds `machine list --json` and `--machine <name>` on that listing and that `spawn show`. The second step adds `work show` in a
 candidate's project and, in the router directory, `spawn`, `spawn wait`, `spawn show`
-and `spawn cancel`; `setup router` runs `spawn --dry-run` in an empty temp directory, then `mars remove`, `init` and `spawn --dry-run` there. Rows may carry `agent`, `work_id`,
+and `spawn cancel`; `setup router` runs `--version`, then in the router directory `mars remove`, `init` and `spawn --dry-run`. Rows may carry `agent`, `work_id`,
 `activity` and an `idle` object. `activity` of `turn_active`, `starting` or `finalizing`
 is working; otherwise `idle` is idle with its cache deadline; neither means activity is
 unknown, never cold. `activity` is read first because `idle` means "since the last

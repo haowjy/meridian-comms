@@ -20,8 +20,6 @@ use crate::model::{ActivityState, Candidate, DecideRequest, Decision};
 use crate::paths;
 
 const PROFILE: &str = "inbox-router";
-/// The first Meridian that ships the profile.
-const MIN_MERIDIAN: &str = "0.X.Y";
 /// The keys `mars add` writes for a dependency, besides `agents`.
 const MARS_SOURCE_KEYS: [&str; 4] = ["url", "path", "subpath", "version"];
 /// Minutes: the spawn's own limit and the wait's. The spawn carries its limit
@@ -47,11 +45,11 @@ fn shadow_dir(dir: &Path) -> PathBuf {
 
 /// Creates the router directory, gives it a Meridian project identity, and
 /// checks that this Meridian resolves the profile there. Nothing in the
-/// directory is changed until this Meridian is shown to ship the profile, so
-/// an older one leaves a router that worked still working. Running it again
+/// directory is changed until this Meridian is new enough to ship the profile,
+/// so an older one leaves a router that worked still working. Running it again
 /// changes nothing that is already right.
 pub async fn setup() -> Result<()> {
-    ships_profile().await?;
+    super::check_version("").await.context("setup changed nothing")?;
     let dir = dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     remove_mars_dependency(&dir).await?;
@@ -76,23 +74,6 @@ pub async fn setup() -> Result<()> {
         "It needs OpenCode on this machine, signed in for the model the profile names, unless [inbox.router] in ~/.meridian/config.toml names another."
     );
     Ok(())
-}
-
-/// Whether this Meridian ships the profile: resolved from a new empty
-/// directory, so no package copy can answer for it.
-async fn ships_profile() -> Result<()> {
-    let empty = std::env::temp_dir().join(format!("{PROGRAM}-check-{}-{}", std::process::id(), nonce()));
-    std::fs::create_dir(&empty).with_context(|| format!("cannot create {}", empty.display()))?;
-    let found = resolve_profile(&empty).await;
-    let _ = std::fs::remove_dir_all(&empty);
-    let Err(why) = found else { return Ok(()) };
-    let not_found = format!("Agent '{PROFILE}' not found");
-    let hint = if why.contains(&format!("{not_found}.")) || why.contains(&format!("{not_found} in")) {
-        format!("\nMeridian ships that agent from {MIN_MERIDIAN} on; `meridian --version` shows which this is.")
-    } else {
-        String::new()
-    };
-    bail!("This Meridian can't start the {PROFILE} agent, so setup changed nothing: {why}{hint}")
 }
 
 /// The profile's path as this Meridian resolves it from `dir`, from a dry run
