@@ -148,12 +148,14 @@ impl Listing {
     }
 
     /// The machines of source `src` that did not answer.
+    /// The machines source `src` looked on.
+    fn machines_of(&self, src: usize) -> Vec<Machine> {
+        self.machines.iter().filter(|(i, _)| *i == src).map(|(_, m)| m.clone()).collect()
+    }
+
+    /// The machines source `src` looked on that did not answer.
     fn missing(&self, src: usize) -> Vec<Machine> {
-        self.machines
-            .iter()
-            .filter(|(i, m)| *i == src && !m.ok)
-            .map(|(_, m)| m.clone())
-            .collect()
+        self.machines_of(src).into_iter().filter(|m| !m.ok).collect()
     }
 }
 
@@ -171,10 +173,11 @@ impl Core {
     /// How people see the ref `r`, cleaned for a post: in the words of the
     /// source it belongs to, with the machines of the listing it came from.
     fn show(&self, listing: &Listing, r: &str) -> String {
-        let shown = self.sources.iter().enumerate().find_map(|(i, s)| {
-            let machines: Vec<Machine> = listing.machines.iter().filter(|(j, _)| *j == i).map(|(_, m)| m.clone()).collect();
-            s.show(r, &machines)
-        });
+        let shown = self
+            .sources
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.show(r, &listing.machines_of(i)));
         text::clean(&shown.unwrap_or_else(|| r.to_string()))
     }
 

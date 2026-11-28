@@ -22,7 +22,10 @@ pub struct Candidate {
     #[serde(default)]
     pub names: Vec<String>,
     pub person: String,
-    /// What people call the machine the session runs on, when the source knows it.
+    /// The name of the machine the session runs on, as the source's own
+    /// commands resolve it (for Meridian, the name the machine is saved under
+    /// here), which is also what people are shown. The source builds its
+    /// address for the session from it.
     #[serde(default)]
     pub machine: Option<String>,
     #[serde(default)]
@@ -145,7 +148,8 @@ pub struct Notice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeRequest {
-    /// The candidate as its source listed it.
+    /// The candidate as its source listed it. Serialized, it loses `root`
+    /// (`serde(skip)`): a source in another process must not need it.
     pub to: Candidate,
     pub notice: Notice,
 }

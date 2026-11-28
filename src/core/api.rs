@@ -65,9 +65,12 @@ impl Core {
                 "this agent session can't be named: its environment has no spawn ID or project, so it cannot use meridian-comms"
             )),
             CallerKind::Session => {
-                let source = self.sources.iter().find(|s| Some(s.name()) == id.source.as_deref());
+                let source = self.sources.iter().position(|s| Some(s.name()) == id.source.as_deref());
                 let session = match source {
-                    Some(s) => s.session(id).await?,
+                    Some(i) => {
+                        let machines = self.newest().map(|l| l.machines_of(i)).unwrap_or_default();
+                        self.sources[i].session(id, &machines).await?
+                    }
                     None => None,
                 };
                 let Some(session) = session else {

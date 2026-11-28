@@ -169,8 +169,18 @@ each (`jimyao-pop-os/p41`).
 | any caller but the form, for a word that matched nothing | one listing started after the miss, before the word is reported as matching nothing |
 
 So a handled message waits for a listing only when the newest is over 15 s old: in a busy
-thread, most messages, at 8 to 11 s each on a Raspberry Pi asking one other machine. The
-worst case is two fan-outs, the one running and the next. A retry comes 30 s after the
+thread, most messages, at 8 to 11 s each on a Raspberry Pi asking one other machine.
+
+The worst case is four fan-outs, all while the thread's lock is held. The message's own
+listing can mean waiting out the one running and then the next. A `to:` word that
+matches nothing then needs one more listing that started after the miss, which can again
+mean the one running and the next. On the Pi with every machine up, that is at most
+about 36 s before the wakes start. A machine that hangs makes each fan-out its full
+per-machine limit, about 15 s (2.5 s of `machine list` plus 12 s). The code caps each of
+the two waits at 75 s, and the wakes, which run at once, at 100 s, so a handled
+message takes at most about 250 s. `send --to`'s 300 s on the client covers that.
+
+A retry comes 30 s after the
 attempt it repeats, so it never reuses the listing that attempt failed on. Up to 15 s
 old, a default agent that just started isn't woken (the message is filed), and a scoped
 session that just ended gets a wake that fails as `not_running`, named in the thread.
@@ -611,10 +621,13 @@ its project ID (`MERIDIAN_PROJECT_ID`, else `meridian context --json` in
 (`MERIDIAN_MACHINE_ID`, else `meridian machine name --json`, cached per `MERIDIAN_HOME`
 in the state directory's `machine-ids.json`, written whole). The daemon's source turns
 it into a session (`Source::session`): a ref, how it is shown, and the person. A child
-spawn may read but not post; a session whose project is not in the config is refused
-with what to add and where; a machine that is neither this one nor saved is
-`unknown_machine`, and the client claims once more without its cache, in case the
-machine's ID changed. A process with no Meridian variables is the owner at a terminal.
+spawn may read but not post. A session whose project is not in the config is refused
+with what to add and where; one in an ad-hoc project (an ID that names a folder on one
+machine) is told to give the project an ID first, since no key can name it. The daemon
+looks the claimed machine up in the newest listing's machines and runs `machine list`
+(2.5 s on the Pi) only for an ID that isn't there. A machine that is neither this one
+nor saved is `unknown_machine`, and the client claims once more without its cache, in
+case the machine's ID changed. A process with no Meridian variables is the owner at a terminal.
 A claim from an older client, with no machine, is taken as this machine's. Requests go over a Unix socket (mode 0600, peer uid checked) as one JSON
 object each way (`src/proto.rs`). On a machine whose config has `[bot]`, the same
 request goes over SSH instead (`src/bridge.rs`): the client runs `ssh <options> --

@@ -373,7 +373,10 @@ impl Core {
     /// A ref the listing lacks: gone, unless its machine or source did not answer.
     pub(super) fn missing(&self, listing: &Listing, r: &str) -> String {
         let shown = self.show(listing, r);
-        if self.unchecked(listing, r) {
+        if !listing.failed.is_empty() {
+            let failed: Vec<&str> = listing.failed.iter().map(|i| self.sources[*i].name()).collect();
+            format!("`{shown}`: not checked (listing {} sessions failed)", failed.join(" and "))
+        } else if self.unchecked(listing, r) {
             format!("`{shown}`: not checked (its machine did not answer)")
         } else {
             format!("`{shown}`: no longer running")

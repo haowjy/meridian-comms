@@ -730,7 +730,7 @@ impl Source for Meridian {
 
     /// A session here, or on a machine Meridian saved here: anything else
     /// is a session no wake from here could reach.
-    async fn session(&self, caller: &IdentifyResult) -> Result<Option<Session>> {
+    async fn session(&self, caller: &IdentifyResult, machines: &[Machine]) -> Result<Option<Session>> {
         if caller.source.as_deref() != Some(self.name()) {
             return Ok(None);
         }
@@ -741,6 +741,16 @@ impl Source for Meridian {
                 "the client named no project or spawn ID: it and the daemon are different builds (restart the daemon)"
             ))
         };
+        if !is_project_id(project) {
+            bail!(Failure::new(
+                FailKind::NotAllowed,
+                format!(
+                    "this session's project has no ID of its own ({project} names a folder on one machine), so the bot can't be set up for it: give the project an ID with `[project] id = \"…\"` in its meridian.toml, then add [sources.meridian.projects.<that ID>] to {} on {} and restart the daemon",
+                    config.display(),
+                    self.machine
+                )
+            ))
+        }
         if !self.projects.contains_key(project) {
             bail!(Failure::new(
                 FailKind::NotAllowed,
@@ -753,8 +763,15 @@ impl Source for Meridian {
         }
         // A client older than machine IDs runs here.
         let machine = caller.machine.as_deref().unwrap_or(&self.id);
+        let listed = machines
+            .iter()
+            .find(|m| m.id.as_deref() == Some(machine))
+            .and_then(|m| m.name.clone());
         let name = if machine == self.id {
             self.machine.clone()
+        } else if let Some(name) = listed {
+            // Saved when the newest listing ran: `machine list` costs seconds.
+            name
         } else {
             let saved = self
                 .saved_machines()

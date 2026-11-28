@@ -51,7 +51,8 @@ pub trait Source: Send + Sync {
     /// The session this source's claim reported, checked: `None` when the
     /// claim is another source's. An error says why it can't be named, as a
     /// `Failure`: a session no `wake` could reach must never be stored.
-    async fn session(&self, caller: &IdentifyResult) -> Result<Option<Session>>;
+    /// `machines`: what the newest listing of this source looked on, if any.
+    async fn session(&self, caller: &IdentifyResult, machines: &[Machine]) -> Result<Option<Session>>;
 
     /// What people call the machine this source runs on. Known after `check`.
     fn machine(&self) -> Option<&str> {
