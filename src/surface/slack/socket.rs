@@ -6,22 +6,24 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{BUTTON, MENU, MENU_BLOCK, Slack, web::Token};
-use crate::model::{Action, Sender, SurfaceEvent};
+use super::{BUTTON, MENU, MENU_BLOCK, Slack, form, web::Token};
+use crate::model::{Action, Interacted, Sender, SurfaceEvent};
 
 /// Slack pings about every 30 s; no frame for this long means a dead link.
 const SILENCE: Duration = Duration::from_secs(120);
 
-pub async fn run(slack: &Slack, tx: mpsc::Sender<SurfaceEvent>) {
+pub async fn run(slack: &Slack, tx: mpsc::Sender<SurfaceEvent>, asks: mpsc::Sender<Interacted>) {
     let mut backoff = Duration::from_secs(1);
     let mut first = true;
     loop {
-        match session(slack, &tx, &mut first).await {
+        match session(slack, &tx, &asks, &mut first).await {
             Ok(true) => backoff = Duration::from_secs(1),
             Ok(false) => {}
             Err(e) => tracing::warn!("socket mode: {e:#}"),
@@ -35,14 +37,23 @@ pub async fn run(slack: &Slack, tx: mpsc::Sender<SurfaceEvent>) {
 }
 
 /// One connection. `Ok(true)` when it got as far as `hello`.
-async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, first: &mut bool) -> Result<bool> {
+async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, asks: &mpsc::Sender<Interacted>, first: &mut bool) -> Result<bool> {
     let open = slack.web.form(Token::App, "apps.connections.open", &[]).await?;
     let url = open["url"].as_str().context("apps.connections.open gave no url")?;
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("websocket connect failed")?;
     let (mut sink, mut stream) = ws.split();
     let mut hello = false;
+    // Acknowledgements that carry an answer, each finishing on its own.
+    let mut answers = FuturesUnordered::new();
     loop {
-        let frame = match tokio::time::timeout(SILENCE, stream.next()).await {
+        let frame = tokio::select! {
+            Some(ack) = answers.next(), if !answers.is_empty() => {
+                sink.send(Message::text(ack)).await?;
+                continue;
+            }
+            frame = tokio::time::timeout(SILENCE, stream.next()) => frame,
+        };
+        let frame = match frame {
             Err(_) => bail!("no frame for {}s, reconnecting", SILENCE.as_secs()),
             Ok(None) => return Ok(hello),
             Ok(Some(f)) => f?,
@@ -63,6 +74,10 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, first: &mut boo
                 continue;
             }
         };
+        if let (Some(id), Some((kind, interaction))) = (v["envelope_id"].as_str(), form::parse(&v)) {
+            answers.push(answer(slack, asks, id.to_string(), kind, interaction));
+            continue;
+        }
         if let Some(id) = v["envelope_id"].as_str() {
             sink.send(Message::text(json!({ "envelope_id": id }).to_string())).await?;
         }
@@ -91,6 +106,11 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, first: &mut boo
             }
             Some("disconnect") => {
                 tracing::info!("slack asked us to reconnect ({})", v["reason"].as_str().unwrap_or("no reason"));
+                // The link still works for a few seconds: the answers held for
+                // acknowledgement go out first, each due within 3 s anyway.
+                while let Some(ack) = answers.next().await {
+                    sink.send(Message::text(ack)).await?;
+                }
                 return Ok(hello);
             }
             Some("events_api") => {
@@ -110,6 +130,22 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, first: &mut boo
             _ => {}
         }
     }
+}
+
+/// The acknowledgement of an interaction's envelope, with the core's answer
+/// in it: due within Slack's 3 s of the envelope's arrival.
+async fn answer(slack: &Slack, asks: &mpsc::Sender<Interacted>, id: String, kind: form::Kind, i: crate::model::Interaction) -> String {
+    let deadline = Instant::now() + form::ACK_WITHIN;
+    let (tx, rx) = oneshot::channel();
+    let response = match asks.send((i, tx)).await {
+        Ok(()) => tokio::time::timeout_at(deadline, rx).await.ok().and_then(Result::ok),
+        Err(_) => None,
+    };
+    let mut ack = json!({ "envelope_id": id });
+    if let Some(p) = form::ack(slack, kind, response, deadline).await {
+        ack["payload"] = p;
+    }
+    ack.to_string()
 }
 
 fn action(p: &Value) -> Option<Action> {

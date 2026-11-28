@@ -7,12 +7,14 @@ mod cursor;
 mod deliver;
 mod events;
 mod filing;
+mod form;
+mod online;
 mod route;
 mod text;
 
 pub use text::candidate_line;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::config::Config;
 use crate::jev::Jev;
-use crate::model::{Candidate, FailKind, Failure, ListRequest, SurfaceEvent, WakeRequest, WakeResult};
+use crate::model::{Candidate, FailKind, Failure, ListRequest, Msg, SurfaceEvent, WakeRequest, WakeResult};
 use crate::routes;
 use crate::source::Source;
 use crate::state::Store;
@@ -62,6 +64,8 @@ pub struct Core {
     filing: tokio::sync::RwLock<()>,
     /// One second step at a time: each starts an agent.
     second: tokio::sync::Semaphore,
+    snapshots: online::Snapshots,
+    forms: form::Sent,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -172,6 +176,8 @@ impl Core {
             routing,
             filing: tokio::sync::RwLock::default(),
             second: tokio::sync::Semaphore::new(1),
+            snapshots: online::Snapshots::default(),
+            forms: form::Sent::default(),
         }))
     }
 
@@ -255,6 +261,26 @@ impl Core {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => failed(format!("{e:#}")),
             Err(_) => failed("timed out".into()),
+        }
+    }
+
+    /// The directory name of whoever wrote `m`, with `authors` from its
+    /// thread's file: a post the bot made for a person is that person's.
+    fn author(&self, authors: &BTreeMap<String, String>, m: &Msg) -> Option<String> {
+        if m.sender.id == self.bot {
+            return authors.get(&m.id).cloned();
+        }
+        self.cfg.person_by_slack(&m.sender.id).map(|(n, _)| n.clone())
+    }
+
+    /// The `authors` of a thread's file; none without a readable file.
+    fn authors(&self, conversation: &str, thread: &str) -> BTreeMap<String, String> {
+        match self.store.load_thread(conversation, thread) {
+            Ok(st) => st.map(|st| st.authors).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!("cannot read the thread file of {conversation}/{thread}: {e:#}");
+                BTreeMap::new()
+            }
         }
     }
 

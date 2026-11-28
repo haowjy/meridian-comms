@@ -725,6 +725,10 @@ impl Source for Meridian {
         Ok(())
     }
 
+    fn machine(&self) -> Option<&str> {
+        Some(self.machine.as_str()).filter(|m| !m.is_empty())
+    }
+
     fn ref_start(&self) -> Option<RefStart> {
         let start = |name: &String| format!("{name}/");
         Some(RefStart {

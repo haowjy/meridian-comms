@@ -1,6 +1,7 @@
 //! Slack, hand-rolled: Socket Mode for events, the Web API for everything else.
 //! Every post uses the bot token; the app has no user token.
 
+mod form;
 mod socket;
 mod web;
 
@@ -11,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::Surface;
-use crate::model::{FailKind, Failure, Menu, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
+use crate::model::{FailKind, Failure, Interacted, Menu, MenuGroup, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
 use web::{Token, Web};
 
 /// Ids of the picker's blocks and elements; the click reads the menu's choice
@@ -134,12 +135,10 @@ fn plain(s: &str, max: usize) -> Value {
     json!({"type": "plain_text", "text": fit(s, max), "emoji": false})
 }
 
-/// The menu as a select element. Slack takes a multi-select as a section's accessory
-/// but not inside an `actions` block. Options whose value is too long are left out
-/// (they stay in the text), and so are groups left empty by that.
-fn menu_select(menu: &Menu) -> Option<Value> {
-    let groups: Vec<Value> = menu
-        .groups
+/// Menu groups as a select's `option_groups`. Options whose value is too long
+/// are left out (they stay in the text), and so are groups left empty by that.
+fn option_groups(groups: &[MenuGroup]) -> Vec<Value> {
+    groups
         .iter()
         .filter_map(|g| {
             let options: Vec<Value> = g
@@ -152,7 +151,13 @@ fn menu_select(menu: &Menu) -> Option<Value> {
             (!options.is_empty()).then(|| json!({"label": plain(&g.label, MAX_LABEL), "options": options}))
         })
         .take(MAX_GROUPS)
-        .collect();
+        .collect()
+}
+
+/// The menu as a select element. Slack takes a multi-select as a section's accessory
+/// but not inside an `actions` block.
+fn menu_select(menu: &Menu) -> Option<Value> {
+    let groups = option_groups(&menu.groups);
     (!groups.is_empty()).then(|| {
         json!({"type": "multi_static_select", "action_id": MENU, "option_groups": groups,
                "placeholder": plain("Sessions to wake", MAX_LABEL)})
@@ -167,8 +172,8 @@ fn ts_time(ts: &str) -> DateTime<Utc> {
 
 #[async_trait]
 impl Surface for Slack {
-    async fn run(&self, events: mpsc::Sender<SurfaceEvent>) {
-        socket::run(self, events).await
+    async fn run(&self, events: mpsc::Sender<SurfaceEvent>, interactions: mpsc::Sender<Interacted>) {
+        socket::run(self, events, interactions).await
     }
 
     async fn post(&self, req: PostRequest) -> Result<Posted> {
@@ -197,6 +202,16 @@ impl Surface for Slack {
             body["blocks"] = json!([{"type": "rich_text", "elements": [
                 {"type": "rich_text_section", "elements": [{"type": "text", "text": req.text}]}
             ]}]);
+        }
+        if let Some(by) = &req.by {
+            // The name above the text; `text` stays the person's words alone,
+            // which is what `read` gives as theirs.
+            let mut blocks = vec![json!({"type": "context", "elements": [plain(&format!("{by}, with /agent:"), SECTION_TEXT)]})];
+            match body["blocks"].as_array() {
+                Some(b) => blocks.extend(b.iter().cloned()),
+                None => blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": fit(&text, SECTION_TEXT)}})),
+            }
+            body["blocks"] = json!(blocks);
         }
         if let Some(menu) = &req.menu
             && let Some(select) = menu_select(menu)

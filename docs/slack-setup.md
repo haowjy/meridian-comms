@@ -21,7 +21,14 @@ invited to.
     "description": "Hands Slack messages to Jimmy's running agent sessions, and posts their answers."
   },
   "features": {
-    "bot_user": { "display_name": "jimmy-agents", "always_online": true }
+    "bot_user": { "display_name": "jimmy-agents", "always_online": true },
+    "slash_commands": [
+      {
+        "command": "/agent",
+        "description": "Message one of Jimmy's agent sessions in a new thread",
+        "should_escape": false
+      }
+    ]
   },
   "oauth_config": {
     "scopes": {
@@ -31,6 +38,7 @@ invited to.
         "groups:history",
         "groups:read",
         "chat:write",
+        "commands",
         "reactions:write"
       ]
     }
@@ -54,7 +62,23 @@ What each scope is for:
 | `channels:history`, `groups:history` | Message events, and reading a thread or a channel's recent messages (`read`, recovery) in public and private channels |
 | `channels:read`, `groups:read` | Checking at startup whether a configured channel is shared with another organization |
 | `chat:write` | Posting in threads the bot is in |
+| `commands` | The `/agent` command, which opens the form for starting a thread for one session |
 | `reactions:write` | The 👀 reaction on a message that woke someone |
+
+Under Socket Mode the command has no request URL, and the form's session list needs no
+options URL: both arrive over the same connection, with interactivity on.
+
+### An app made before `/agent`
+
+The manifest above adds the `commands` scope and the `/agent` command. For an app that
+already exists:
+
+1. Open the app at <https://api.slack.com/apps>, choose **App Manifest**, and replace it
+   with what `meridian-comms setup` prints now; or add the `commands` scope under
+   **OAuth & Permissions** and create `/agent` under **Slash Commands** by hand.
+2. Slack asks to reinstall the app for the new scope: under **Install App**, reinstall it.
+   The bot token normally stays the same; if Slack shows a new one, put it in `slack.env`.
+3. Restart the daemon with a build that has the form.
 
 ## 2. Make the app-level token
 

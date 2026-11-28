@@ -34,6 +34,11 @@ pub trait Source: Send + Sync {
     /// `None` when the two are not a session this source would list.
     fn session_ref(&self, project: &str, session: &str) -> Option<String>;
 
+    /// The machine whose sessions `list` gives and `wake` reaches, by the name
+    /// this source's refs carry. Known after `check`.
+    fn machine(&self) -> Option<&str> {
+        None
+    }
     /// Whether `word` is the ref of a session this source can list and never
     /// wakes, because it runs on another machine.
     async fn elsewhere(&self, _word: &str) -> bool {

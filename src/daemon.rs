@@ -95,7 +95,9 @@ pub async fn run() -> Result<()> {
     let core = Core::new(cfg, surface.clone(), sources, store, who.bot, jev, routes)?;
 
     let (tx, rx) = mpsc::channel(4096);
-    tokio::spawn(async move { surface.run(tx).await });
+    let (asks, asked) = mpsc::channel(256);
+    tokio::spawn(async move { surface.run(tx, asks).await });
+    tokio::spawn(core.clone().serve_interactions(asked));
     let server = core.clone();
     tokio::spawn(async move { serve(server, listener).await });
     tracing::info!("meridian-comms daemon up, socket {}", paths::socket_path().display());

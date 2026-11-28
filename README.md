@@ -9,6 +9,13 @@ or gone cold. Reply `to: p41`, and that session gets a one-line notice, reads th
 itself, and answers there. Later messages in the thread go to the same session. Agents
 can start threads and hand work to each other the same way, with `meridian-comms send`.
 
+To start a thread for one session without the picker, type `/agent` in a channel the bot
+is set up for. A form opens: the session field lists the sessions running on the bot's
+machine as you type (the form names that machine), and a message box. Send it, and the
+bot opens a thread in the channel with your message, under your name, and wakes the
+session you chose. Reply in that thread as usual, `to:` included: Slack doesn't allow
+slash commands in threads, so the form only starts one.
+
 It is built for [Meridian](https://github.com/haowjy/meridian-cli) sessions (Claude Code,
 Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meridian. It
 needs Meridian 0.28.1 or later (`meridian --version`): the daemon and `setup router`
