@@ -128,11 +128,7 @@ it exclusively once before it looks for the item's thread, so it never looks too
 
 **It is routed, when the router is on:** the config has a `[router]` section and the
 daemon has `OPENCODE_API_KEY` ([Config](#config)). Otherwise each `route` is logged as
-`off` and the message waits. Filing and routing need Meridian 0.28 or later. The daemon
-asks at start whether Meridian has the `inbox` command; on one without it the daemon
-says so once in its log, files and routes nothing, and each message waits as `pending`
-and shows in `meridian-comms list`.
-`meridian-comms route [ITEM]` is a thin client:
+`off` and the message waits. `meridian-comms route [ITEM]` is a thin client:
 it hands the item to the daemon and exits when the daemon has accepted it. Run as
 Meridian's hook it reads the item from `MERIDIAN_INBOX_MESSAGE_ID` (the source's
 `routed_item` knows the variable; the client does not):
@@ -290,14 +286,15 @@ the router's key, and then routes nothing: filed messages wait, and `meridian-co
 routes` shows each as `off`. It starts with no
 `[sources.meridian]` too, on a machine without Meridian: threads are read and posted,
 nobody is woken, and every message waits and shows in `meridian-comms list`. A
-`[sources.meridian]` that is there is checked when the daemon starts: a project key that
-is not its root's Meridian project ID, or a root or a `meridian` that can't be asked,
-stops it with an error that says which.
+`[sources.meridian]` that is there is checked when the daemon starts: a Meridian older
+than 0.28.0 (`meridian --version`), a project key that is not its root's Meridian project
+ID, or a root or a `meridian` that can't be asked, stops it with an error that says
+which and what to do. 0.28.0 is the first Meridian with the machine inbox, machine names
+and IDs, and a `kind` on every JSON error, and the source relies on all three. A
+`machine` key, which older builds read, is ignored with a warning.
 
 ```toml
 owner = "jimmy"                  # the person whose agents this daemon wakes
-machine = "desk"                 # optional; default: the hostname. Starts every ref only
-                                 # where Meridian has no name for the machine (before 0.28).
 
 [surface.slack.channels.C0123ABCD]   # the channel's Slack ID
 name = "meridian-cli"                # the name in message refs
@@ -423,8 +420,15 @@ without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
-`spawn message` and, at start, `context --json`. For the machine it runs in the home
-directory with no `-C`: `machine name --json` (once, at start), `spawn list --global --primary --json`,
+`message <spawn-id> <line> --wake --json` for a message notice (`--wake` because Meridian
+holds a message to a cold session without it, and a message notice goes only to a session
+the rule or a person chose), and the same without `--wake` for a release notice, which
+nobody chose: Meridian refuses it for a cold session (kind `cold`, nothing sent), and
+that session simply gets no more of the thread's messages
+and, at start, `context --json`. A wake reads the error's kind: `not_running` or
+`not_found` is a session that is gone, `maybe_delivered` a notice that may have arrived
+(reported as not woken, so the message still waits), anything else a failed wake. For the machine it runs in the home
+directory with no `-C`: `--version` and `machine name --json` (once each, at start), `spawn list --global --primary --json`,
 `message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
 item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it
 adds `machine list --json` and `--machine <name>` on that listing and that `spawn show`. The second step adds `work show` in a
@@ -443,18 +447,13 @@ A ref is `machine/project/spawn-id`. The machine is the name Meridian gives this
 `meridian machine name --json` is asked once when the daemon starts, for the name, the
 machine's ID and the names it had before (`was`), and the name is kept for the daemon's
 life, so a `meridian machine rename` while it runs changes no ref and stops no wake.
-Where Meridian's `machine` command exists and can't answer, the daemon does not start
-and says why. A build whose `machine name` has no `--json` gives the name alone, and on
-a Meridian before 0.28 the name is the config's `machine`. Only the daemon composes
+When it can't answer, the daemon does not start and says why. Only the daemon composes
 refs: the client reports the project and spawn ID it reads from its environment.
 
 At each start the daemon rewrites the refs in its thread files (`scope`, `woken` and
-`pending`) that start with a name this machine no longer has, so a thread keeps the
-sessions it chose through a rename. The old names are every name in `was`, the config's
-`machine`, and the start recorded in `ref-starts.json` in the state directory, which is
-written after the rewrite. `was` covers a rename while the daemon was stopped, and
-threads a killed daemon left at an older name. The record covers what Meridian can't
-tell: a rename on a build without `--json`, and a config `machine` that was changed.
+`pending`) that start with a name in `was`, so a thread keeps the sessions it chose
+through a rename while the daemon was stopped, and threads a killed daemon left at an
+older name.
 
 For an offer the Meridian source also lists the primaries of every machine Meridian has
 saved (`meridian machine list`): one `spawn list --global --primary --json --machine M`
@@ -480,20 +479,21 @@ does. Neither: the sender is on a machine that is not saved, which lists no cand
 and its chat ID is not looked up, since here it would name some other session. An item
 with no `machine_id` is read by its `machine` name the same way, own names first: a
 name this machine has or had is here, a saved machine's name is there, any other name
-is no candidate, and no name at all is looked up here. On a Meridian that does not tell
-this machine's ID, a sender that is on no saved machine is looked up here.
+is no candidate, and no name at all is looked up here.
 
-Only Meridian's "not found" for the chat means the sender is gone. Any other failure
-fails the routing and the item waits: the sender's machine can't be reached or is too
-old, its shell finds no `meridian`, or `machine list` can't be read. Read as "no
-sender", each would leave the sender among the candidates whenever the listing, a
-moment later, reaches its machine, and it could be offered its own message; a waiting
+Only Meridian's kind `not_found` means the sender is gone: the chat is not there, or no
+machine is saved under the name. Meridian gives it at the top of the error here and
+inside `error` through `--machine`. Any other kind, `failed` included, fails the routing
+and the item waits: the sender's machine can't be reached (`unreachable`) or is too old
+(`version`), its shell finds no `meridian` (`failed`), or `machine list` can't be read.
+Read as "no sender", each would leave the sender among the candidates whenever the
+listing, a moment later, reaches its machine, and it could be offered its own message; a waiting
 item costs only a later `meridian-comms route`. The listing, by contrast, reads a failed
 `machine list` as no saved machines, since a missing candidate offers nobody a wrong
 message. Two cases still let a sender through:
 
-- A live chat issued before Meridian's machine-wide IDs: `spawn show` answers "not
-  found" for it, so its session can be offered its own message. This fades as those
+- A live chat issued before Meridian's machine-wide IDs: `spawn show` answers `not_found`
+  for it, so its session can be offered its own message. This fades as those
   sessions end.
 - This machine's ID is read once at start. If `machine.json` is replaced while the
   daemon runs, items carry an ID that is neither this machine's nor a saved one, so
@@ -520,7 +520,7 @@ the daemon in JSON.
 Waking across machines would be the first change to store another machine's ref in a
 thread (`scope`, `woken`, `pending.picks`). Every stored ref is this machine's today,
 and the start's rewrite depends on it: Meridian lets a machine be saved under a name
-this one used to have, or under the config's `machine`, and the rewrite would turn
+this one used to have, and the rewrite would turn
 that machine's refs into this machine's at every start. That change must leave the
 saved machines' current names out of the old names, or store the machine ID beside
 each ref. A ref stored by a saved machine's name is also orphaned when that machine is

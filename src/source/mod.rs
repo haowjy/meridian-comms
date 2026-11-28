@@ -44,9 +44,9 @@ pub trait Source: Send + Sync {
     async fn check(&mut self) -> Result<()> {
         Ok(())
     }
-    /// After `check`: what this source's refs start with. The daemon records
-    /// it, and when it changes rewrites the refs its threads hold, so a thread
-    /// keeps the sessions it chose.
+    /// After `check`: what this source's refs start with, now and before.
+    /// The daemon rewrites the refs its threads hold from each earlier start,
+    /// so a thread keeps the sessions it chose.
     fn ref_start(&self) -> Option<RefStart> {
         None
     }

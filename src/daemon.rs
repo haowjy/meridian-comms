@@ -34,6 +34,12 @@ pub async fn run() -> Result<()> {
     let cfg = Config::load()?;
     config::check_private(&config::config_path())?;
     let tokens = Tokens::load()?;
+    if cfg.machine.is_some() {
+        tracing::warn!(
+            "the config's `machine` is no longer read: refs start with Meridian's name for this machine (`meridian machine name`). Remove it from {}",
+            config::config_path().display()
+        );
+    }
     if cfg.surface.slack.is_none() {
         bail!("config has no [surface.slack] section: this build holds a bot only");
     }
@@ -79,7 +85,7 @@ pub async fn run() -> Result<()> {
     // After the bind too: only the one daemon rewrites its threads' refs.
     for s in &sources {
         if let Some(start) = s.ref_start() {
-            let threads = store.settle_refs(s.name(), &start)?;
+            let threads = store.settle_refs(&start)?;
             if threads > 0 {
                 tracing::info!("{} names its sessions {}… now: {threads} thread(s) updated", s.name(), start.now);
             }
