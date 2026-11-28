@@ -420,8 +420,11 @@ without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
-`message <spawn-id> <line> --wake --json` (`--wake` because Meridian holds a message to a
-cold session without it, and a wake goes only to a session the rule or a person chose)
+`message <spawn-id> <line> --wake --json` for a message notice (`--wake` because Meridian
+holds a message to a cold session without it, and a message notice goes only to a session
+the rule or a person chose), and the same without `--wake` for a release notice, which
+nobody chose: Meridian refuses it for a cold session (kind `cold`, nothing sent), and
+that session simply gets no more of the thread's messages
 and, at start, `context --json`. A wake reads the error's kind: `not_running` or
 `not_found` is a session that is gone, `maybe_delivered` a notice that may have arrived
 (reported as not woken, so the message still waits), anything else a failed wake. For the machine it runs in the home

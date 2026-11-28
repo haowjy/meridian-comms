@@ -577,9 +577,17 @@ impl Source for Meridian {
         let (project, id) = self
             .parse_ref(&req.ref_)
             .with_context(|| format!("{} is not a Meridian ref", req.ref_))?;
-        // `--wake`: the wake rule already chose this session, cache warm or not,
-        // and without it Meridian holds a cold one.
-        let out = run(Some(&self.projects[project].root), &["message", id, &line(req), "--wake", "--json"]).await?;
+        // A message notice goes to a session the rule or a person chose, so it
+        // passes `--wake`, cache warm or not. A release notice was chosen by
+        // nobody: without `--wake` Meridian refuses a cold session (kind `cold`,
+        // nothing sent) rather than pay a cold read to say there is nothing to do.
+        let line = line(req);
+        let mut args = vec!["message", id, &line];
+        if req.notice.kind == NoticeKind::Message {
+            args.push("--wake");
+        }
+        args.push("--json");
+        let out = run(Some(&self.projects[project].root), &args).await?;
         let error = answer(&out)?.err().map(|kind| {
             let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
             (kind, field(&v["error"]["text"]).unwrap_or_default())
