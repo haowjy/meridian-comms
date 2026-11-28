@@ -214,36 +214,16 @@ impl Store {
             .collect()
     }
 
-    /// Makes every stored ref of `source` start the way the source starts
-    /// them now, and records that start. A source names its sessions anew (a
+    /// Makes every stored ref that starts the way a source's refs started
+    /// before start the way they do now. A source names its sessions anew (a
     /// machine is renamed) and a thread keeps the sessions it chose. Run
     /// before any message is handled. Gives the threads changed.
-    ///
-    /// A ref is rewritten from any start the source says it had and from the
-    /// recorded one: the record is what covers a source that can't say. It is
-    /// written last, so a daemon killed part-way rewrites the rest at its
-    /// next start, and a ref already rewritten no longer matches.
-    pub fn settle_refs(&self, source: &str, start: &RefStart) -> Result<usize> {
-        let path = self.dir.join("ref-starts.json");
-        let mut recorded: BTreeMap<String, String> = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let old: Vec<&String> = start
-            .earlier
-            .iter()
-            .chain(recorded.get(source))
-            .filter(|o| **o != start.now)
-            .collect();
-        let changed = match old.is_empty() {
-            true => 0,
-            false => self.rename_refs(&old, &start.now)?,
-        };
-        if recorded.get(source) != Some(&start.now) {
-            recorded.insert(source.to_string(), start.now.clone());
-            write_atomic(&path, &serde_json::to_vec_pretty(&recorded)?)?;
+    pub fn settle_refs(&self, start: &RefStart) -> Result<usize> {
+        let old: Vec<&String> = start.earlier.iter().filter(|o| **o != start.now).collect();
+        if old.is_empty() {
+            return Ok(0);
         }
-        Ok(changed)
+        self.rename_refs(&old, &start.now)
     }
 
     fn rename_refs(&self, old: &[&String], new: &str) -> Result<usize> {

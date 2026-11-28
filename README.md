@@ -10,9 +10,9 @@ itself, and answers there. Later messages in the thread go to the same session. 
 can start threads and hand work to each other the same way, with `meridian-comms send`.
 
 It is built for [Meridian](https://github.com/haowjy/meridian-cli) sessions (Claude Code,
-Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meridian.
-Waking sessions works with any current Meridian. Filing a message nobody was woken for,
-and the router, need Meridian 0.28 or later.
+Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meridian. It
+needs Meridian 0.28.0 or later (`meridian --version`), and the daemon refuses to start
+with an older one.
 
 **Status:** early. One Slack bot per person, with its daemon on one machine. The router
 can offer a filed message to a session on another machine Meridian has saved
@@ -52,7 +52,8 @@ meridian-comms setup router                        install the agent the router 
 
 ## Setup
 
-1. `cargo install --path .`
+1. `cargo install --path .`, and Meridian 0.28.0 or later
+   (`uv tool install --upgrade meridian-cli`).
 2. Create the Slack app: [docs/slack-setup.md](docs/slack-setup.md).
 3. Write `~/.config/meridian-comms/config.toml` (mode 0600): the owner, the channels, the
    people, and the Meridian projects. The fields are in [docs/design.md](docs/design.md).
@@ -63,8 +64,7 @@ meridian-comms setup router                        install the agent the router 
 
 Without these steps the bot works as above and a message nobody was woken for waits.
 
-1. Run Meridian 0.28 or later (`meridian --version`).
-2. Have Meridian tell the daemon about each new inbox message. Add to
+1. Have Meridian tell the daemon about each new inbox message. Add to
    `~/.meridian/config.toml`:
 
    ```toml
@@ -74,18 +74,18 @@ Without these steps the bot works as above and a message nobody was woken for wa
    command = "meridian-comms route"
    ```
 
-3. Put `OPENCODE_API_KEY=...` in `~/.config/meridian-comms/slack.env`, beside the Slack
+2. Put `OPENCODE_API_KEY=...` in `~/.config/meridian-comms/slack.env`, beside the Slack
    tokens. It is an API key from the OpenCode Console, and pays for the model that picks
    a session.
-4. Add a `[router]` section to `config.toml`. Empty is enough; its three settings and
+3. Add a `[router]` section to `config.toml`. Empty is enough; its three settings and
    their defaults are in [docs/design.md](docs/design.md#config).
-5. Install the agent the router asks when the model is unsure:
+4. Install the agent the router asks when the model is unsure:
    `meridian-comms setup router --package <path to meridian-base>`, with the
    `meridian-base` directory of a checkout of Meridian's prompts. Until those prompts are
    released, the default package does not have the agent. It runs on OpenCode, which
    must be installed and signed in on this machine.
-6. Restart the daemon.
-7. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
+5. Restart the daemon.
+6. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
    router did with it.
 
 How it works and why: [docs/design.md](docs/design.md).

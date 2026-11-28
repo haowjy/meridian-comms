@@ -10,8 +10,10 @@ use crate::paths;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub owner: String,
+    /// No longer read: refs start with Meridian's name for the machine. Kept
+    /// so the daemon can say so to a config that still sets it.
     #[serde(default)]
-    machine: Option<String>,
+    pub machine: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub surface: Surfaces,
     #[serde(default)]
@@ -143,14 +145,6 @@ impl Config {
     }
 
     fn finish(&mut self) -> Result<()> {
-        if self.machine.is_none() {
-            let host = gethostname::gethostname().to_string_lossy().into_owned();
-            self.machine = Some(host.split('.').next().unwrap_or("local").to_string());
-        }
-        let machine = self.machine();
-        if !is_id(machine) {
-            bail!("machine name {machine:?} must be 1 to 64 characters from A-Z a-z 0-9 . _ - and not start with '-'");
-        }
         if !self.people.contains_key(&self.owner) {
             bail!("owner {:?} has no [people.{}] entry", self.owner, self.owner);
         }
@@ -175,10 +169,6 @@ impl Config {
             bail!("router.floor is {}: it is a probability, from 0 to 1", r.floor);
         }
         Ok(())
-    }
-
-    pub fn machine(&self) -> &str {
-        self.machine.as_deref().unwrap_or("local")
     }
 
     pub fn channels(&self) -> impl Iterator<Item = (&String, &Channel)> {

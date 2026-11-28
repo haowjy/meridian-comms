@@ -34,28 +34,19 @@ const MACHINE_TIMEOUT: Duration = Duration::from_secs(8);
 const PROGRAM: &str = "meridian-comms";
 
 pub struct Meridian {
-    /// What every ref to a session here starts with, for the daemon's life:
-    /// the config's `machine` until `check` asks Meridian for its own name.
-    /// A rename in Meridian while the daemon runs changes nothing here.
+    /// Meridian's name for this machine, which every ref to a session here
+    /// starts with: asked by `check` once, so a rename in Meridian while the
+    /// daemon runs changes nothing here. Empty in the client, which composes
+    /// no refs.
     machine: String,
-    /// The config's `machine`: what refs started with before Meridian named
-    /// its machines.
-    configured: String,
     /// The names Meridian says this machine had before.
     was: Vec<String>,
     /// This machine's ID, which no rename changes: what an inbox item's
-    /// sender carries. `None` on a Meridian that does not tell it.
-    id: Option<String>,
+    /// sender carries.
+    id: String,
     owner: String,
     default: Option<String>,
     projects: BTreeMap<String, Project>,
-    /// Whether this Meridian saves other machines (its `machine` command):
-    /// learnt by `check`, like `inbox`.
-    machines: bool,
-    /// Whether this Meridian has the machine inbox, by its `inbox` command and
-    /// not its version: builds before the release share a version. Learnt by
-    /// `check` when the daemon starts; without it nothing is filed or routed.
-    inbox: bool,
 }
 
 /// A machine Meridian has saved: the ID that never changes, and the name
@@ -136,15 +127,12 @@ impl Meridian {
             })
             .collect();
         Ok(Self {
-            machine: cfg.machine().to_string(),
-            configured: cfg.machine().to_string(),
+            machine: String::new(),
             was: vec![],
-            id: None,
+            id: String::new(),
             owner: cfg.owner.clone(),
             default: m.default.clone(),
             projects,
-            machines: false,
-            inbox: true,
         })
     }
 
@@ -202,7 +190,7 @@ impl Meridian {
         // machine, before any saved machine that has since taken it.
         let own = |name: &String| *name == self.machine || self.was.contains(name);
         let here = match &id {
-            Some(_) => id == self.id,
+            Some(id) => *id == self.id,
             None => name.as_ref().is_none_or(own),
         };
         let machine = if here {
@@ -215,9 +203,6 @@ impl Meridian {
             });
             match saved {
                 Some(m) => Some(m.name),
-                // An ID on a Meridian that does not tell this machine's own:
-                // any sender not on a saved machine is taken as here.
-                None if id.is_some() && self.id.is_none() => None,
                 None => {
                     // The ID is read once, at start: this machine got a new
                     // one since (its machine.json was replaced), and until a
@@ -243,7 +228,7 @@ impl Meridian {
                 let machine = machine.as_deref().unwrap_or(&self.machine);
                 Ok(field(&sender["project"]).map(|project| format!("{machine}/{project}/{id}")))
             }
-            None if not_found(&out, &chat) => Ok(None),
+            None if not_found(&out) => Ok(None),
             None => bail!(
                 "cannot tell which session sent it: `meridian spawn show {chat}` failed: {}{}",
                 tail(&out.stdout),
@@ -267,13 +252,10 @@ impl Meridian {
         rows(run(None, &args).await?)
     }
 
-    /// The machines Meridian has saved: none on a Meridian without them. A
-    /// list that can't be read is an error, not an empty list: a caller that
-    /// took it for "nothing saved" would look for a remote session here.
+    /// The machines Meridian has saved. A list that can't be read is an
+    /// error, not an empty list: a caller that took it for "nothing saved"
+    /// would look for a remote session here.
     async fn saved_machines(&self) -> Result<Vec<Saved>> {
-        if !self.machines {
-            return Ok(vec![]);
-        }
         let out = tokio::time::timeout(MACHINE_TIMEOUT, run(None, &["machine", "list", "--json"]))
             .await
             .context("`meridian machine list` gave no answer")??;
@@ -360,40 +342,56 @@ fn meridian_command(root: Option<&Path>) -> Command {
     cmd
 }
 
-/// Whether this Meridian has the command group `name`, which says what the
-/// daemon may do for its whole life. Only an answer that the command is not
-/// there says no: a Meridian that can't be run, or doesn't answer, is unknown,
-/// and the start fails instead of taking it for an older build.
-async fn has_command(name: &str) -> Result<bool> {
-    let asked = format!("`meridian {name} --help`, which tells whether this Meridian has `{name}`,");
-    let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &[name, "--help"]))
-        .await
-        .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))?
-        .with_context(|| format!("{asked} could not be run"))?;
-    Ok(out.status.success())
+/// The oldest Meridian this daemon runs with: the first with the machine
+/// inbox, machine names and IDs, and a `kind` on every JSON error.
+const FLOOR: [u32; 3] = [0, 28, 0];
+
+/// Refuses a Meridian older than `FLOOR`, or one that can't be run, with
+/// what to do about it.
+async fn check_version() -> Result<()> {
+    let out = match tokio::time::timeout(CHECK_TIMEOUT, run(None, &["--version"])).await {
+        Err(_) => bail!("`meridian --version` gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()),
+        Ok(Err(e))
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            bail!(
+                "`meridian` was not found on PATH: install Meridian 0.28.0 or later (`uv tool install meridian-cli`), or remove [sources.meridian] from the config to run without it"
+            )
+        }
+        Ok(r) => r?,
+    };
+    let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let version: Option<[u32; 3]> = printed
+        .strip_prefix("meridian ")
+        .and_then(|v| v.split('.').take(3).map(|p| p.parse().ok()).collect::<Option<Vec<u32>>>())
+        .and_then(|v| v.try_into().ok());
+    let Some(version) = version.filter(|_| out.status.success()) else {
+        bail!(
+            "`meridian --version` gave no version this build can read: {}{}",
+            tail(&out.stdout),
+            tail(&out.stderr)
+        );
+    };
+    if version < FLOOR {
+        bail!(
+            "this is {printed}, and meridian-comms needs Meridian 0.28.0 or later: upgrade it with `uv tool install --upgrade meridian-cli`, or remove [sources.meridian] from the config to run without it"
+        );
+    }
+    Ok(())
 }
 
-/// Whether a failed `spawn show` of `chat` says the session does not exist.
-/// Meridian has said it three ways, on either stream: `{"error": "Chat '…'
-/// not found"}`, the same with a top-level `"kind": "not_found"`, and through
-/// `--machine` `{"error": {"kind", "text"}}`, where the kind was `failed`
-/// with the far side's text before it became `not_found`. Under no kind or
-/// `failed` the text must name the chat: `failed` is also a far shell that
-/// found no `meridian`, which is a machine that could not be asked. An
-/// unknown machine reads as not found too, and such a machine lists no
-/// candidates.
-fn not_found(out: &std::process::Output, chat: &str) -> bool {
-    let missing = format!("'{chat}' not found");
-    let said = |text: &Value| text.as_str().is_some_and(|t| t.contains(&missing));
+/// Whether a failed `spawn show` says the chat does not exist. Meridian's
+/// kind for that is `not_found`: at the top of the error here (on stderr), and
+/// inside `error` through `--machine` (on stdout). An unknown machine is
+/// `not_found` too, and such a machine lists no candidates. Every other kind,
+/// `failed` among them, is a machine that could not be asked.
+fn not_found(out: &std::process::Output) -> bool {
     [&out.stdout, &out.stderr]
         .into_iter()
         .flat_map(|stream| stream.split(|b| *b == b'\n'))
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-        .any(|e| match e["kind"].as_str().or(e["error"]["kind"].as_str()) {
-            Some("not_found") => true,
-            Some("failed") | None => said(&e["error"]) || said(&e["error"]["text"]),
-            Some(_) => false,
-        })
+        .any(|e| e["kind"] == "not_found" || e["error"]["kind"] == "not_found")
 }
 
 fn rows(out: std::process::Output) -> Result<Rows> {
@@ -428,8 +426,7 @@ fn is_field(s: &str) -> bool {
 }
 
 /// What a `--json` inbox command printed: its object on success, else the
-/// error's kind (one of Meridian's closed list). A Meridian without the
-/// command prints no such object, and that is an error.
+/// error's kind (one of Meridian's closed list). Anything else is an error.
 fn answer(out: &std::process::Output) -> Result<std::result::Result<Value, String>> {
     let v: Value = serde_json::from_slice(&out.stdout)
         .ok()
@@ -656,6 +653,7 @@ impl Source for Meridian {
     /// project, a candidate's project and a filed item's project are one value.
     /// A check that could not run stops the daemon too, and says what stopped it.
     async fn check(&mut self) -> Result<()> {
+        check_version().await?;
         let answers = join_all(self.projects.iter().map(|(key, p)| async move {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
             (key, p, out)
@@ -674,12 +672,6 @@ impl Source for Meridian {
                     "{at}: `meridian -C {root} context --json` gave no answer in {} seconds, {unchecked}",
                     CHECK_TIMEOUT.as_secs()
                 ),
-                Ok(Err(e))
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    bail!("{at}: `meridian` was not found on PATH, {unchecked}")
-                }
                 Ok(Err(e)) => bail!("{at}: {e:#}, {unchecked}"),
                 Ok(Ok(out)) => out,
             };
@@ -701,44 +693,21 @@ impl Source for Meridian {
                 );
             }
         }
-        // Meridian names its machines from 0.28. Where it does, its name is the
-        // one every ref carries, and a daemon that can't learn it must not
-        // guess: its refs would match nothing Meridian or another start wrote.
-        self.machines = has_command("machine").await?;
-        if self.machines {
-            let asked = "`meridian machine name --json`, which every session's ref starts with,";
-            let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name", "--json"]))
-                .await
-                .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
-            // `{"name", "id", "was"}`. A build from before that prints the name
-            // alone, and is the only answer that may come without the other two:
-            // half an answer would quietly run without the ID and the old names.
-            let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let told: Value = serde_json::from_str(&printed).unwrap_or_default();
-            let failed = || anyhow::anyhow!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr));
-            let (name, id, was) = match told.get("name") {
-                None => (printed.clone(), None, vec![]),
-                Some(name) => {
-                    let whole = (field(name), field(&told["id"]), told["was"].as_array());
-                    let (Some(name), Some(id), Some(was)) = whole else {
-                        return Err(failed());
-                    };
-                    (name, Some(id), was.iter().filter_map(field).filter(|n| is_id(n)).collect())
-                }
-            };
-            if !out.status.success() || !is_id(&name) {
-                return Err(failed());
-            }
-            (self.machine, self.id, self.was) = (name, id, was);
-        }
-        // An older Meridian has no `inbox` command: say so once, here, instead
-        // of failing a command for every message.
-        if !has_command("inbox").await? {
-            self.inbox = false;
-            tracing::warn!(
-                "this Meridian has no `inbox` command (it came with 0.28), so it can't file or route: a Slack message nobody is woken for waits in `meridian-comms list`"
-            );
-        }
+        // Meridian's name is the one every ref carries, and a daemon that
+        // can't learn it must not guess: its refs would match nothing Meridian
+        // or another start wrote.
+        let asked = "`meridian machine name --json`, which every session's ref starts with,";
+        let out = tokio::time::timeout(CHECK_TIMEOUT, run(None, &["machine", "name", "--json"]))
+            .await
+            .with_context(|| format!("{asked} gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()))??;
+        let told: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let (name, id, was) = match (field(&told["name"]), field(&told["id"]), told["was"].as_array()) {
+            (Some(name), Some(id), Some(was)) if out.status.success() && is_id(&name) => (name, id, was),
+            _ => bail!("{asked} failed: {}{}", tail(&out.stdout), tail(&out.stderr)),
+        };
+        self.machine = name;
+        self.id = id;
+        self.was = was.iter().filter_map(field).filter(|n| is_id(n)).collect();
         Ok(())
     }
 
@@ -746,14 +715,11 @@ impl Source for Meridian {
         let start = |name: &String| format!("{name}/");
         Some(RefStart {
             now: start(&self.machine),
-            earlier: self.was.iter().chain([&self.configured]).map(start).collect(),
+            earlier: self.was.iter().map(start).collect(),
         })
     }
 
     async fn file(&self, req: &FileRequest) -> Result<Option<Filed>> {
-        if !self.inbox {
-            return Ok(None);
-        }
         let mut cmd = meridian_command(None);
         cmd.args(["message", "inbox", "-", "--json", "--via-program", PROGRAM]);
         cmd.args([
@@ -790,9 +756,6 @@ impl Source for Meridian {
     }
 
     async fn inbox_item(&self, item: &str) -> Result<Option<InboxItem>> {
-        if !self.inbox {
-            return Ok(None);
-        }
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
@@ -815,9 +778,6 @@ impl Source for Meridian {
     }
 
     async fn offer(&self, item: &str, ref_: &str) -> Result<OfferResult> {
-        if !self.inbox {
-            bail!("this Meridian has no inbox");
-        }
         // The spawn ID alone names the session, whether or not its project is configured.
         let target = self.target(ref_).with_context(|| format!("{ref_} is not a Meridian ref"))?;
         if !is_id(item) {
@@ -843,9 +803,6 @@ impl Source for Meridian {
     }
 
     async fn take(&self, item: &str, by: &str) -> Result<()> {
-        if !self.inbox {
-            bail!("this Meridian has no inbox");
-        }
         if !is_id(item) {
             bail!("{item:?} is not an inbox message ID");
         }
