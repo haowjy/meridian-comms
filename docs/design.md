@@ -420,7 +420,11 @@ without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
 removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
-`spawn message` and, at start, `context --json`. For the machine it runs in the home
+`message <spawn-id> <line> --wake --json` (`--wake` because Meridian holds a message to a
+cold session without it, and a wake goes only to a session the rule or a person chose)
+and, at start, `context --json`. A wake reads the error's kind: `not_running` or
+`not_found` is a session that is gone, `maybe_delivered` a notice that may have arrived
+(reported as not woken, so the message still waits), anything else a failed wake. For the machine it runs in the home
 directory with no `-C`: `--version` and `machine name --json` (once each, at start), `spawn list --global --primary --json`,
 `message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
 item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it

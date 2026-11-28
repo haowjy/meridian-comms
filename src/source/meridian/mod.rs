@@ -1,5 +1,5 @@
 //! The Meridian source. It uses only Meridian's public CLI: `spawn list
-//! --primary --json` for the running primaries, `spawn message` to wake one,
+//! --primary --json` for the running primaries, `message --wake` to wake one,
 //! `message inbox` and `inbox read/take/offer` for the machine's inbox, and
 //! `context` for a root's project ID.
 
@@ -364,7 +364,13 @@ async fn check_version() -> Result<()> {
     let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let version: Option<[u32; 3]> = printed
         .strip_prefix("meridian ")
-        .and_then(|v| v.split('.').take(3).map(|p| p.parse().ok()).collect::<Option<Vec<u32>>>())
+        .and_then(|v| {
+            // Each part's leading digits: `0.29.0-rc.1` is 0.29.0, `0.28.0+local` is 0.28.0.
+            v.split('.')
+                .take(3)
+                .map(|p| p[..p.find(|c: char| !c.is_ascii_digit()).unwrap_or(p.len())].parse().ok())
+                .collect::<Option<Vec<u32>>>()
+        })
         .and_then(|v| v.try_into().ok());
     let Some(version) = version.filter(|_| out.status.success()) else {
         bail!(
@@ -425,7 +431,7 @@ fn is_field(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '@' | '-'))
 }
 
-/// What a `--json` inbox command printed: its object on success, else the
+/// What a `--json` inbox or message command printed: its object on success, else the
 /// error's kind (one of Meridian's closed list). Anything else is an error.
 fn answer(out: &std::process::Output) -> Result<std::result::Result<Value, String>> {
     let v: Value = serde_json::from_slice(&out.stdout)
@@ -571,21 +577,20 @@ impl Source for Meridian {
         let (project, id) = self
             .parse_ref(&req.ref_)
             .with_context(|| format!("{} is not a Meridian ref", req.ref_))?;
-        let out = run(
-            Some(&self.projects[project].root),
-            &["spawn", "message", id, "--message", &line(req)],
-        )
-        .await?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // Exit 0 is woken, with or without a receipt. "not running" means the
-        // session stopped; retrying cannot help.
-        let (woken, detail) = if out.status.success() {
-            (true, stdout.trim().to_string())
-        } else if stderr.contains("not running") || stdout.contains("not running") {
-            (false, format!("{id} is no longer running"))
-        } else {
-            (false, format!("{}{}", stderr.trim(), stdout.trim()))
+        // `--wake`: the wake rule already chose this session, cache warm or not,
+        // and without it Meridian holds a cold one.
+        let out = run(Some(&self.projects[project].root), &["message", id, &line(req), "--wake", "--json"]).await?;
+        let error = answer(&out)?.err().map(|kind| {
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            (kind, field(&v["error"]["text"]).unwrap_or_default())
+        });
+        // Only `maybe_delivered` may have reached the session; it is reported
+        // as not woken, so the message still waits.
+        let (woken, detail) = match error {
+            None => (true, String::new()),
+            Some((kind, _)) if kind == "not_running" || kind == "not_found" => (false, format!("{id} is no longer running")),
+            Some((kind, text)) if kind == "maybe_delivered" => (false, format!("may have reached {id}: {text}")),
+            Some((kind, text)) => (false, format!("{kind}: {text}")),
         };
         Ok(WakeResult {
             woken,
