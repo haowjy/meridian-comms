@@ -13,8 +13,8 @@ use chrono::Utc;
 use tokio::sync::{mpsc, watch};
 
 use super::deliver::{How, Incoming};
-use super::online::Online;
-use super::{Core, Listing, text};
+use super::online::{Online, Scope};
+use super::{Core, Listing, text, view};
 use crate::config::AgentMark;
 use crate::model::{
     FailKind, Failure, Form, FormConversation, FormField, Interacted, Interaction, MenuGroup, MenuOption, PostRequest, Posted, Response,
@@ -75,10 +75,14 @@ impl Core {
     async fn interact(self: &Arc<Self>, i: Interaction) -> Response {
         let deadline = Instant::now() + ANSWER;
         match i {
+            Interaction::Form { sender, owner_only, .. } if owner_only && !self.is_owner(&sender) => {
+                Response::Private(view::NOT_YOURS.into())
+            }
             Interaction::Form {
                 conversations,
                 sender,
                 session,
+                ..
             } => self.form(&conversations, &sender, session).await,
             Interaction::Suggest {
                 conversation,
@@ -128,8 +132,13 @@ impl Core {
             })
             .collect();
         let online = self.online(u.project.as_deref(), Duration::ZERO).await;
+        // The view's listing knows a session it offered before this one may.
+        let everywhere = self.newest(&Scope::Everywhere);
         let chosen = session.map(|r| {
-            let found = online.sessions.as_ref().and_then(|l| l.resolve(&r).map(|(_, c)| c.clone()));
+            let found = [online.sessions.as_ref(), everywhere.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|l| l.resolve(&r).map(|(_, c)| c.clone()));
             MenuOption {
                 label: found.map_or_else(|| text::clean(&r), |c| text::option_label(&c, Utc::now())),
                 value: r,

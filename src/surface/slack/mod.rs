@@ -2,6 +2,7 @@
 //! Every post uses the bot token; the app has no user token.
 
 mod form;
+mod home;
 mod socket;
 mod web;
 
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::Surface;
-use crate::model::{FailKind, Failure, Interacted, Menu, MenuGroup, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
+use crate::model::{FailKind, Failure, Interacted, Menu, MenuGroup, Msg, PostRequest, Posted, Sender, SurfaceEvent, View, WhoAmI};
 use web::{Token, Web};
 
 /// Ids of the picker's blocks and elements; the click reads the menu's choice
@@ -367,5 +368,9 @@ impl Surface for Slack {
             bot: self.bot_user.clone(),
             external,
         })
+    }
+
+    async fn show(&self, viewer: &str, view: &View) -> Result<()> {
+        home::show(self, viewer, view).await
     }
 }

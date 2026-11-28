@@ -329,6 +329,13 @@ pub fn routes(of: Option<String>, as_json: bool) -> Result<()> {
         if let Some(id) = &r.record {
             println!("  second step: {id}");
         }
+        for m in &r.missing {
+            let why = m.why.as_deref().unwrap_or("no reason given");
+            match &m.name {
+                Some(name) => println!("  {name} didn't answer: {why}"),
+                None => println!("  {why}: no saved machine was asked"),
+            }
+        }
         if let Some(e) = &r.error {
             println!("  error: {e}");
         }

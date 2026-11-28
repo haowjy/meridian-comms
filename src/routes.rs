@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::model::Machine;
 use crate::state::write_atomic;
 
 const MAX_BYTES: u64 = 5 << 20;
@@ -68,6 +69,10 @@ pub struct Route {
     /// The source's ID for a second-step run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
+    /// The machines whose sessions were missing from the candidates: each
+    /// didn't answer the listing, with its source's reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<Machine>,
     pub outcome: Outcome,
     /// The outcome in words, for a person.
     pub done: String,

@@ -8,7 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::model::{Interacted, Msg, PostRequest, Posted, SurfaceEvent, WhoAmI};
+use crate::model::{Interacted, Msg, PostRequest, Posted, SurfaceEvent, View, WhoAmI};
 
 #[async_trait]
 pub trait Surface: Send + Sync {
@@ -40,4 +40,7 @@ pub trait Surface: Send + Sync {
     /// A conversation's top-level messages after `from` (or the latest `limit`), oldest first.
     async fn recent(&self, conversation: &str, from: Option<&str>, limit: Option<usize>) -> Result<Vec<Msg>>;
     async fn whoami(&self, conversations: &[String]) -> Result<WhoAmI>;
+    /// Replaces what person `viewer` (their ID on this surface) sees in their
+    /// view of the agents with `view`.
+    async fn show(&self, viewer: &str, view: &View) -> Result<()>;
 }

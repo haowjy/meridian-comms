@@ -28,6 +28,10 @@ pub struct Candidate {
     pub model: Option<String>,
     #[serde(default)]
     pub default: bool,
+    /// Whether `wake` from this daemon would reach it: the source decides, as
+    /// it decides `default`.
+    #[serde(default)]
+    pub wakeable: bool,
     #[serde(default)]
     pub activity: Option<Activity>,
     /// The directory the session's project lives in on this machine, when
@@ -85,6 +89,44 @@ pub struct ListResponse {
     pub candidates: Vec<Candidate>,
     #[serde(default)]
     pub unreachable: Vec<String>,
+    /// With `offerable`: each place something runs, candidates or not.
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// With `offerable`: every machine the source looked on, and whether it
+    /// answered.
+    #[serde(default)]
+    pub machines: Vec<Machine>,
+}
+
+/// One `(machine, project, group)` with something running in it. A later
+/// call that describes groups names them by these three.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub machine: String,
+    pub project: String,
+    /// What people call the project, when the source can tell.
+    #[serde(default)]
+    pub project_label: Option<String>,
+    /// `None`: what runs in no group.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// How many things run there that are not candidates.
+    #[serde(default)]
+    pub others: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Machine {
+    /// What no rename changes, when the source has one; `None` with `name`
+    /// when the source could not tell which machines there are.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// What people call it.
+    pub name: Option<String>,
+    pub ok: bool,
+    /// Why it did not answer, in the source's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,11 +343,13 @@ pub struct Action {
 pub enum Interaction {
     /// A person asked for the form that opens a thread for one session, in
     /// one of `conversations` (the person chooses when there are several);
-    /// `session` is a ref already chosen.
+    /// `session` is a ref already chosen. `owner_only`: asked from the view,
+    /// which is the owner's alone.
     Form {
         conversations: Vec<String>,
         sender: Sender,
         session: Option<String>,
+        owner_only: bool,
     },
     /// The form's session field asks what to offer for what was typed, for
     /// the form's first conversation.
@@ -369,6 +413,10 @@ pub enum FormField {
 pub enum SurfaceEvent {
     Message(Msg),
     Action(Action),
+    /// A person opened their view of the agents (Slack's Home tab).
+    ViewOpened(Sender),
+    /// A person asked for their view to be listed again.
+    ViewRefresh(Sender),
     /// The connection is up (first time or after a drop): the core recovers
     /// what was missed before it handles later events.
     Connected,
@@ -444,6 +492,53 @@ impl Failure {
     pub fn kind_of(e: &anyhow::Error) -> FailKind {
         e.downcast_ref::<Failure>().map_or(FailKind::NotSent, |f| f.kind)
     }
+}
+
+/// What one person's view of the agents shows: a surface lays it out, fits
+/// it to its own limits, and shows the text as it is, making no mention, link
+/// or formatting from it.
+#[derive(Debug, Clone)]
+pub enum View {
+    /// One line, for someone the view is not for.
+    Note(String),
+    Agents(Agents),
+}
+
+#[derive(Debug, Clone)]
+pub struct Agents {
+    /// The line under the title: when it was listed, and which machines answered.
+    pub status: String,
+    pub projects: Vec<ViewProject>,
+    /// What the view says with no project to show.
+    pub empty: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewProject {
+    pub label: String,
+    pub groups: Vec<ViewGroup>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewGroup {
+    pub label: String,
+    pub agents: Vec<ViewAgent>,
+    /// What else runs there, in a line: "5 other sessions running".
+    pub others: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewAgent {
+    pub line: String,
+    /// What a Message button opens: the form, preset with this session and
+    /// these conversations. `None`: no button.
+    pub message: Option<FormFor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormFor {
+    pub session: String,
+    pub conversations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

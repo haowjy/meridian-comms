@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use super::{MAX_LABEL, Slack, option_groups, plain};
+use super::{MAX_LABEL, Slack, home, option_groups, plain};
 use crate::model::{Form, FormField, Interaction, Response, Sender};
 
 const CALLBACK: &str = "agent-form";
@@ -46,6 +46,11 @@ pub(super) enum Kind {
     Command {
         trigger: String,
     },
+    /// A button outside any channel (the Home tab's): an answer in words is
+    /// shown in a modal of its own.
+    Click {
+        trigger: String,
+    },
     Suggest,
     /// `choice`: the form has a channel field, where errors about the channel go.
     Submit {
@@ -65,6 +70,7 @@ pub(super) fn parse(envelope: &Value) -> Option<(Kind, Interaction)> {
                 conversations: vec![p["channel_id"].as_str()?.to_string()],
                 sender: person(p["user_id"].as_str()?),
                 session: None,
+                owner_only: false,
             },
         )),
         "interactive" => {
@@ -181,6 +187,20 @@ pub(super) async fn ack(slack: &Slack, kind: Kind, answer: Option<Response>, dea
             };
             tracing::warn!("cannot open the form: {why}");
             Some(json!({"text": format!("The form could not be opened ({why}). Try again.")}))
+        }
+        (Kind::Click { trigger }, answer) => {
+            let opened = match answer {
+                Some(Response::Form(form)) => tokio::time::timeout_at(deadline, open(slack, &trigger, &form)).await,
+                Some(Response::Private(t)) => tokio::time::timeout_at(deadline, home::notice(slack, &trigger, &t)).await,
+                Some(Response::Done) => return None,
+                _ => tokio::time::timeout_at(deadline, home::notice(slack, &trigger, late)).await,
+            };
+            match opened {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("cannot open a modal for a click: {e:#}"),
+                Err(_) => tracing::warn!("cannot open a modal for a click: Slack did not answer in time"),
+            }
+            None
         }
         (Kind::Command { .. }, Some(Response::Private(t))) => Some(json!({"text": t})),
         (Kind::Command { .. }, Some(Response::Done)) => None,

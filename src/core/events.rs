@@ -76,6 +76,8 @@ impl Core {
             SurfaceEvent::Message(m) => self.accept(m),
             SurfaceEvent::Action(a) if self.cfg.channel(&a.conversation).is_some() => self.enqueue(Job::Action(a)),
             SurfaceEvent::Action(_) => {}
+            SurfaceEvent::ViewOpened(viewer) => self.view(viewer, false),
+            SurfaceEvent::ViewRefresh(viewer) => self.view(viewer, true),
         }
     }
 
