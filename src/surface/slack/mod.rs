@@ -306,7 +306,15 @@ impl Surface for Slack {
             }
             self.pages("conversations.replies", p, None).await
         };
-        let mut raw = fetch(id.to_string()).await?;
+        let mut raw = fetch(id.to_string()).await.map_err(|e| {
+            if e.downcast_ref::<web::CallError>()
+                .is_some_and(|c| c.code.as_deref() == Some("thread_not_found"))
+            {
+                Failure::new(FailKind::NotFound, format!("no message {id} in this channel")).into()
+            } else {
+                e
+            }
+        })?;
         // Asked with a reply's ID, Slack returns only that reply: ask again with the root's.
         if let Some(root) = raw.first().and_then(|m| m["thread_ts"].as_str()).filter(|root| *root != id) {
             raw = fetch(root.to_string()).await?;

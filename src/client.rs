@@ -54,8 +54,8 @@ fn environment() -> IdentifyRequest {
     }
 }
 
-/// One request and its answer. Every error is a `Failure`: from the moment the
-/// request is written, one without a clear answer is `MaybeDelivered`.
+/// One request and its answer. Every error is a `Failure`: from the moment a
+/// request that posts is written, one without a clear answer is `MaybeSent`.
 async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
     let fail = |kind, text: String| anyhow::Error::from(Failure::new(kind, text));
     let mut line = serde_json::to_string(req)?;
@@ -76,13 +76,18 @@ async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
             ),
         )
     })?;
-    let unanswered = |what: String| {
-        fail(
+    let posts = req.posts();
+    let unanswered = |what: String| match posts {
+        true => fail(
             FailKind::MaybeSent,
             format!(
                 "{what}. The daemon may have finished the request: `meridian-comms read` shows whether the message was posted before you send again"
             ),
-        )
+        ),
+        false => fail(
+            FailKind::NotSent,
+            format!("{what}. This request posts nothing: running it again is safe"),
+        ),
     };
     let (rd, mut wr) = conn.into_split();
     wr.write_all(line.as_bytes())

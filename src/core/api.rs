@@ -6,9 +6,23 @@ use chrono::Utc;
 use super::deliver::{Author, How, Incoming};
 use super::{Core, Listing};
 use crate::config::Channel;
-use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, ListRequest, Msg, PostRequest};
+use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, ListRequest, Msg, PostRequest, Posted};
 use crate::proto::{ListOut, MessageOut, PersonOut, PostTo, ReadOut, SendOut, Target, WaitingOut};
 use crate::state::{Pick, ThreadState};
+
+/// A `send` resolved up to the post: nothing has gone out yet.
+struct Prepared {
+    conv: String,
+    requested: Option<Msg>,
+    to: Vec<String>,
+    text: Option<String>,
+    persons: Vec<String>,
+    words: Vec<String>,
+    listing: Listing,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    st: ThreadState,
+    post: Option<PostRequest>,
+}
 
 /// The caller after `identify`: a session, or the owner at a terminal.
 pub struct Who {
@@ -149,14 +163,28 @@ impl Core {
     }
 
     /// Posts `text` (naming `mention`, a person as the surface notifies them)
-    /// and wakes whom `to` names. An error after the post is `MaybeDelivered`.
+    /// and wakes whom `to` names. Everything is resolved before the post, and
+    /// any error after it is `MaybeSent`.
     pub async fn send(&self, who: &Who, target: Target, to: Vec<String>, text: Option<String>, mention: Option<String>) -> Result<SendOut> {
-        if !who.may_post {
-            bail!(Failure::new(
-                FailKind::NotAllowed,
-                "only a primary session, or the owner at a terminal, may post; a child spawn reads and reports to its parent"
-            ));
-        }
+        let prep = self.prepare_send(who, target, to, text, mention).await?;
+        let posted = match &prep.post {
+            Some(req) => Some(self.surface.post(req.clone()).await?),
+            None => None,
+        };
+        self.finish_send(who, prep, posted)
+            .await
+            .map_err(|e| Failure::new(FailKind::MaybeSent, format!("the post or wake went out, then: {e:#}")).into())
+    }
+
+    async fn prepare_send(
+        &self,
+        who: &Who,
+        target: Target,
+        to: Vec<String>,
+        text: Option<String>,
+        mention: Option<String>,
+    ) -> Result<Prepared> {
+        Self::may_post(who)?;
         if text.is_none() && to.is_empty() {
             bail!(Failure::new(
                 FailKind::Invalid,
@@ -207,10 +235,10 @@ impl Core {
             }
         }
 
-        let mut _held = None;
-        let mut st = match &requested {
+        let mut held = None;
+        let st = match &requested {
             Some(m) => {
-                _held = Some(self.lock(&conv, &m.thread).await);
+                held = Some(self.lock(&conv, &m.thread).await);
                 self.store
                     .load_thread(&conv, &m.thread)?
                     .unwrap_or_else(|| ThreadState::new(&conv, &m.thread))
@@ -251,38 +279,65 @@ impl Core {
             }
         }
 
-        // Post.
-        let (message_id, from, sent, text_out) = match (&text, &requested) {
-            (Some(body), _) => {
-                let named: Vec<&str> = mention.iter().chain(&to).map(String::as_str).collect();
-                let to_part = if named.is_empty() {
-                    String::new()
-                } else {
-                    format!(" to {}", named.join(", "))
-                };
-                let req = PostRequest {
-                    conversation: conv.clone(),
-                    thread: requested.as_ref().map(|m| m.thread.clone()),
-                    text: format!("From {}{to_part}:\n{body}", who.label()),
-                    menu: None,
-                    plain: false,
-                };
-                let posted = self.surface.post(req).await?;
+        let post = text.as_ref().map(|body| {
+            let named: Vec<&str> = mention.iter().chain(&to).map(String::as_str).collect();
+            let to_part = if named.is_empty() {
+                String::new()
+            } else {
+                format!(" to {}", named.join(", "))
+            };
+            PostRequest {
+                conversation: conv.clone(),
+                thread: requested.as_ref().map(|m| m.thread.clone()),
+                text: format!("From {}{to_part}:\n{body}", who.label()),
+                menu: None,
+                plain: false,
+            }
+        });
+        Ok(Prepared {
+            conv,
+            requested,
+            to,
+            text,
+            persons,
+            words,
+            listing,
+            held,
+            st,
+            post,
+        })
+    }
+
+    /// The wakes and the thread file, after the post (if any) went out.
+    async fn finish_send(&self, who: &Who, prep: Prepared, posted: Option<Posted>) -> Result<SendOut> {
+        let Prepared {
+            conv,
+            requested,
+            to,
+            text,
+            persons,
+            words,
+            listing,
+            mut held,
+            mut st,
+            ..
+        } = prep;
+        let (message_id, from, sent, text_out) = match (posted, &text, &requested) {
+            (Some(posted), Some(body), _) => {
                 if requested.is_none() {
                     // The thread exists now: a reply can arrive while the wakes run. Take
                     // its lock and write its file before waking, so the reply waits its
                     // turn and finds the scope.
-                    _held = Some(self.lock(&conv, &posted.id).await);
+                    held = Some(self.lock(&conv, &posted.id).await);
                     st = self
                         .store
-                        .load_thread(&conv, &posted.id)
-                        .map_err(after_post)?
+                        .load_thread(&conv, &posted.id)?
                         .unwrap_or_else(|| ThreadState::new(&conv, &posted.id));
-                    self.store.save_thread(&st).map_err(after_post)?;
+                    self.store.save_thread(&st)?;
                 }
                 (posted.id, who.label(), Utc::now(), body.clone())
             }
-            (None, Some(m)) => {
+            (None, None, Some(m)) => {
                 let from = self
                     .cfg
                     .person_by_slack(&m.sender.id)
@@ -290,8 +345,9 @@ impl Core {
                     .unwrap_or_else(|| format!("{}-agents", self.cfg.owner));
                 (m.id.clone(), from, m.time, m.text.clone())
             }
-            (None, None) => unreachable!("a channel target requires text"),
+            _ => unreachable!("a post exactly when there is text, and a target message when there is none"),
         };
+        let _held = held;
         let message = self.message_ref(&conv, &message_id);
         let inc = Incoming {
             conversation: conv.clone(),
@@ -331,7 +387,7 @@ impl Core {
             chooser: &who.person,
         };
         let out = self.deliver(&mut st, &picks, &listing, &inc, how).await;
-        self.store.save_thread(&st).map_err(after_post)?;
+        self.store.save_thread(&st)?;
 
         let mut not_woken = out.left_out;
         if !to.is_empty() && out.woken.is_empty() && not_woken.is_empty() {
@@ -348,9 +404,20 @@ impl Core {
         })
     }
 
+    fn may_post(who: &Who) -> Result<()> {
+        if !who.may_post {
+            bail!(Failure::new(
+                FailKind::NotAllowed,
+                "only a primary session, or the owner at a terminal, may post; a child spawn reads and reports to its parent"
+            ));
+        }
+        Ok(())
+    }
+
     /// Posts `text` for a person or in a thread, and wakes nobody. For a
     /// person it opens a thread naming them in the caller's channel.
     pub async fn post_to(&self, who: &Who, to: PostTo, text: String) -> Result<SendOut> {
+        Self::may_post(who)?;
         if text.trim().is_empty() {
             bail!(Failure::new(FailKind::Invalid, "nothing to send: the message text is empty"));
         }
@@ -403,8 +470,9 @@ impl Core {
             many => bail!(Failure::new(
                 FailKind::Ambiguous,
                 format!(
-                    "channels {} could each take a new thread; open it in one with `meridian-comms send --channel NAME`",
-                    many.join(", ")
+                    "channels {} could each take a new thread: answer in an existing thread by its message ref instead, or change {} so that only one can",
+                    many.join(", "),
+                    config.display()
                 )
             )),
         }
@@ -467,9 +535,4 @@ fn another_project(channel: &str) -> Failure {
 
 fn not_found(message: &str) -> Failure {
     Failure::new(FailKind::NotFound, format!("message {message} not found"))
-}
-
-/// The post went out: whatever fails after it, the message may have arrived.
-fn after_post(e: anyhow::Error) -> anyhow::Error {
-    Failure::new(FailKind::MaybeSent, format!("the post went out, then: {e:#}")).into()
 }

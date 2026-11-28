@@ -18,6 +18,8 @@ pub struct Web {
 #[error("slack {method}: {text}")]
 pub struct CallError {
     pub method: String,
+    /// Slack's error code, when it answered `ok: false`.
+    pub code: Option<String>,
     pub text: String,
     pub unanswered: bool,
 }
@@ -54,6 +56,7 @@ impl Web {
     ) -> Result<Value, CallError> {
         let fail = |unanswered: bool, text: String| CallError {
             method: method.to_string(),
+            code: None,
             text,
             unanswered,
         };
@@ -98,7 +101,10 @@ impl Web {
                     err = format!("{err} (needs scope {needed})");
                 }
                 // Slack documents that these two may follow a partial success.
-                return Err(fail(matches!(code, "internal_error" | "fatal_error"), err));
+                return Err(CallError {
+                    code: Some(code.to_string()),
+                    ..fail(matches!(code, "internal_error" | "fatal_error"), err)
+                });
             }
             return Ok(v);
         }

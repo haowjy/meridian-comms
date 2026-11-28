@@ -66,9 +66,23 @@ pub enum PostTo {
 pub struct Reply<T> {
     pub error: Option<String>,
     /// The error's kind; a daemon older than `post` sends none.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "kind_or_maybe")]
     pub kind: Option<FailKind>,
     pub result: Option<T>,
+}
+
+/// A kind this build doesn't know, from a newer daemon, may mean anything:
+/// read as `MaybeSent`, the one that never invites sending again.
+fn kind_or_maybe<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<FailKind>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.map(|v| serde_json::from_value(v).unwrap_or(FailKind::MaybeSent)))
+}
+
+impl Request {
+    /// Whether the request posts or wakes, so an unanswered one may have.
+    pub fn posts(&self) -> bool {
+        matches!(self, Request::Send { .. } | Request::Post { .. })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

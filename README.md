@@ -72,6 +72,10 @@ Meridian's config. To make that this bot, add to `~/.meridian/config.toml` by ha
 people = ["meridian-comms", "deliver"]
 ```
 
+Meridian runs the `meridian-comms` a session finds on its `PATH`, so that must be this
+build or later: an older one has no `deliver`, and Meridian reads its silence as
+`maybe_delivered`. Or put the binary's absolute path as the first word.
+
 `@alice` must be a name under `[people]`. The bot opens a new thread in the channel of
 the session's project, or the one channel with no project and `post = true` when the
 project has none, starting "From jimmy's session `…` to @alice", so Slack notifies

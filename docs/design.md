@@ -426,7 +426,9 @@ may count the dead connection for a while, so a restart can be refused until Sla
 drops it; run the service with a restart delay. Web API calls: `chat.postMessage`,
 `reactions.add`, `conversations.replies`, `conversations.history`, `auth.test`,
 `conversations.info`; a 429 waits out `Retry-After`. A post replaces `<!` with `&lt;!`
-so text from a session can't ping a channel. A channel shared with another
+so text from a session can't ping a channel. A post over Slack's 40,000 characters,
+which Slack would cut, is refused before it is sent, for `send` as for `deliver`. A
+channel shared with another
 organization is refused at start unless its entry says `external = true`.
 
 ## Client and daemon
@@ -494,13 +496,17 @@ that the channel sees the message and the person has to be in it.
 **Its errors say whether the post may have gone out.** The kind (`FailKind` in
 `src/model.rs`) travels as a `Failure` inside the error, set where it is known, and the
 daemon's reply carries it (`Reply.kind`). Every kind but `maybe_sent` says nothing was
-posted. An error that names no kind is `not_sent`, so every step after the post names
-`maybe_sent`.
+posted. An error that names no kind is `not_sent`. `send` is split at the post:
+`prepare_send` resolves everything and builds the post, the surface posts, and every
+error of `finish_send` (the thread file, the wakes) becomes `maybe_sent` in one place.
+A kind the client doesn't know, from a newer daemon, is read as `maybe_sent`. A request
+that posts nothing (`read`, `list`, `route`) and gets no answer says that running it
+again is safe.
 
 | Kind | Where it comes from |
 |---|---|
 | `invalid` | A ref that is not `<channel>/<id>`, empty text. |
-| `not_found` | No such person, channel or message. |
+| `not_found` | No such person, channel or message (Slack's `thread_not_found` included). |
 | `ambiguous`, `no_channel` | Choosing the channel, above. |
 | `not_allowed` | A caller that may not post (a child spawn, an unlisted project), a channel of another project. |
 | `too_large` | Over Slack's 40,000 characters, checked before posting; a request over the socket's 4 MiB, checked by the client. |
