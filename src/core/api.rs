@@ -383,7 +383,7 @@ impl Core {
                 let from = self
                     .author(&st.authors, m)
                     .map(|n| self.cfg.display(&n))
-                    .unwrap_or_else(|| format!("{}-agents", self.cfg.owner));
+                    .unwrap_or_else(|| format!("meridian-{}", self.cfg.owner));
                 (m.id.clone(), from, m.time, m.text.clone())
             }
             _ => unreachable!("a post exactly when there is text, and a target message when there is none"),

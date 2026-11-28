@@ -1,7 +1,7 @@
 # Setting up the Slack app
 
 `meridian-comms` talks to Slack as its own app, with a bot user named
-`<owner>-agents` (for Jimmy, `@jimmy-agents`). The app connects over Socket Mode: the
+`meridian-<owner>` (for Jimmy, `@meridian-jimmy`). The app connects over Socket Mode: the
 daemon opens an outbound websocket, so nothing listens on a public port. The app has
 no user token, so it can't read anyone's DMs, and it sees only the channels its bot is
 invited to.
@@ -17,12 +17,12 @@ invited to.
 ```json
 {
   "display_information": {
-    "name": "jimmy-agents",
+    "name": "meridian-jimmy",
     "description": "Hands Slack messages to Jimmy's running agent sessions, and posts their answers."
   },
   "features": {
     "app_home": { "home_tab_enabled": true },
-    "bot_user": { "display_name": "jimmy-agents", "always_online": true },
+    "bot_user": { "display_name": "meridian-jimmy", "always_online": true },
     "slash_commands": [
       {
         "command": "/agent",
@@ -119,7 +119,7 @@ tokens into a chat or an agent session.
 
 ## 5. Invite the bot to each channel
 
-In each channel the config lists, run `/invite @jimmy-agents`. The bot sees nothing in
+In each channel the config lists, run `/invite @meridian-jimmy`. The bot sees nothing in
 a channel it isn't in.
 
 ## 6. Note the IDs the config needs
