@@ -11,8 +11,8 @@ can start threads and hand work to each other the same way, with `meridian-comms
 
 It is built for [Meridian](https://github.com/haowjy/meridian-cli) sessions (Claude Code,
 Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meridian. It
-needs Meridian 0.28.0 or later (`meridian --version`), and the daemon refuses to start
-with an older one.
+needs Meridian 0.28.1 or later (`meridian --version`): the daemon and `setup router`
+refuse an older one.
 
 **Status:** early. One Slack bot per person, with its daemon on one machine. The router
 can offer a filed message to a session on another machine Meridian has saved
@@ -47,12 +47,12 @@ meridian-comms route [ITEM]                        hand an inbox message to the 
 meridian-comms routes [ITEM | <message>]           what the router did: all, one inbox item (m412), or one message
 meridian-comms daemon                              the Slack connection (run as a user service)
 meridian-comms setup                               print the Slack app manifest
-meridian-comms setup router                        install the agent the router asks when unsure
+meridian-comms setup router                        set up the agent the router asks when unsure
 ```
 
 ## Setup
 
-1. `cargo install --path .`, and Meridian 0.28.0 or later
+1. `cargo install --path .`, and Meridian 0.28.1 or later
    (`uv tool install --upgrade meridian-cli`).
 2. Create the Slack app: [docs/slack-setup.md](docs/slack-setup.md).
 3. Write `~/.config/meridian-comms/config.toml` (mode 0600): the owner, the channels, the
@@ -79,13 +79,28 @@ Without these steps the bot works as above and a message nobody was woken for wa
    a session.
 3. Add a `[router]` section to `config.toml`. Empty is enough; its three settings and
    their defaults are in [docs/design.md](docs/design.md#config).
-4. Install the agent the router asks when the model is unsure:
-   `meridian-comms setup router --package <path to meridian-base>`, with the
-   `meridian-base` directory of a checkout of Meridian's prompts. Until those prompts are
-   released, the default package does not have the agent. It runs on OpenCode, which
-   must be installed and signed in on this machine.
+4. Run `meridian-comms setup router`. It first checks that Meridian is 0.28.1 or later,
+   the first to ship the agent the router asks when the model is unsure, and changes
+   nothing if not. Then it makes the router's directory, checks that Meridian can start
+   the agent there, and prints the harness and model Meridian chose for it. The agent
+   prefers OpenCode; when OpenCode isn't usable there, Meridian falls back to your Mars
+   harness order, so it may run on another harness you have, such as Pi, paid for by
+   that harness's account. To choose its model, harness or effort, set them in
+   `[inbox.router]` in `~/.meridian/config.toml`.
 5. Restart the daemon.
 6. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
    router did with it.
 
 How it works and why: [docs/design.md](docs/design.md).
+
+## Upgrading
+
+The daemon refuses to start with a Meridian older than the one it needs, so upgrade in
+this order:
+
+1. Meridian (`uv tool install --upgrade meridian-cli`).
+2. meridian-comms (`cargo install --path .`).
+3. If the router is on, `meridian-comms setup router`. A router set up by an earlier
+   meridian-comms installed its own copy of the agent through Mars, which would replace
+   Meridian's; setup removes it.
+4. Restart the daemon.

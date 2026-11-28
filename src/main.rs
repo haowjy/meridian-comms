@@ -108,19 +108,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Setup {
-    /// Create the router directory and install the `inbox-router` agent there.
+    /// Create the router directory and check Meridian can start the `inbox-router` agent there.
     ///
     /// The router's second step starts that agent, through Meridian, for a
-    /// message its model can't place from the session list alone. The
-    /// directory is a Meridian project of its own under the state directory.
-    /// Run this once on the daemon's machine, outside any agent session, and
-    /// again to update the agent. Without it the second step fails, the
-    /// routing log says so, and the message waits.
-    Router {
-        /// The package holding the agent, as `meridian mars add` takes it: owner/repo, a URL or a local path.
-        #[arg(long, default_value = source::meridian::router::PACKAGE)]
-        package: String,
-    },
+    /// message its model can't place from the session list alone. Meridian
+    /// ships the agent; its model, harness and effort go in `[inbox.router]`
+    /// in `~/.meridian/config.toml`. The directory is a Meridian project of
+    /// its own under the state directory. Run this once on the daemon's
+    /// machine, outside any agent session, and again if an earlier version of
+    /// meridian-comms set the router up. Without it the second step
+    /// fails, the routing log says so, and the message waits.
+    Router,
 }
 
 #[tokio::main]
@@ -152,9 +150,8 @@ async fn main() {
         Command::Daemon => daemon::run().await,
         Command::Setup { what: None, owner } => setup::run(owner),
         Command::Setup {
-            what: Some(Setup::Router { package }),
-            ..
-        } => source::meridian::router::setup(&package).await,
+            what: Some(Setup::Router), ..
+        } => source::meridian::router::setup().await,
     };
     if let Err(e) = result {
         eprintln!("meridian-comms: {e:#}");

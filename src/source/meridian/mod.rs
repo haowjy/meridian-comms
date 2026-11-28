@@ -343,21 +343,21 @@ fn meridian_command(root: Option<&Path>) -> Command {
 }
 
 /// The oldest Meridian this daemon runs with: the first with the machine
-/// inbox, machine names and IDs, and a `kind` on every JSON error.
-const FLOOR: [u32; 3] = [0, 28, 0];
+/// inbox, machine names and IDs, a `kind` on every JSON error, and the
+/// `inbox-router` profile in its wheel.
+const FLOOR: [u32; 3] = [0, 28, 1];
 
 /// Refuses a Meridian older than `FLOOR`, or one that can't be run, with
-/// what to do about it.
-async fn check_version() -> Result<()> {
+/// what to do about it; `or_else` ends the advice on a missing or old one.
+async fn check_version(or_else: &str) -> Result<()> {
+    let floor = FLOOR.map(|n| n.to_string()).join(".");
     let out = match tokio::time::timeout(CHECK_TIMEOUT, run(None, &["--version"])).await {
         Err(_) => bail!("`meridian --version` gave no answer in {} seconds", CHECK_TIMEOUT.as_secs()),
         Ok(Err(e))
             if e.downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            bail!(
-                "`meridian` was not found on PATH: install Meridian 0.28.0 or later (`uv tool install meridian-cli`), or remove [sources.meridian] from the config to run without it"
-            )
+            bail!("`meridian` was not found on PATH: install Meridian {floor} or later (`uv tool install meridian-cli`){or_else}")
         }
         Ok(r) => r?,
     };
@@ -381,7 +381,7 @@ async fn check_version() -> Result<()> {
     };
     if version < FLOOR {
         bail!(
-            "this is {printed}, and meridian-comms needs Meridian 0.28.0 or later: upgrade it with `uv tool install --upgrade meridian-cli`, or remove [sources.meridian] from the config to run without it"
+            "this is {printed}, and meridian-comms needs Meridian {floor} or later: upgrade it with `uv tool install --upgrade meridian-cli`{or_else}"
         );
     }
     Ok(())
@@ -666,7 +666,7 @@ impl Source for Meridian {
     /// project, a candidate's project and a filed item's project are one value.
     /// A check that could not run stops the daemon too, and says what stopped it.
     async fn check(&mut self) -> Result<()> {
-        check_version().await?;
+        check_version(", or remove [sources.meridian] from the config to run without it").await?;
         let answers = join_all(self.projects.iter().map(|(key, p)| async move {
             let out = tokio::time::timeout(CHECK_TIMEOUT, run(Some(&p.root), &["context", "--json"])).await;
             (key, p, out)

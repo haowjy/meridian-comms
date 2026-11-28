@@ -1,9 +1,9 @@
 //! The router's second step for Meridian: a spawn of the `inbox-router` agent
 //! profile, started from the router directory when the model asks for more.
 //! The agent looks at what the listed sessions are doing and reports one
-//! decision line; code carries it out. The router directory is a Meridian
-//! project of its own that holds nothing but that profile, made once by
-//! `meridian-comms setup router` and never by the daemon.
+//! decision line; code carries it out. Meridian ships the profile; the router
+//! directory is a Meridian project of its own that holds the prompt files,
+//! made once by `meridian-comms setup router` and never by the daemon.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -20,8 +20,8 @@ use crate::model::{ActivityState, Candidate, DecideRequest, Decision};
 use crate::paths;
 
 const PROFILE: &str = "inbox-router";
-/// The package that ships the profile, as `mars add` takes it.
-pub const PACKAGE: &str = "haowjy/meridian-base";
+/// The keys `mars add` writes for a dependency, besides `agents`.
+const MARS_SOURCE_KEYS: [&str; 4] = ["url", "path", "subpath", "version"];
 /// Minutes: the spawn's own limit and the wait's. The spawn carries its limit
 /// itself, so it ends even if this process dies.
 const LIMIT: &str = "5";
@@ -38,33 +38,133 @@ pub fn dir() -> PathBuf {
     paths::state_dir().join("router")
 }
 
-/// Creates the router directory and installs the profile there, with
-/// Meridian's own commands. Running it again updates the install.
-pub async fn setup(package: &str) -> Result<()> {
+/// Where a Mars project in the router directory installs its agents.
+fn shadow_dir(dir: &Path) -> PathBuf {
+    dir.join(".mars").join("agents")
+}
+
+/// Creates the router directory, gives it a Meridian project identity, and
+/// checks that this Meridian resolves the profile there. Nothing in the
+/// directory is changed until this Meridian is new enough to ship the profile,
+/// so an older one leaves a router that worked still working. Running it again
+/// changes nothing that is already right.
+pub async fn setup() -> Result<()> {
+    super::check_version("").await.context("setup changed nothing")?;
     let dir = dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let steps: [&[&str]; 2] = [&["mars", "init"], &["mars", "add", package, "--agents", PROFILE]];
-    for args in steps {
-        if args[1] == "init" && dir.join("mars.toml").exists() {
-            continue;
-        }
-        let out = run(Some(&dir), args).await?;
-        if !out.status.success() {
-            bail!(
-                "`meridian -C {} {}` failed: {}{}",
-                dir.display(),
-                args.join(" "),
-                tail(&out.stdout),
-                tail(&out.stderr)
-            );
-        }
+    remove_mars_dependency(&dir).await?;
+    let at = dir.to_string_lossy();
+    let init = run(None, &["init", &at]).await?;
+    if !init.status.success() {
+        bail!("`meridian init {at}` failed: {}{}", tail(&init.stdout), tail(&init.stderr));
+    }
+    let launch = resolve_profile(&dir)
+        .await
+        .map_err(|why| anyhow::anyhow!("Meridian can't start the {PROFILE} agent in the router directory: {why}"))?;
+    println!(
+        "The router directory is {}: Meridian finds the {PROFILE} profile at {}.",
+        dir.display(),
+        launch.path
+    );
+    if Path::new(&launch.path).starts_with(shadow_dir(&dir)) {
+        println!(
+            "That is a package's copy from the router directory's own mars.toml, which an earlier setup did not write, so it was left: it replaces the profile Meridian ships."
+        );
+    }
+    println!("It runs on {} with model {}.", launch.harness, launch.model);
+    if launch.chosen_by != "profile" {
+        println!(
+            "Meridian chose that harness by {}, not by the profile's preference.",
+            launch.chosen_by
+        );
+    }
+    println!("To choose its harness, model or effort, set them in [inbox.router] in ~/.meridian/config.toml.");
+    Ok(())
+}
+
+/// What a dry run in the router directory says a launch would use.
+struct Launch {
+    path: String,
+    harness: String,
+    model: String,
+    /// Meridian's name for where the harness came from; `profile` when the
+    /// profile's preferred harness was usable.
+    chosen_by: String,
+}
+
+/// The launch this Meridian composes from `dir` for the profile, from a dry
+/// run that starts nothing; else Meridian's reason. The profile's harness is a
+/// preference: when it isn't usable, Meridian falls back to the user's harness
+/// order.
+async fn resolve_profile(dir: &Path) -> Result<Launch, String> {
+    let out = run(Some(dir), &["spawn", "-a", PROFILE, "--dry-run", "-p", "setup check", "--json"])
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    if shown["status"] == "dry-run"
+        && let Some(path) = field(&shown["agent_path"])
+    {
+        let text = |v: &Value| field(v).unwrap_or_else(|| "unknown".to_string());
+        return Ok(Launch {
+            path,
+            harness: text(&shown["harness_id"]),
+            model: text(&shown["model"]),
+            chosen_by: text(&shown["model_selection"]["harness_provenance"]),
+        });
+    }
+    Err(shown["message"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}{}", tail(&out.stdout), tail(&out.stderr))))
+}
+
+/// An earlier setup made the router directory a Mars project whose one
+/// dependency installed the profile from a package. Once the package drops it
+/// a sync there fails, and while it has it the copy shadows Meridian's. Removes
+/// that dependency with Mars's own command; the emptied `mars.toml`,
+/// `mars.lock` and `.mars/` it leaves install nothing. Any other `mars.toml`
+/// is left alone: the check after shows whether it shadows the profile.
+async fn remove_mars_dependency(dir: &Path) -> Result<()> {
+    let toml = dir.join("mars.toml");
+    let text = match std::fs::read_to_string(&toml) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", toml.display())),
+    };
+    let Some(key) = setup_dependency(&text) else { return Ok(()) };
+    let out = run(Some(dir), &["mars", "remove", &key]).await?;
+    if !out.status.success() {
+        bail!(
+            "`meridian -C {} mars remove {key}` failed: {}{}",
+            dir.display(),
+            tail(&out.stdout),
+            tail(&out.stderr)
+        );
     }
     println!(
-        "The router directory is {}: the {PROFILE} profile is installed from {package}.",
+        "Removed the {key} dependency an earlier setup added in {}: Meridian's own {PROFILE} profile now runs there.",
         dir.display()
     );
-    println!("It needs OpenCode on this machine, signed in for the model the profile names.");
     Ok(())
+}
+
+/// The dependency's key, when `mars.toml` is what `mars init` and `mars add
+/// <package> --agents inbox-router` wrote: one dependency, a source, and that
+/// one agent.
+fn setup_dependency(text: &str) -> Option<String> {
+    let doc = text.parse::<toml::Table>().ok()?;
+    let deps = doc.get("dependencies")?.as_table()?;
+    let [(key, dep)] = deps.iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let dep = dep.as_table()?;
+    (doc.len() == 1
+        && dep
+            .get("agents")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| a.len() == 1 && a[0].as_str() == Some(PROFILE))
+        && dep.keys().all(|k| k == "agents" || MARS_SOURCE_KEYS.contains(&k.as_str())))
+    .then(|| key.clone())
 }
 
 /// Removes prompt files a killed daemon left: they hold a stranger's text.
@@ -232,9 +332,18 @@ impl Meridian {
     /// Starts the agent on `req` and gives its spawn ID.
     pub(super) async fn launch_router(&self, req: &DecideRequest) -> Result<String> {
         let dir = dir();
-        if !dir.join("mars.toml").exists() {
+        // `setup router` makes it with `meridian init`.
+        if !dir.join("meridian.toml").exists() {
             bail!(
                 "the router directory {} is not set up: run `meridian-comms setup router`",
+                dir.display()
+            );
+        }
+        // Only the dependency an earlier setup wrote: setup removes it. A
+        // mars.toml the user wrote is their choice, which setup reported.
+        if std::fs::read_to_string(dir.join("mars.toml")).is_ok_and(|t| setup_dependency(&t).is_some()) {
+            tracing::warn!(
+                "an earlier setup's Mars dependency in {} installs a package's {PROFILE}, which replaces the profile Meridian ships: run `{PROGRAM} setup router`",
                 dir.display()
             );
         }
