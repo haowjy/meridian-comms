@@ -67,10 +67,8 @@ pub(super) fn parse(envelope: &Value) -> Option<(Kind, Interaction)> {
                 trigger: p["trigger_id"].as_str()?.to_string(),
             },
             Interaction::Form {
-                conversations: vec![p["channel_id"].as_str()?.to_string()],
+                conversation: p["channel_id"].as_str()?.to_string(),
                 sender: person(p["user_id"].as_str()?),
-                session: None,
-                owner_only: false,
             },
         )),
         "interactive" => {
@@ -192,8 +190,14 @@ pub(super) async fn ack(slack: &Slack, kind: Kind, answer: Option<Response>, dea
             let opened = match answer {
                 Some(Response::Form(form)) => tokio::time::timeout_at(deadline, open(slack, &trigger, &form)).await,
                 Some(Response::Private(t)) => tokio::time::timeout_at(deadline, home::notice(slack, &trigger, &t)).await,
-                Some(Response::Done) => return None,
-                _ => tokio::time::timeout_at(deadline, home::notice(slack, &trigger, late)).await,
+                // No answer by the deadline leaves half a second of the
+                // trigger's 3 s: too little for a modal to open, and a click
+                // has nowhere else to show words.
+                None => {
+                    tracing::warn!("a click on the view got no answer in time: nothing was shown");
+                    return None;
+                }
+                Some(_) => return None,
             };
             match opened {
                 Ok(Ok(())) => {}

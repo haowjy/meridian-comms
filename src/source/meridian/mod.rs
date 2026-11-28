@@ -30,8 +30,8 @@ use crate::model::{
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `machine list`, and then each saved machine's listing, may take:
 /// together under the core's 30 s for a listing across machines. Measured on
-/// a Raspberry Pi: about 5 s for one that answers, nearly 10 beside other
-/// listings; `ssh` itself gives up connecting after 10.
+/// raspberry asking homebox: 4.9 s alone, 9.5 s beside five other listings;
+/// `ssh` itself gives up connecting after 10.
 const MACHINE_TIMEOUT: Duration = Duration::from_secs(12);
 /// What this program calls itself in an inbox item's `via` and in a claim.
 const PROGRAM: &str = "meridian-comms";
@@ -290,10 +290,16 @@ impl Meridian {
         let mut out = ListResponse::default();
         let elsewhere = async {
             // The sessions here are still worth listing without the others.
-            let saved = match self.saved_machines().await {
-                Ok(saved) => saved,
+            let asked = Instant::now();
+            let saved = self.saved_machines().await;
+            let took = asked.elapsed().as_secs_f32();
+            let saved = match saved {
+                Ok(saved) => {
+                    tracing::info!("machine list answered in {took:.1} s: {} saved", saved.len());
+                    saved
+                }
                 Err(e) => {
-                    tracing::warn!("no saved machine's sessions are listed: {e:#}");
+                    tracing::warn!("no saved machine's sessions are listed: machine list failed after {took:.1} s: {e:#}");
                     return Err(());
                 }
             };
@@ -305,7 +311,7 @@ impl Meridian {
                 };
                 let took = asked.elapsed().as_secs_f32();
                 match &rows {
-                    Ok(r) => tracing::debug!("{m} listed {} session(s) in {took:.1} s", r.spawns.len()),
+                    Ok(r) => tracing::info!("{m} answered in {took:.1} s: {} session(s)", r.spawns.len()),
                     Err(e) => tracing::warn!("no sessions listed from {m} after {took:.1} s: {e:#}"),
                 }
                 (id, m, rows)
@@ -350,7 +356,12 @@ impl Meridian {
             for mut row in rows.spawns {
                 let Some(project) = row.project_id.take() else { continue };
                 let Seen { groups, roots } = projects.entry(project.clone()).or_default();
-                let candidate = row.kind == "primary" && row.status == "running";
+                let candidate = row.kind == "primary";
+                // A primary that is starting or ending can't take a message
+                // and is no other session either: it is not counted.
+                if candidate && row.status != "running" {
+                    continue;
+                }
                 *groups.entry(row.work_id.clone()).or_default() += u32::from(!candidate);
                 roots.extend(row.project_root.clone().map(|r| (candidate, r)));
                 if candidate {
@@ -371,13 +382,22 @@ impl Meridian {
         Ok(out)
     }
 
-    /// The last part of the folder a project lives in. Meridian's rows give
-    /// only the folder each session runs in, which can be a worktree's, so the
+    /// The name of the folder a project lives in. Meridian's rows give only
+    /// the folder each session runs in, which can be a worktree's, so the
     /// configured root wins; for another project, the folder most of its
     /// primaries run in (people start those in the main checkout), else most
-    /// of its sessions.
+    /// of its sessions. A worktree in `<name>.worktrees/` (worktrunk's layout)
+    /// is named for `<name>`; one elsewhere can't be told from a checkout.
     fn project_label(&self, machine: &str, project: &str, roots: &[(bool, String)]) -> Option<String> {
-        let last = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let last = |p: &Path| {
+            let worktrees = p
+                .ancestors()
+                .filter_map(|a| a.file_name()?.to_str()?.strip_suffix(".worktrees"))
+                .find(|n| !n.is_empty());
+            worktrees
+                .map(String::from)
+                .or_else(|| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
         if machine == self.machine
             && let Some(p) = self.projects.get(project)
         {

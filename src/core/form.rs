@@ -75,15 +75,9 @@ impl Core {
     async fn interact(self: &Arc<Self>, i: Interaction) -> Response {
         let deadline = Instant::now() + ANSWER;
         match i {
-            Interaction::Form { sender, owner_only, .. } if owner_only && !self.is_owner(&sender) => {
-                Response::Private(view::NOT_YOURS.into())
-            }
-            Interaction::Form {
-                conversations,
-                sender,
-                session,
-                ..
-            } => self.form(&conversations, &sender, session).await,
+            Interaction::Form { conversation, sender } => self.form(&[conversation], &sender, None).await,
+            Interaction::ViewMessage { sender, .. } if !self.is_owner(&sender) => Response::Private(view::NOT_YOURS.into()),
+            Interaction::ViewMessage { sender, to } => self.form(&to.conversations, &sender, Some(to.session)).await,
             Interaction::Suggest {
                 conversation,
                 sender,

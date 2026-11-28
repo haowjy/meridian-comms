@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::{Local, Utc};
 use tokio::sync::watch;
 
-use super::online::{Listed, Need, Reader, Scope, Shared};
+use super::online::{By, Listed, Need, Reader, Scope, Shared};
 use super::{Core, Listing, text};
 use crate::model::{Agents, FormFor, Sender, View, ViewAgent, ViewGroup, ViewProject};
 
@@ -43,8 +43,10 @@ impl Core {
             });
             return;
         }
-        let need = Need::YoungerThan(if refresh { Duration::ZERO } else { REFRESH_AFTER });
-        let listing = self.listing(Scope::Everywhere, need);
+        let listing = match refresh {
+            true => self.listing(Scope::Everywhere, Need::YoungerThan(Duration::ZERO), By::ViewRefresh),
+            false => self.listing(Scope::Everywhere, Need::YoungerThan(REFRESH_AFTER), By::ViewOpen),
+        };
         let mut publisher = self.publisher.0.lock().unwrap();
         if let Some(again) = publisher.as_ref() {
             again.send_replace(());
@@ -145,10 +147,22 @@ impl Core {
                 message,
             });
         }
+        let named: BTreeMap<Option<&str>, &str> = places
+            .keys()
+            .map(|p| (*p, labels.get(p).copied().or(*p).unwrap_or("No project")))
+            .collect();
+        // Two projects whose folders share a name: each says its ID too.
+        let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+        for l in named.values() {
+            *uses.entry(l).or_default() += 1;
+        }
         let mut projects: Vec<ViewProject> = places
             .into_iter()
             .map(|(project, groups)| {
-                let label = labels.get(&project).copied().or(project).unwrap_or("No project");
+                let label = match (named[&project], project) {
+                    (l, Some(id)) if uses[l] > 1 && l != id => format!("{l} ({id})"),
+                    (l, _) => l.to_string(),
+                };
                 // What runs in no group goes last.
                 let (named, none): (Vec<_>, Vec<_>) = groups.into_iter().partition(|(g, _)| g.is_some());
                 let groups = named
@@ -164,10 +178,7 @@ impl Core {
                         },
                     })
                     .collect();
-                ViewProject {
-                    label: label.to_string(),
-                    groups,
-                }
+                ViewProject { label, groups }
             })
             .collect();
         projects.sort_by(|a, b| a.label.cmp(&b.label));

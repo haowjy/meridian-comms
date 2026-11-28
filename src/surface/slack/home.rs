@@ -61,12 +61,7 @@ pub(super) fn message(envelope: &Value) -> Option<(Kind, Interaction)> {
         Kind::Click {
             trigger: p["trigger_id"].as_str()?.to_string(),
         },
-        Interaction::Form {
-            conversations: to.conversations,
-            sender: person(user),
-            session: Some(to.session),
-            owner_only: true,
-        },
+        Interaction::ViewMessage { sender: person(user), to },
     ))
 }
 

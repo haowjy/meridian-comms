@@ -53,9 +53,31 @@ pub(super) struct Shared {
     pub newest: Option<Listed>,
     /// When the running listing started.
     pub running: Option<Instant>,
-    /// Someone needs a listing that starts after the running one did: the
-    /// next starts as soon as it ends.
-    again: bool,
+    /// Who asked for the running listing: the first started it, the rest joined.
+    by: Vec<By>,
+    /// Who needs a listing that starts after the running one did: the next
+    /// starts as soon as it ends.
+    next: Vec<By>,
+}
+
+/// Who asked for a listing, for the log.
+#[derive(Clone, Copy)]
+pub(super) enum By {
+    ViewOpen,
+    ViewRefresh,
+    Router,
+    Form,
+}
+
+impl By {
+    fn word(self) -> &'static str {
+        match self {
+            By::ViewOpen => "view open",
+            By::ViewRefresh => "view refresh",
+            By::Router => "router",
+            By::Form => "form",
+        }
+    }
 }
 
 /// What a caller needs of a scope's listing.
@@ -85,32 +107,52 @@ pub(super) struct Snapshots(Mutex<HashMap<Scope, watch::Sender<Shared>>>);
 impl Core {
     /// The newest listing of `scope` as it changes, after starting (or
     /// queueing) the one `need` asks for, if the newest won't do.
-    pub(super) fn listing(self: &Arc<Self>, scope: Scope, need: Need) -> watch::Receiver<Shared> {
+    pub(super) fn listing(self: &Arc<Self>, scope: Scope, need: Need, by: By) -> watch::Receiver<Shared> {
+        enum Act {
+            Start,
+            Join,
+            Next,
+            Newest,
+        }
         let mut all = self.snapshots.0.lock().unwrap();
         let snap = all.entry(scope.clone()).or_default();
-        let (start, again) = {
+        let act = {
             let s = snap.borrow();
             match (need, s.running) {
-                (Need::YoungerThan(age), None) => (s.newest.as_ref().is_none_or(|l| l.started.elapsed() >= age), false),
-                (Need::YoungerThan(_), Some(_)) => (false, false),
-                (Need::StartedAfter(t), None) => (s.newest.as_ref().is_none_or(|l| l.started < t), false),
-                (Need::StartedAfter(t), Some(running)) => (false, running < t),
+                (Need::YoungerThan(age), None) if s.newest.as_ref().is_none_or(|l| l.started.elapsed() >= age) => Act::Start,
+                (Need::StartedAfter(t), None) if s.newest.as_ref().is_none_or(|l| l.started < t) => Act::Start,
+                (_, None) => Act::Newest,
+                (Need::StartedAfter(t), Some(running)) if running < t => Act::Next,
+                (_, Some(_)) => Act::Join,
             }
         };
-        if start {
-            self.start_listing(scope, snap);
-        } else if again {
-            snap.send_modify(|s| s.again = true);
+        // Who joined is only for the log: subscribers aren't told.
+        match act {
+            Act::Start => self.start_listing(scope, snap, vec![by]),
+            Act::Join => {
+                snap.send_if_modified(|s| {
+                    s.by.push(by);
+                    false
+                });
+            }
+            Act::Next => {
+                snap.send_if_modified(|s| {
+                    s.next.push(by);
+                    false
+                });
+            }
+            Act::Newest => {}
         }
         snap.subscribe()
     }
 
-    /// Runs one listing of `scope`, and the next one if one is owed when it ends.
-    fn start_listing(self: &Arc<Self>, scope: Scope, snap: &watch::Sender<Shared>) {
+    /// Runs one listing of `scope` for `by`, and the next one if one is owed
+    /// when it ends.
+    fn start_listing(self: &Arc<Self>, scope: Scope, snap: &watch::Sender<Shared>, by: Vec<By>) {
         let started = Instant::now();
         snap.send_modify(|s| {
             s.running = Some(started);
-            s.again = false;
+            s.by = by;
         });
         let core = self.clone();
         tokio::spawn(async move {
@@ -128,10 +170,28 @@ impl Core {
             let listed = tokio::spawn(async move { lister.list(&req).await }).await;
             let all = core.snapshots.0.lock().unwrap();
             let snap = all.get(&scope).expect("an entry is never removed");
-            let mut again = false;
+            let mut next = vec![];
             snap.send_modify(|s| {
                 s.running = None;
-                again = s.again;
+                next = std::mem::take(&mut s.next);
+                if scope == Scope::Everywhere {
+                    let words: Vec<&str> = s.by.iter().map(|b| b.word()).collect();
+                    let (first, joined) = words.split_first().map_or(("nobody", &[][..]), |(f, j)| (*f, j));
+                    let joined = if joined.is_empty() {
+                        "nobody".to_string()
+                    } else {
+                        joined.join(", ")
+                    };
+                    let ended = match &listed {
+                        Ok(l) if l.failed => "a source failed".to_string(),
+                        Ok(l) => format!("{} candidates", l.candidates.len()),
+                        Err(_) => "the listing panicked".to_string(),
+                    };
+                    tracing::info!(
+                        "listing across machines: started for {first}, joined by {joined}, took {:.1} s, {ended}",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
                 match listed {
                     Ok(l) => {
                         s.newest = Some(Listed {
@@ -142,8 +202,8 @@ impl Core {
                     Err(e) => tracing::error!("listing sessions failed: {e}"),
                 }
             });
-            if again {
-                core.start_listing(scope.clone(), snap);
+            if !next.is_empty() {
+                core.start_listing(scope.clone(), snap, next);
             }
         });
     }
@@ -160,7 +220,7 @@ impl Core {
     /// than 15 s and none runs. With none, or only one older than 5 minutes,
     /// waits up to `wait` for the new one.
     pub async fn online(self: &Arc<Self>, project: Option<&str>, wait: Duration) -> Online {
-        let mut newest = self.listing(Scope::Project(project.map(String::from)), Need::YoungerThan(FRESH));
+        let mut newest = self.listing(Scope::Project(project.map(String::from)), Need::YoungerThan(FRESH), By::Form);
         let usable = |s: &Shared| s.newest.as_ref().is_some_and(|l| l.started.elapsed() <= STALE);
         let sessions = match tokio::time::timeout(wait, newest.wait_for(usable)).await {
             Ok(Ok(s)) => s.newest.as_ref().map(|l| l.listing.clone()),
@@ -176,7 +236,7 @@ impl Core {
     /// started at `after` or later: the one running, or the next. `None` when
     /// none finished in time.
     pub(super) async fn everywhere(self: &Arc<Self>, after: Instant) -> Option<Arc<Listing>> {
-        let mut newest = self.listing(Scope::Everywhere, Need::StartedAfter(after));
+        let mut newest = self.listing(Scope::Everywhere, Need::StartedAfter(after), By::Router);
         let late_enough = |s: &Shared| s.newest.as_ref().is_some_and(|l| l.started >= after);
         // At most the one running and the next; this is for one that never ends.
         let waited = tokio::time::timeout(EVERYWHERE_TIMEOUT * 2 + FRESH, newest.wait_for(late_enough)).await;

@@ -341,16 +341,12 @@ pub struct Action {
 /// `Response` goes back on.
 #[derive(Debug, Clone)]
 pub enum Interaction {
-    /// A person asked for the form that opens a thread for one session, in
-    /// one of `conversations` (the person chooses when there are several);
-    /// `session` is a ref already chosen. `owner_only`: asked from the view,
-    /// which is the owner's alone.
-    Form {
-        conversations: Vec<String>,
-        sender: Sender,
-        session: Option<String>,
-        owner_only: bool,
-    },
+    /// A person asked, in `conversation`, for the form that opens a thread
+    /// there for one session.
+    Form { conversation: String, sender: Sender },
+    /// A person clicked Message in the view, which is the owner's alone: the
+    /// form, with the session chosen and the conversations it may use.
+    ViewMessage { sender: Sender, to: FormFor },
     /// The form's session field asks what to offer for what was typed, for
     /// the form's first conversation.
     Suggest {

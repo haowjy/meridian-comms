@@ -526,10 +526,13 @@ opening the view to others means deciding what each may see.
 
 - **Events:** Slack's `app_home_opened` with `tab` `home` (the Messages tab sends the
   same event, and is dropped), and the Refresh click, come in as events. A Message click
-  must open a modal within Slack's 3 s, so it is answered like the form's command: the
-  core answers with the form and the socket opens it with the click's `trigger_id`
-  before acknowledging. An answer in words (someone not the owner) opens as a modal of
-  its own, since a Home click has no channel.
+  must open a modal within Slack's 3 s, so it is an interaction of its own
+  (`ViewMessage`), answered like the form's command: the core checks the owner and
+  answers with the form, and the socket opens it with the click's `trigger_id` before
+  acknowledging. An answer in words (someone not the owner) opens as a modal of its own,
+  since a Home click has no channel. A click the core didn't answer by the socket's
+  2.5 s is only logged: the half second left of the trigger's life is too little to open
+  a modal.
 - **Freshness:** opening shows the newest listing at once, with its age, and starts a
   new one when it is over 60 s old; Refresh always starts one, or joins the one running.
   Nothing polls. One task publishes the owner's view (`views.publish`), again whenever
@@ -663,9 +666,11 @@ older name.
 For an offer and the Home tab the Meridian source also lists the sessions of every
 machine Meridian has saved (`meridian machine list`): one `spawn list --global --json
 --machine M` each, all at once, beside the local listing. `machine list` and then each
-machine have 12 seconds. One that answers takes about 5 on a Raspberry Pi, nearly 10
-beside other listings; one that is down, too old or slow contributes no sessions, and is
-named in the answer's `machines` with why. The whole listing stays under the core's
+machine have 12 seconds. A design review measured raspberry (Meridian 0.28.3) asking
+homebox: about 4.9 s alone, 9.5 s beside five local listings. One that is down, too old
+or slow contributes no sessions, and is named in the answer's `machines` with why. Each
+listing logs at info who started and joined it, how long it took, and how long
+`machine list` and each saved machine took and whether it answered. The whole listing stays under the core's
 30-second limit however many machines are saved.
 
 That answer carries more than candidates. Each candidate has `wakeable`: whether `wake`
@@ -673,9 +678,11 @@ from this daemon reaches it, which for Meridian is a running primary in a config
 project on this machine. `groups` has one entry per `(machine, project, group)` with
 anything running, with how many of what runs there are not candidates (for Meridian,
 spawns, which is why this listing drops `--primary`) and the project's label. The label
-is the last part of the project's folder: the configured root here; elsewhere the folder
-most of its primaries run in, since Meridian's rows give each session's own folder,
-which can be a worktree's, and no command gives a project's main checkout. `machines`
+is the name of the project's folder: the configured root here; elsewhere the folder most
+of its primaries run in, since Meridian's rows give each session's own folder, which can
+be a worktree's, and no command gives a project's main checkout. A folder inside
+`<name>.worktrees/` is named `<name>`. A primary that is starting or ending is counted
+nowhere. The view adds the project ID to each of two projects whose labels are the same. `machines`
 has each machine looked on, by ID and name, and whether it answered; a `machine list`
 that fails is one entry with no name. A row's `desc` (a spawn's prompt opening) is
 never read.
