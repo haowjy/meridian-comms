@@ -28,7 +28,7 @@ pub fn run(owner: Option<String>) -> Result<()> {
     print!(
         "{}",
         manifest
-            .replace("jimmy-agents", &format!("{owner}-agents"))
+            .replace("meridian-jimmy", &format!("meridian-{owner}"))
             .replace("Jimmy's", &format!("{cap}'s"))
     );
     eprintln!("\n{}", crate::source::meridian::people::SETUP);

@@ -676,8 +676,10 @@ candidate's project and, in the router directory, `spawn`, `spawn wait`, `spawn 
 and `spawn cancel`. `setup router` runs `--version`, then in the router directory
 `mars remove`, `init` and `spawn --dry-run`. Rows may carry `agent`, `work_id`,
 `activity` and an `idle` object. `activity` of `turn_active`, `starting` or `finalizing`
-is working; otherwise `idle` is idle with its cache deadline; neither means activity is
-unknown, never cold. `activity` is read first because `idle` means "since the last
+is working; otherwise `idle` is idle with its cache deadline. `activity` of `idle` with
+no `idle` object (a primary with idle notifications off) is idle with no stretch and no
+cache deadline: shown as idle, never offered to, since its warmth is unknown. Neither
+means activity is unknown, never cold. `activity` is read first because `idle` means "since the last
 user-loop turn ended": a Claude primary running a turn that something injected (a wake,
 a task notification) keeps its old `since`. The row has no `waiting_on_user`, and the
 source never reports "waiting".

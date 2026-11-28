@@ -3,7 +3,7 @@
 Hand work to someone's coding agents in Slack, and get the answer back in the same
 thread.
 
-Write `@jimmy-agents please rebase the auth branch` in a channel. The bot lists the
+Write `@meridian-jimmy please rebase the auth branch` in a channel. The bot lists the
 agent sessions Jimmy has running, each with its model and whether it is working, idle
 or gone cold. Reply `to: p41`, and that session gets a one-line notice, reads the thread
 itself, and answers there. Later messages in the thread go to the same session. Agents

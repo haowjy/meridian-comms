@@ -442,6 +442,14 @@ impl Meridian {
                 warm_until: None,
                 note: None,
             }),
+            // `idle` with no idle object: a primary with idle notifications
+            // off. Idle, with no stretch and so no warm time to offer on.
+            Some("idle") if row.idle.is_none() => Some(Activity {
+                state: ActivityState::Idle,
+                since: None,
+                warm_until: None,
+                note: None,
+            }),
             _ => row.idle.map(|i| Activity {
                 state: ActivityState::Idle,
                 since: i.since,
