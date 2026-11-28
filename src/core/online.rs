@@ -193,9 +193,16 @@ impl Core {
         });
     }
 
-    /// The newest listing, without starting one.
+    /// The newest listing, without starting one, unless it is over 5 minutes
+    /// old: then none, as for `online`. A caller trusts what it says about the
+    /// machines, so a machine removed since counts for at most that long.
     pub(super) fn newest(&self) -> Option<Arc<Listing>> {
-        self.snapshot.0.lock().unwrap().borrow().newest.as_ref().map(|l| l.listing.clone())
+        let snap = self.snapshot.0.lock().unwrap();
+        let s = snap.borrow();
+        s.newest
+            .as_ref()
+            .filter(|l| l.started.elapsed() <= STALE)
+            .map(|l| l.listing.clone())
     }
 
     /// For what must answer within seconds: the newest listing, kept to
