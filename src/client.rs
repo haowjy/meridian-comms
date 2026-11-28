@@ -1,9 +1,10 @@
 //! The client a session runs: `read`, `send` and `list`. It learns who is calling
 //! from the sources, asks the daemon over its socket, and prints the answer.
-//! `route` is what a source's inbox runs for a new message, and `routes` prints
-//! the routing log.
+//! `post` is what a source's people command calls. `route` is what a source's
+//! inbox runs for a new message, and `routes` prints the routing log.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{Local, Utc};
@@ -13,12 +14,12 @@ use tokio::net::UnixStream;
 
 use crate::config::Config;
 use crate::daemon;
-use crate::model::{CallerKind, IdentifyRequest, IdentifyResult};
+use crate::model::{CallerKind, FailKind, Failure, IdentifyRequest, IdentifyResult};
 use crate::paths;
-use crate::proto::{ListOut, ReadOut, Reply, Request, RouteOut, SendOut, Target};
+use crate::proto::{ListOut, MAX_REQUEST, PostTo, ReadOut, Reply, Request, RouteOut, SendOut, Target};
 use crate::routes;
 
-const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Who is calling: the first source that claims the environment, else the
 /// owner at a terminal. A session never falls through to the owner.
@@ -29,11 +30,14 @@ fn identify() -> Result<IdentifyResult> {
         let id = s.identify(&req);
         match id.caller {
             CallerKind::None => continue,
-            CallerKind::Unlisted => bail!(
-                "this session's project is not listed in {}: add it under [sources.{}.projects] to let this session use meridian-comms",
-                crate::config::config_path().display(),
-                s.name()
-            ),
+            CallerKind::Unlisted => bail!(Failure::new(
+                FailKind::NotAllowed,
+                format!(
+                    "this session's project is not listed in {}: add it under [sources.{}.projects] to let this session use meridian-comms",
+                    crate::config::config_path().display(),
+                    s.name()
+                )
+            )),
             CallerKind::Session => return Ok(id),
         }
     }
@@ -50,40 +54,59 @@ fn environment() -> IdentifyRequest {
     }
 }
 
-async fn call<T: DeserializeOwned>(req: &Request) -> Result<T> {
+/// One request and its answer. Every error is a `Failure`: from the moment the
+/// request is written, one without a clear answer is `MaybeDelivered`.
+async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
+    let fail = |kind, text: String| anyhow::Error::from(Failure::new(kind, text));
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+    if line.len() > MAX_REQUEST {
+        bail!(Failure::new(
+            FailKind::TooLarge,
+            format!("the request is over the daemon's {} MiB; nothing was sent", MAX_REQUEST >> 20)
+        ));
+    }
     let path = paths::socket_path();
-    let conn = UnixStream::connect(&path).await.with_context(|| {
-        format!(
-            "cannot reach the meridian-comms daemon at {}. Is it running (`meridian-comms daemon`)? A sandboxed session may block Unix sockets: allow connecting to that path",
-            path.display()
+    let conn = UnixStream::connect(&path).await.map_err(|e| {
+        fail(
+            FailKind::Unreachable,
+            format!(
+                "cannot reach the meridian-comms daemon at {} ({e}); nothing was sent. Is it running (`meridian-comms daemon`)? A sandboxed session may block Unix sockets: allow connecting to that path",
+                path.display()
+            ),
         )
     })?;
+    let unanswered = |what: String| {
+        fail(
+            FailKind::MaybeSent,
+            format!(
+                "{what}. The daemon may have finished the request: `meridian-comms read` shows whether the message was posted before you send again"
+            ),
+        )
+    };
     let (rd, mut wr) = conn.into_split();
-    wr.write_all(serde_json::to_string(req)?.as_bytes()).await?;
-    wr.write_all(b"\n").await?;
-    let mut line = String::new();
-    // Only this side gives up: the daemon finishes the request either way.
-    tokio::time::timeout(ANSWER_TIMEOUT, BufReader::new(rd).read_line(&mut line))
+    wr.write_all(line.as_bytes())
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "no answer from the daemon after {} s. It may still finish the request: `meridian-comms read` shows whether the message was posted before you send again",
-                ANSWER_TIMEOUT.as_secs()
-            )
-        })??;
-    if line.is_empty() {
-        bail!("the daemon closed the connection without answering");
+        .map_err(|e| unanswered(format!("the request to the daemon broke off ({e})")))?;
+    let mut answer = String::new();
+    // Only this side gives up: the daemon finishes the request either way.
+    match tokio::time::timeout(wait, BufReader::new(rd).read_line(&mut answer)).await {
+        Err(_) => return Err(unanswered(format!("no answer from the daemon after {} s", wait.as_secs()))),
+        Ok(Err(e)) => return Err(unanswered(format!("the daemon's answer broke off ({e})"))),
+        Ok(Ok(_)) if answer.is_empty() => return Err(unanswered("the daemon closed the connection without answering".into())),
+        Ok(Ok(_)) => {}
     }
-    let reply: Reply<T> = serde_json::from_str(&line).context("unreadable answer from the daemon")?;
+    let reply: Reply<T> = serde_json::from_str(&answer).map_err(|e| unanswered(format!("unreadable answer from the daemon ({e})")))?;
     match (reply.error, reply.result) {
         // A daemon that can't read the request is another build: after an
         // upgrade the old one is still running.
-        (Some(e), _) if e.starts_with("bad request") => {
-            bail!("{e}. The daemon is a different build from this client: restart it (`meridian-comms daemon`)")
-        }
-        (Some(e), _) => bail!("{e}"),
+        (Some(e), _) if e.starts_with("bad request") => Err(fail(
+            FailKind::NotSent,
+            format!("{e}. The daemon is a different build from this client: restart it (`meridian-comms daemon`)"),
+        )),
+        (Some(e), _) => Err(fail(reply.kind.unwrap_or(FailKind::NotSent), e)),
         (None, Some(r)) => Ok(r),
-        (None, None) => bail!("the daemon answered with nothing"),
+        (None, None) => Err(unanswered("the daemon answered with nothing".into())),
     }
 }
 
@@ -105,11 +128,14 @@ fn json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 pub async fn read(message: Option<String>, channel: Option<String>, limit: Option<usize>, as_json: bool) -> Result<()> {
-    let out: ReadOut = call(&Request::Read {
-        caller: identify()?,
-        target: target(message, channel)?,
-        limit,
-    })
+    let out: ReadOut = call(
+        &Request::Read {
+            caller: identify()?,
+            target: target(message, channel)?,
+            limit,
+        },
+        ANSWER_TIMEOUT,
+    )
     .await?;
     if as_json {
         return json(&out);
@@ -158,12 +184,15 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
         }
         _ => text,
     };
-    let out: SendOut = call(&Request::Send {
-        caller: identify()?,
-        target: target(message, channel)?,
-        to: to.clone(),
-        text,
-    })
+    let out: SendOut = call(
+        &Request::Send {
+            caller: identify()?,
+            target: target(message, channel)?,
+            to: to.clone(),
+            text,
+        },
+        ANSWER_TIMEOUT,
+    )
     .await?;
     if as_json {
         json(&out)?;
@@ -196,11 +225,21 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
     Ok(())
 }
 
+/// Posts `text` for a person or in a thread and wakes nobody. Every error is
+/// a `Failure`.
+pub async fn post(to: PostTo, text: String, wait: Duration) -> Result<SendOut> {
+    let caller = identify()?;
+    call(&Request::Post { caller, to, text }, wait).await
+}
+
 pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
-    let out: ListOut = call(&Request::List {
-        caller: identify()?,
-        project,
-    })
+    let out: ListOut = call(
+        &Request::List {
+            caller: identify()?,
+            project,
+        },
+        ANSWER_TIMEOUT,
+    )
     .await?;
     if as_json {
         return json(&out);
@@ -253,7 +292,7 @@ pub async fn route(item: Option<String>) -> Result<()> {
                 .context("no item to route: name one, or run this as a source's hook for a new inbox message")?
         }
     };
-    let out: RouteOut = call(&Request::Route { source, item }).await?;
+    let out: RouteOut = call(&Request::Route { source, item }, ANSWER_TIMEOUT).await?;
     println!("{}", out.detail);
     Ok(())
 }

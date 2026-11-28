@@ -431,7 +431,9 @@ organization is refused at start unless its entry says `external = true`.
 
 ## Client and daemon
 
-The client learns who is calling from the source (`identify`): a Meridian primary is a
+The client's commands are `read`, `send` and `list` for a session or a person, `deliver`
+for `meridian message @…` (below), `route` for a source's inbox hook, and `routes`, which reads
+the routing log itself. The client learns who is calling from the source (`identify`): a Meridian primary is a
 session of its project; a child spawn may read but not post; a session whose project is
 not in the config is refused; a process with no Meridian variables is the owner at a
 terminal. Requests go over a Unix socket (mode 0600, peer uid checked) as one JSON
@@ -441,7 +443,7 @@ may open threads there. `send` waits for the post and the wakes. A cold session 
 is not a failure; the command exits non-zero, with a retry line naming only the refs
 whose wake errored. A request runs to the end in its own task in the daemon whether or
 not the client is still waiting (the client gives up after 300 s and says the daemon
-may still finish). The socket is `/run/user/<uid>/meridian-comms.sock` where that
+may still finish; `deliver` gives up after 60 s). The socket is `/run/user/<uid>/meridian-comms.sock` where that
 directory exists, whatever `XDG_RUNTIME_DIR` the caller has, so a session started
 without it finds the same path as the daemon.
 
@@ -468,6 +470,64 @@ unknown, never cold. `activity` is read first because `idle` means "since the la
 user-loop turn ended": a Claude primary running a turn that something injected (a wake,
 a task notification) keeps its old `since`. The row has no `waiting_on_user`, and the
 source never reports "waiting".
+
+### Posting for a person
+
+The `post` request (`src/proto.rs`, `post_to` in `src/core/api.rs`) posts text for a
+person or in a thread and wakes nobody. It goes through `send`'s path, so there is one
+way a post is made, and its caller must be allowed to post, as for `send`: a child spawn
+is not.
+
+- **For a person** in `[people]`, it opens a new thread that starts "From … to
+  <mention>", the mention being the surface's (`<@U…>` on Slack) so the person is
+  notified. The channel is the one whose `project` is the caller's; with none, the one
+  channel with no project and `post = true`; for the owner at a terminal, the one channel
+  they may open threads in. Several is `ambiguous`, none is `no_channel`.
+- **In a thread** named by a message ref, as `send <ref>` does.
+
+**A thread, not a DM.** The person's reply then reaches the session through what exists:
+the session that posted joins its person's scope, and the rule delivers the reply. A DM
+would need `im:write`, `im:history` and the `message.im` event (a reinstall), and its
+reply would reach nothing, because the core reads configured channels only. The cost is
+that the channel sees the message and the person has to be in it.
+
+**Its errors say whether the post may have gone out.** The kind (`FailKind` in
+`src/model.rs`) travels as a `Failure` inside the error, set where it is known, and the
+daemon's reply carries it (`Reply.kind`). Every kind but `maybe_sent` says nothing was
+posted. An error that names no kind is `not_sent`, so every step after the post names
+`maybe_sent`.
+
+| Kind | Where it comes from |
+|---|---|
+| `invalid` | A ref that is not `<channel>/<id>`, empty text. |
+| `not_found` | No such person, channel or message. |
+| `ambiguous`, `no_channel` | Choosing the channel, above. |
+| `not_allowed` | A caller that may not post (a child spawn, an unlisted project), a channel of another project. |
+| `too_large` | Over Slack's 40,000 characters, checked before posting; a request over the socket's 4 MiB, checked by the client. |
+| `unreachable` | The client could not connect to the socket. |
+| `not_sent` | Slack answered with an error, the request never had a connection, or the daemon refused before posting (another build reads `post` as a bad request). |
+| `maybe_sent` | The Slack request went out with no answer, or with a 5xx, unreadable JSON, `internal_error`/`fatal_error` (Slack says these may follow a partial success), or no `ts`; anything failing after the post; a panic in the request; the socket dropping after the request was written; the client's time limit. |
+
+The Web client (`src/surface/slack/web.rs`) tells the two apart at the call: its error
+says `unanswered` unless the request never had a connection (connecting, TLS included,
+is limited to 10 s so a stalled connect is a connect error) or Slack's answer refused
+it, and the surface's `post` turns that into the kind. A read before the post keeps no
+kind, so a failed read is `not_sent`.
+
+### `deliver`, for Meridian
+
+`meridian message @alice "…"` runs the program in `[message] people` of
+`~/.meridian/config.toml` with the address as its last argument, the text on stdin and
+the environment `meridian` started with, and reads one JSON line back within 120 s.
+`meridian-comms deliver <address>` is that program, and all of it that knows Meridian's
+contract is in `src/source/meridian/people.rs`: `@<person>` and `@<channel>/<id>` become
+a `post`, waiting at most 60 s; the answer is `{"ok": true, "delivery": "acknowledged",
+"note": <link>}` once Slack returned the post's `ts`, or `{"ok": false, "error": {"kind",
+"text"}}` with exit 1, the kind mapped onto Meridian's closed list (`invalid` → `usage`,
+`no_channel` → `no_route`, `not_allowed` → `refused`, `not_sent` → `failed`, `maybe_sent`
+→ `maybe_delivered`, the rest by the same name). The wake notice still names
+`meridian-comms send`: a notice naming `meridian message @…` would fail on a machine
+without `[message] people`.
 
 ## Saved machines
 

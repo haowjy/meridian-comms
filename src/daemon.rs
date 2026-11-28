@@ -13,14 +13,13 @@ use tokio::sync::mpsc;
 use crate::config::{self, Config, Tokens};
 use crate::core::Core;
 use crate::jev::Jev;
+use crate::model::{FailKind, Failure};
 use crate::paths;
-use crate::proto::{Reply, Request};
+use crate::proto::{MAX_REQUEST, Reply, Request};
 use crate::routes;
 use crate::source::{Source, meridian, meridian::Meridian};
 use crate::state::Store;
 use crate::surface::{Surface, slack::Slack};
-
-const MAX_REQUEST: u64 = 4 << 20;
 
 pub fn sources(cfg: &Config) -> Result<Vec<Box<dyn Source>>> {
     let mut out: Vec<Box<dyn Source>> = vec![];
@@ -156,19 +155,21 @@ async fn connection(core: Arc<Core>, conn: UnixStream) -> Result<()> {
     }
     let (rd, mut wr) = conn.into_split();
     let mut line = String::new();
-    BufReader::new(rd.take(MAX_REQUEST)).read_line(&mut line).await?;
+    BufReader::new(rd.take(MAX_REQUEST as u64)).read_line(&mut line).await?;
     let reply = match serde_json::from_str::<Request>(&line) {
-        Err(e) => error(format!("bad request: {e}")),
+        Err(e) => error(FailKind::NotSent, format!("bad request: {e}")),
         // The request runs to the end in its own task, whether or not the client
         // is still waiting: a `send` that has posted must finish its wakes and
         // write its thread file.
         Ok(req) => match tokio::spawn(async move { handle(&core, req).await }).await {
             Ok(Ok(v)) => Reply {
                 error: None,
+                kind: None,
                 result: Some(v),
             },
-            Ok(Err(e)) => error(format!("{e:#}")),
-            Err(e) => error(format!("the request failed inside the daemon: {e}")),
+            Ok(Err(e)) => error(Failure::kind_of(&e), format!("{e:#}")),
+            // It may have stopped after a post.
+            Err(e) => error(FailKind::MaybeSent, format!("the request failed inside the daemon: {e}")),
         },
     };
     wr.write_all(serde_json::to_string(&reply)?.as_bytes()).await?;
@@ -176,9 +177,10 @@ async fn connection(core: Arc<Core>, conn: UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn error(e: String) -> Reply<serde_json::Value> {
+fn error(kind: FailKind, e: String) -> Reply<serde_json::Value> {
     Reply {
         error: Some(e),
+        kind: Some(kind),
         result: None,
     }
 }
@@ -186,8 +188,9 @@ fn error(e: String) -> Reply<serde_json::Value> {
 async fn handle(core: &Arc<Core>, req: Request) -> Result<serde_json::Value> {
     Ok(match req {
         Request::Read { caller, target, limit } => serde_json::to_value(core.read(&core.who(&caller)?, target, limit).await?)?,
-        Request::Send { caller, target, to, text } => serde_json::to_value(core.send(&core.who(&caller)?, target, to, text).await?)?,
+        Request::Send { caller, target, to, text } => serde_json::to_value(core.send(&core.who(&caller)?, target, to, text, None).await?)?,
         Request::List { caller, project } => serde_json::to_value(core.list_people(&core.who(&caller)?, project).await?)?,
+        Request::Post { caller, to, text } => serde_json::to_value(core.post_to(&core.who(&caller)?, to, text).await?)?,
         Request::Route { source, item } => serde_json::to_value(core.route(source, item)?)?,
     })
 }

@@ -17,6 +17,7 @@ pub trait Surface: Send + Sync {
     /// surface never sends the bot's own posts, edits or deletions.
     async fn run(&self, events: mpsc::Sender<SurfaceEvent>);
     /// Posts as the bot, with the post's menu if the surface has menus. Never retried by the core.
+    /// An error is a `Failure`: `MaybeDelivered` when the post may have gone out.
     async fn post(&self, req: PostRequest) -> Result<Posted>;
     /// Adds `note` under the bot's post `post`, keeping its text. Its menu and
     /// buttons go unless `keep_menu`: a choice was made with them, or (kept)
@@ -27,6 +28,8 @@ pub trait Surface: Send + Sync {
     /// Tells a paused thread that it is paused after `limit` messages, and how
     /// a person lets it go on.
     async fn notify_pause(&self, conversation: &str, thread: &str, limit: u32) -> Result<()>;
+    /// How a post names person `user` (their ID on this surface) so the surface notifies them.
+    fn mention(&self, user: &str) -> String;
     /// A permalink to message `id`, for a source that cannot run `read`.
     fn link(&self, conversation: &str, id: &str, thread: &str) -> String;
     /// The thread containing message `id`, oldest first; with `from`, only later messages.

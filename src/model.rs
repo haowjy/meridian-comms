@@ -334,6 +334,44 @@ pub struct MenuOption {
     pub label: String,
 }
 
+/// Why a post failed. Every kind but `MaybeSent` says nothing was posted,
+/// so sending again is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailKind {
+    /// The request itself is wrong: a malformed ref, empty text.
+    Invalid,
+    NotFound,
+    Ambiguous,
+    /// No channel is configured to take it.
+    NoChannel,
+    NotAllowed,
+    TooLarge,
+    /// The client could not reach the daemon.
+    Unreachable,
+    NotSent,
+    MaybeSent,
+}
+
+/// An error that carries its kind through `anyhow`. An error without one
+/// is `NotSent`, so a step that runs after a post must say `MaybeSent`.
+#[derive(Debug, thiserror::Error)]
+#[error("{text}")]
+pub struct Failure {
+    pub kind: FailKind,
+    pub text: String,
+}
+
+impl Failure {
+    pub fn new(kind: FailKind, text: impl Into<String>) -> Self {
+        Self { kind, text: text.into() }
+    }
+
+    pub fn kind_of(e: &anyhow::Error) -> FailKind {
+        e.downcast_ref::<Failure>().map_or(FailKind::NotSent, |f| f.kind)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Posted {
     pub id: String,

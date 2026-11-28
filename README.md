@@ -43,6 +43,7 @@ recipients, are not supported.
 meridian-comms read <message> | --channel NAME     print a thread or a channel's recent threads
 meridian-comms send <message> | --channel NAME     post as the bot; --to wakes who it names
 meridian-comms list                                who could take a message, and what is waiting
+meridian-comms deliver @PERSON | @<message>        post the text on stdin for `meridian message @…`
 meridian-comms route [ITEM]                        hand an inbox message to the router (Meridian's hook runs it)
 meridian-comms routes [ITEM | <message>]           what the router did: all, one inbox item (m412), or one message
 meridian-comms daemon                              the Slack connection (run as a user service)
@@ -59,6 +60,26 @@ meridian-comms setup router                        set up the agent the router a
    people, and the Meridian projects. The fields are in [docs/design.md](docs/design.md).
 4. Run `meridian-comms daemon` outside any agent session, as a user service:
    [docs/service.md](docs/service.md).
+
+## Message a person from a session
+
+`meridian message @alice "the PR is up"` hands the text to the program named in
+Meridian's config. To make that this bot, add to `~/.meridian/config.toml` by hand
+(`meridian-comms setup` prints the same lines; it never writes Meridian's config):
+
+```toml
+[message]
+people = ["meridian-comms", "deliver"]
+```
+
+`@alice` must be a name under `[people]`. The bot opens a new thread in the channel of
+the session's project, or the one channel with no project and `post = true` when the
+project has none, starting "From jimmy's session `…` to @alice", so Slack notifies
+Alice. She must be in that channel. Her reply in the thread goes to the session that
+wrote, as a reply to any session's post does: woken unless it has gone cold, otherwise
+waiting. `meridian message @meridian-cli/1731600123.000200 "..."`
+answers in that message's thread instead. Either way nobody is woken, and a child spawn
+may not post.
 
 ## Turn the router on
 

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::Surface;
-use crate::model::{Menu, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
+use crate::model::{FailKind, Failure, Menu, Msg, PostRequest, Posted, Sender, SurfaceEvent, WhoAmI};
 use web::{Token, Web};
 
 /// Ids of the picker's blocks and elements; the click reads the menu's choice
@@ -20,8 +20,9 @@ const MENU_BLOCK: &str = "picker";
 const MENU: &str = "pick";
 const BUTTON: &str = "choose";
 
-// Slack's limits for a section's text, a select's groups, a group's options,
+// Slack's limits for a message's text, a section's text, a select's groups, a group's options,
 // and an option's label and value.
+const MAX_TEXT: usize = 40_000;
 const SECTION_TEXT: usize = 3000;
 const MAX_GROUPS: usize = 100;
 const MAX_OPTIONS: usize = 100;
@@ -179,6 +180,12 @@ impl Surface for Slack {
             true => req.text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
             false => req.text.replace("<!", "&lt;!"),
         };
+        if text.chars().count() > MAX_TEXT {
+            bail!(Failure::new(
+                FailKind::TooLarge,
+                format!("the post is over Slack's {MAX_TEXT} characters; nothing was posted")
+            ));
+        }
         let mut body = json!({
             "channel": req.conversation, "text": text, "unfurl_links": false, "unfurl_media": false,
         });
@@ -205,9 +212,14 @@ impl Surface for Slack {
         if let Some(t) = &req.thread {
             body["thread_ts"] = json!(t);
         }
-        let v = self.web.json("chat.postMessage", &body).await?;
-        let id = v["ts"].as_str().context("chat.postMessage gave no ts")?.to_string();
-        Ok(Posted { id })
+        let v = self.web.json("chat.postMessage", &body).await.map_err(|e| {
+            let kind = if e.unanswered { FailKind::MaybeSent } else { FailKind::NotSent };
+            Failure::new(kind, e.to_string())
+        })?;
+        let id = v["ts"]
+            .as_str()
+            .ok_or_else(|| Failure::new(FailKind::MaybeSent, "slack chat.postMessage: Slack said ok but gave no ts"))?;
+        Ok(Posted { id: id.to_string() })
     }
 
     async fn notify_pause(&self, conversation: &str, thread: &str, limit: u32) -> Result<()> {
@@ -221,7 +233,8 @@ impl Surface for Slack {
                 ]}
             ],
         });
-        self.web.json("chat.postMessage", &body).await.map(|_| ())
+        self.web.json("chat.postMessage", &body).await?;
+        Ok(())
     }
 
     async fn annotate(&self, conversation: &str, thread: &str, post: &str, note: &str, keep_menu: bool) -> Result<()> {
@@ -256,7 +269,12 @@ impl Surface for Slack {
             blocks.push(json!({"type": "context", "elements": [{"type": "mrkdwn", "text": fit(note, SECTION_TEXT)}]}));
             body["blocks"] = json!(blocks);
         }
-        self.web.json("chat.update", &body).await.map(|_| ())
+        self.web.json("chat.update", &body).await?;
+        Ok(())
+    }
+
+    fn mention(&self, user: &str) -> String {
+        format!("<@{user}>")
     }
 
     fn link(&self, conversation: &str, id: &str, thread: &str) -> String {
@@ -276,7 +294,7 @@ impl Surface for Slack {
         ];
         match self.web.form(Token::Bot, "reactions.add", &p).await {
             Err(e) if e.to_string().contains("already_reacted") => Ok(()),
-            r => r.map(|_| ()),
+            r => Ok(r.map(|_| ())?),
         }
     }
 
