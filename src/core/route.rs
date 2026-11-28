@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 
 use super::filing::INBOX_TIMEOUT;
-use super::online::Reader;
+use super::online::{By, Reader};
 use super::{Core, WAKE_TIMEOUT, text};
 use crate::jev;
 use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision, InboxItem, Offered, PostRequest};
@@ -238,8 +238,6 @@ impl Core {
     /// gathers what the log keeps as the steps learn it. An error is a failed
     /// run: nothing was offered and the item waits.
     async fn run_route(self: &Arc<Self>, src: usize, route: &mut Route, reply: Option<&str>) -> Result<(Outcome, String)> {
-        // The sessions offered among are listed after this attempt began.
-        let attempt = Instant::now();
         let Some(jev) = &self.jev else {
             return Ok((
                 Outcome::Off,
@@ -275,24 +273,24 @@ impl Core {
             return Ok((Outcome::None, "nothing: it was already taken".into()));
         }
 
-        // Shared with the Home view, so the two never list across machines at once.
-        let listing = self
-            .everywhere(attempt)
-            .await
-            .context("listing the running sessions did not finish")?;
-        route.missing = listing.machines.iter().filter(|m| !m.ok).cloned().collect();
-        if listing.failed {
-            bail!("a source could not list the running sessions");
+        // Shared with every other caller, so the bot's machine never runs two
+        // listings at once. It offers among the machines that answered.
+        let listing = self.fresh(By::Router).await;
+        route.missing = listing.machines.iter().filter(|(_, m)| !m.ok).map(|(_, m)| m.clone()).collect();
+        if listing.failed.contains(&src) {
+            bail!("the source could not list the running sessions");
         }
         let now = Utc::now();
         // A guess never carries a message out of its project, to its own
         // sender, or to a session that would pay to re-read its context.
         let kept: Vec<Candidate> = self
             .reach(&listing, Reader::Router(src))
+            .candidates
+            .into_iter()
+            .map(|(_, c)| c)
             .filter(|c| item.project.is_none() || c.project == item.project)
             .filter(|c| item.from.as_ref() != Some(&c.ref_))
             .filter(|c| awake(c, now))
-            .cloned()
             .collect();
         if kept.is_empty() {
             return Ok((Outcome::None, "nothing: no working or warm session to offer it to".into()));
@@ -338,7 +336,7 @@ impl Core {
             }
         };
 
-        let offer = tokio::time::timeout(WAKE_TIMEOUT, source.offer(&route.item, &target.ref_))
+        let offer = tokio::time::timeout(WAKE_TIMEOUT, source.offer(&route.item, target))
             .await
             .context("the offer timed out")??;
         // Not offered, or perhaps offered: either way the item waits, and the
@@ -350,7 +348,9 @@ impl Core {
             Offered::Maybe => return Ok((Outcome::MaybeOffered, format!("may have been offered to {}: {why}", target.ref_))),
         }
         if let Some(t) = thread
-            && let Err(e) = self.note_offer(&t, source.name(), &route.item, target, now).await
+            && let Err(e) = self
+                .note_offer(&t, source.name(), &route.item, &self.show(&listing, &target.ref_), target, now)
+                .await
         {
             tracing::warn!("cannot say in the thread who was offered {}: {e:#}", route.item);
         }
@@ -471,7 +471,8 @@ impl Core {
 
     /// Says in the thread an item was filed from who was offered it: on the
     /// bot's post that names the item, or in a post of its own.
-    async fn note_offer(&self, t: &ThreadState, source: &str, item: &str, c: &Candidate, now: DateTime<Utc>) -> Result<()> {
+    /// `shown`: how people see `c`.
+    async fn note_offer(&self, t: &ThreadState, source: &str, item: &str, shown: &str, c: &Candidate, now: DateTime<Utc>) -> Result<()> {
         let _guard = self.lock(&t.conversation, &t.thread).await;
         let Some(mut st) = self.store.load_thread(&t.conversation, &t.thread)? else {
             return Ok(());
@@ -481,10 +482,8 @@ impl Core {
         };
         // A second step may have run since the listing: the activity is that old.
         let note = format!(
-            "{} offered to `{}` ({} when listed)",
+            "{} offered to `{shown}` ({} when listed)",
             text::clean(item),
-            // Its project is whatever a repository on some machine calls itself.
-            text::clean(&c.ref_),
             text::activity(c.activity.as_ref(), now)
         );
         match &f.post {

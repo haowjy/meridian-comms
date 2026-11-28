@@ -10,12 +10,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
+    /// What the core stores and compares, and never takes apart: unique
+    /// across sources, and unchanged by any rename.
     #[serde(rename = "ref")]
     pub ref_: String,
+    /// The short ID people and agents type, when the source has one.
     #[serde(default)]
     pub id: Option<String>,
+    /// Every other word a person or an agent may name this candidate by, as
+    /// its source decides: what `resolve` matches besides the ref.
+    #[serde(default)]
+    pub names: Vec<String>,
     pub person: String,
-    /// The machine the session runs on, when the source knows it.
+    /// The name of the machine the session runs on, as the source's own
+    /// commands resolve it (for Meridian, the name the machine is saved under
+    /// here), which is also what people are shown. The source builds its
+    /// address for the session from it.
     #[serde(default)]
     pub machine: Option<String>,
     #[serde(default)]
@@ -26,6 +36,7 @@ pub struct Candidate {
     pub label: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Woken by the rule with no choice. Only ever set where `wakeable` is.
     #[serde(default)]
     pub default: bool,
     /// Whether `wake` from this daemon would reach it: the source decides, as
@@ -34,9 +45,9 @@ pub struct Candidate {
     pub wakeable: bool,
     #[serde(default)]
     pub activity: Option<Activity>,
-    /// The directory the session's project lives in on this machine, when
-    /// the source knows it. For the source's own later calls about the
-    /// session: it never leaves the daemon.
+    /// The directory the session runs in on this machine, when the source
+    /// knows it. For the source's own later calls about the session: it never
+    /// leaves the daemon.
     #[serde(skip)]
     pub root: Option<PathBuf>,
 }
@@ -68,32 +79,16 @@ impl Candidate {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ListRequest {
-    #[serde(default)]
-    pub person: Option<String>,
-    #[serde(default)]
-    pub project: Option<String>,
-    #[serde(default)]
-    pub refs: Vec<String>,
-    /// Every session an inbox item could be offered to: in any project,
-    /// configured or not, on this machine and on each one the source can
-    /// reach. What the router lists; `project` and `refs` are not read with
-    /// it. A source need not be able to wake what it lists here.
-    #[serde(default)]
-    pub offerable: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Every session a source reaches, on every machine it reaches, in every
+/// project, configured or not: each caller keeps its own part.
 pub struct ListResponse {
     #[serde(default)]
     pub candidates: Vec<Candidate>,
-    #[serde(default)]
-    pub unreachable: Vec<String>,
-    /// With `offerable`: each place something runs, candidates or not.
+    /// Each place something runs, candidates or not.
     #[serde(default)]
     pub groups: Vec<Group>,
-    /// With `offerable`: every machine the source looked on, and whether it
-    /// answered.
+    /// Every machine the source looked on, and whether it answered: what is
+    /// missing from `candidates` may run on one that did not.
     #[serde(default)]
     pub machines: Vec<Machine>,
 }
@@ -102,6 +97,7 @@ pub struct ListResponse {
 /// call that describes groups names them by these three.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
+    /// The machine's ID, as its candidates' refs carry it.
     pub machine: String,
     pub project: String,
     /// What people call the project, when the source can tell.
@@ -152,8 +148,9 @@ pub struct Notice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeRequest {
-    #[serde(rename = "ref")]
-    pub ref_: String,
+    /// The candidate as its source listed it. Serialized, it loses `root`
+    /// (`serde(skip)`): a source in another process must not need it.
+    pub to: Candidate,
     pub notice: Notice,
 }
 
@@ -175,23 +172,29 @@ pub struct IdentifyRequest {
 #[serde(rename_all = "lowercase")]
 pub enum CallerKind {
     Session,
+    /// A source's session that can't be named: the daemon refuses it.
     Unlisted,
     None,
 }
 
+/// Who a client was run for, as a source claimed it from the client's
+/// environment, on whatever machine the client runs. The daemon checks the
+/// claim and makes the ref: the client names nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentifyResult {
     pub caller: CallerKind,
     /// The source that claimed the caller, and that source's own ID for the
-    /// session. The daemon makes the ref from them: the client names nothing.
+    /// session.
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
-    pub person: Option<String>,
-    #[serde(default)]
     pub project: Option<String>,
+    /// The ID of the machine the session runs on. `None` from a client older
+    /// than machine IDs, which ran on the daemon's machine.
+    #[serde(default)]
+    pub machine: Option<String>,
     #[serde(default)]
     pub may_post: bool,
 }
@@ -202,11 +205,19 @@ impl IdentifyResult {
             caller: CallerKind::None,
             source: None,
             session: None,
-            person: None,
             project: None,
+            machine: None,
             may_post: false,
         }
     }
+}
+
+/// A claimed session the daemon's source checked: its ref, how people see
+/// it, and whose it is.
+pub struct Session {
+    pub ref_: String,
+    pub shown: String,
+    pub person: String,
 }
 
 // ---- a source's inbox ----
@@ -467,6 +478,9 @@ pub enum FailKind {
     TooLarge,
     /// The client could not reach the daemon.
     Unreachable,
+    /// The caller's session runs on a machine the daemon's source doesn't
+    /// know: a client that cached its machine's ID asks again, once.
+    UnknownMachine,
     NotSent,
     MaybeSent,
 }

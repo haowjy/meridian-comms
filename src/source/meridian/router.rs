@@ -303,7 +303,7 @@ impl Meridian {
     /// uses and Meridian's commands take: the spawn ID, behind its machine's
     /// name when that is another machine. Two machines can each have a `p41`.
     fn sessions<'a>(&'a self, req: &'a DecideRequest) -> impl Iterator<Item = (String, &'a Candidate)> {
-        req.candidates.iter().filter_map(|c| Some((self.target(&c.ref_)?, c)))
+        req.candidates.iter().filter_map(|c| Some((self.address(c)?, c)))
     }
 
     /// The goal of each work item the candidates are on, by project root and

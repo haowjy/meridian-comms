@@ -45,7 +45,7 @@ pub enum Request {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     Message(String),
@@ -53,7 +53,7 @@ pub enum Target {
 }
 
 /// Who a `Post` is for.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PostTo {
     /// A name in the directory: a new thread in the caller's channel names them.

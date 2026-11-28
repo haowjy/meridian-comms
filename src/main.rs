@@ -1,3 +1,4 @@
+mod bridge;
 mod client;
 mod config;
 mod core;
@@ -109,6 +110,10 @@ enum Command {
     },
     #[command(hide = true)]
     Daemon,
+    /// What a client on another machine runs here over SSH: one request on
+    /// stdin to the daemon, after a ready line.
+    #[command(hide = true)]
+    Bridge,
     /// Print the Slack app manifest, or with `router` set up the router's second step.
     Setup {
         /// The owner's name for the manifest, when there is no config yet.
@@ -165,6 +170,7 @@ async fn main() {
         Command::Route { item } => client::route(item).await,
         Command::Routes { of, json } => client::routes(of, json),
         Command::Daemon => daemon::run().await,
+        Command::Bridge => bridge::serve().await,
         Command::Setup { what: None, owner } => setup::run(owner),
         Command::Setup {
             what: Some(Setup::Router), ..

@@ -8,9 +8,10 @@ why. Slack setup is in [slack-setup.md](slack-setup.md).
 ## Shape
 
 ```
-Slack ── surface ──┐                        ┌── source: meridian  (this machine's primaries;
-                   ├── core: thread state ──┤    saved machines' too, for an offer)
-session ─ client ──┘        + wake rule     └── source: amp, remote (later)
+Slack ── surface ──┐                        ┌── source: meridian  (the primaries of this
+                   ├── core: thread state ──┤    machine and every saved one)
+session ─ client ──┘        + wake rule     └── source: amp (later)
+   (here, or over SSH through `bridge`)
 ```
 
 | Word | Meaning |
@@ -20,8 +21,9 @@ session ─ client ──┘        + wake rule     └── source: amp, remot
 | inbox | A source's place for messages nobody was woken for, where its sessions look. For Meridian, the machine's inbox (`meridian inbox list`). |
 | item | One message in an inbox, named by the ID its source gave it: `m412`. |
 | offer | Telling a running session that an item looks like its own. The session decides whether to take it. |
-| candidate | One thing a source can wake: a Meridian primary. Has a ref, a person, a label, a model, a `default` flag its source sets, and when known an activity. |
-| ref | A candidate's name, unique across sources: `desk/mellow-hollow-brood/p41`. The core stores and compares refs and never takes one apart. |
+| candidate | One thing a source can wake: a Meridian primary. Has a ref, the names it answers to, a person, a label, a model, `wakeable` and `default` flags its source sets, and when known an activity. |
+| ref | A candidate's name, unique across sources and unchanged by a rename: `6020323b2671/mellow-hollow-brood/p41`, the machine's ID first. The core stores and compares refs and never takes one apart. People see it as `p41 on jimyao-pop-os`. |
+| names | The other words that name a candidate: `p41`, `jimyao-pop-os/p41`, and for one minor release its old name-based ref. `to:`, clicks and `--to` match them as they match a ref. |
 | scope | Per thread and person: the refs that person's messages go to. Empty means the defaults. |
 | notice | The one line a woken session gets. It names the message; the session fetches the text with `read`. |
 | message ref | `meridian-cli/1731600123.000200`: a channel's configured name and the message's ID. |
@@ -38,8 +40,8 @@ A message counts when it is in a configured channel, its sender is in the direct
 text) or sits in a thread that has a file. The surface drops the bot's own posts,
 edits and deletions before the core sees them.
 
-**The rule.** To deliver message M to person P the core asks every source for P's
-candidates (one `list` per event) and takes:
+**The rule.** To deliver message M to person P the core reads a listing no older than
+15 s (see [The listing](#the-listing)) and takes, of P's candidates:
 
 - if `scope[P]` is not empty, the candidates in it; otherwise those their source marks
   `default`. The Meridian source marks none unless `default = "<agent>"` is configured,
@@ -64,8 +66,8 @@ form because an agent can't click.
 
 **The picker's menu** is the same post's second form. The surface trait's `post` may carry
 one `Menu` (groups of options plus a button label); the core builds it, one group per
-person and project, each option's value a ref and its label the short ID, label, model
-and activity. Slack fits it to its limits (75-character labels, 100 groups and options,
+person and project, each option's value a ref and its label how the session is shown
+(`p41 on jimyao-pop-os`), label, model and activity. Slack fits it to its limits (75-character labels, 100 groups and options,
 150-character values; an option whose ref is longer is left out and stays in the text).
 On Slack the menu is a `multi_static_select` as the section's accessory, because Slack
 refuses a multi-select inside an `actions` block, and "Wake" is a button in the `actions`
@@ -77,7 +79,7 @@ bot then edits the picker post: the menu and button go, and a line says who chos
 Refs the sources no longer list are named in a reply and left out. A click in a paused
 thread takes the choice and wakes nobody, as a `to:` line does.
 
-**The form** starts a thread for one session. A person opens it in a configured channel
+**The form** starts a thread for one session, on any machine the bot reaches. A person opens it in a configured channel
 (on Slack, `/agent`). It has a line naming the machines whose sessions it lists, a session
 field the bot fills as they type, and a message box. Sending it opens a thread in the
 channel with the message and delivers it through `deliver` as that person's choice of the
@@ -113,19 +115,18 @@ core answers within 2.2 s, and the socket gives up at 2.5 s with its own "try ag
 the command, the socket opens the form (`views.open` with the command's `trigger_id`)
 before it acknowledges, and says so if that failed.
 
-Listing sessions is too slow to do on demand (one project's listing costs seconds of CPU
-on a small machine), so the options come from `online` in `src/core/online.rs`: the
-owner's sessions in a project (every configured project for a channel with none), cold
-ones included, as their source describes them, and the machines they cover, by the name
-each source gives its own. It answers from the newest finished listing for that project,
-waits up to a given time for the first, and starts a new listing when the newest is over
-15 s old and none is running; opening the form starts one. Until the first is done, the
-field shows one option saying it is still listing; with no sessions, it says none are
-running on that machine, and so does the line above the fields once that is known. A listing over 5 minutes old counts as none, and callers wait for the
-new one as for the first.
+The options come from the newest listing (`online` in `src/core/online.rs`), kept to
+what can be woken in the channel's project (every configured project for a channel with
+none), cold ones included. The form never waits for a listing that is running, since a
+listing across machines takes seconds; it starts one when the newest is over 15 s old.
+Until the first is done, the field shows one option saying it is still listing; with no
+sessions, it says none are running, and so does the line above the fields once that is
+known. A listing over 5 minutes old counts as none, and callers wait for the new one as
+for the first.
 
 A submission is checked against the newest listing, and a session missing from it is an
-error on the form. The post is made before the answer, and a post that fails, or is still
+error on the form that says to send again, and starts a listing so the next send sees a
+session that started since. The post is made before the answer, and a post that fails, or is still
 running when the time is up, is an error on the form that says to send again. Sending
 again is safe: each send names the open form (on Slack, the view's ID, the same each time
 it is sent), and the core remembers the forms it posted for an hour, so a form sent again,
@@ -136,25 +137,74 @@ error tells the person to look in the channel before using the form again. The w
 the answer, against the listing the submission was checked with, since listing again
 would leave the post unwoken for seconds; a session that ended in between fails its wake
 and is named in the thread as left out. On a `disconnect` frame the socket sends the
-acknowledgements it holds before it reconnects. Waking stays
-on this machine (below), so the form lists this machine's sessions only; `online` takes
-the machines from the sources, so a source that reaches more machines adds them without a
-change to its callers.
+acknowledgements it holds before it reconnects.
 
-**One listing across machines.** Beside the per-project listings, `online.rs` keeps one
-listing of everything the sources reach on every machine (`ListRequest.offerable`), for
-the router and the Home tab, so the bot's machine never runs two such listings at once.
-Each caller says what it needs (`Need`): the Home tab takes the newest at once and starts
-a new one only when that is over a minute old (or always, for Refresh), and joins one
-that runs; the router needs one that started after its attempt began, so it joins the
-running one only if it started after that, and otherwise the next starts as soon as the
-running one ends. Which candidates each caller uses is written once (`Core::reach`), as
-is which channels a form may open a thread for a candidate in
-(`Core::form_conversations`: its project's, for a candidate its source marks
-`wakeable`). The core's limit for this listing is 30 s; the per-project one keeps 15.
+## The listing
 
-**A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
-`to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
+**One listing, not one per project.** A source's `list` takes nothing: it gives every
+running primary on every machine it reaches, in every project, configured or not, each
+with `wakeable` and `names`, plus `groups` and `machines` (below). The core keeps the
+newest answer as one snapshot (`src/core/online.rs`), so a refresh is one fan-out, never
+one per project, and the bot's machine never runs two at once. Each caller filters it,
+in one place (`Core::reach`):
+
+| Caller | Candidates it uses |
+|---|---|
+| the wake rule, `to:`, picker clicks, `send --to`, Continue, the picker's menu | `wakeable`, and either in the channel's project or already among the thread's refs |
+| the form, `list` | `wakeable` in the channel's (or the asked) project |
+| the Home tab | all of the owner's, wakeable or not, in every project; Message only where `wakeable` |
+| the router | all of the owner's from its source, configured projects or not |
+
+`default` is set only where `wakeable` is, so a default agent in an unconfigured project is
+never picked, and a bare `to: p41` is checked for uniqueness only among the candidates its
+caller uses. A name two of them share is ambiguous, and the bot lists what to type for
+each (`jimyao-pop-os/p41`).
+
+**Freshness.** Each caller says what it needs (`Need`):
+
+| Caller | Reads |
+|---|---|
+| the form's options and submission, the Home tab | the snapshot, with no wait (Slack's 3 s clock). The Home tab lists again when the newest is over a minute old, or always for Refresh. |
+| everything else: the wake rule for each handled message, `to:`, picker clicks, Continue, `send --to`, `list`, the router | a listing no older than 15 s: the newest, the running one if it started since, or else the next, which starts as soon as the running one ends |
+| any caller but the form, for a word that matched nothing | one listing started after the miss, before the word is reported as matching nothing |
+
+So a handled message waits for a listing only when the newest is over 15 s old: in a busy
+thread, most messages, at 8 to 11 s each on a Raspberry Pi asking one other machine.
+
+The worst case is a few fan-outs, all while the thread's lock is held. The message's own
+listing can mean waiting out the one running and then the next. A `to:` word that
+matches nothing then needs one more listing that started after the miss. With every
+machine up that is at most three fan-outs, about 30 s on the Pi before the wakes start;
+four when a fan-out runs past 15 s, since the miss can then wait out a running one too. A machine that hangs makes each fan-out its full
+per-machine limit, about 15 s (2.5 s of `machine list` plus 12 s). The code caps each of
+the two waits at 75 s, and the wakes, which run at once, at 100 s, so a handled
+message takes at most about 250 s. `send --to`'s 300 s on the client covers that.
+
+A retry comes 30 s after the
+attempt it repeats, so it never reuses the listing that attempt failed on. Up to 15 s
+old, a default agent that just started isn't woken (the message is filed), and a scoped
+session that just ended gets a wake that fails as `not_running`, named in the thread.
+Each source has 30 s for its listing.
+
+**What didn't answer, per machine.** A listing's `machines` names each machine the source
+looked on, by ID and name, and whether it answered; a `machine list` that fails is one
+entry with no ID. A source that fails whole is in `failed`. The core can't tell which
+machine a word means, so it asks the source: `could_be_unchecked(word, missing)` is true
+only when the word could name a session on a machine that didn't answer. For Meridian
+that is a bare spawn ID, or a word that starts with that machine's name or ID (a word of
+the message's text, as in `to: p41 please`, is neither). `<a machine that answered>/p4` is
+a real miss.
+
+- A `to:` word that could be unchecked makes the message wait and retry every 30 s
+  (`Flow::SourceDown`). After 5 minutes it answers: "`jimyao-pop-os` didn't answer, and
+  `p4` isn't running on the machines that did". A saved machine can be off for days.
+- A scoped session the listing lacks is "not checked" when its machine didn't answer,
+  and "no longer running" otherwise.
+- The router offers among the machines that answered; only a listing where its source
+  failed stops it.
+
+**A choice always wakes**, cold or not: a message opening `to: p41 jimyao-pop-os/p7` (or
+`to: all` for the defaults), or `send --to`. A name stands for its ref when exactly
 one listed candidate has it. A choice replaces the scope of the person whose refs it
 names; sessions woken before and no longer in the scope get one "now with" notice.
 A `send --to` with no text is a pointer at an existing message, not a hand-off: the refs
@@ -222,10 +272,10 @@ The daemon routes each accepted item in its own task (`src/core/route.rs`):
 1. Read the item through its source. Stop if it is taken.
 2. Find the thread it was filed from by `filed.item` in the thread files, never by the
    item's `via`: anyone can file an item that claims to come from here.
-3. List every session the item could be offered to (`ListRequest.offerable`): the
-   owner's running sessions in every project, on this machine and on each
-   [saved machine](#saved-machines). The listing is the one across machines the Home tab
-   shares (above), started after this routing began. A machine that didn't answer is
+3. List every session the item could be offered to (the router's reader in
+   [The listing](#the-listing)): the owner's running sessions in every project, on this
+   machine and on each [saved machine](#saved-machines), from a listing no older than
+   15 s. A machine that didn't answer is
    left out and named in the log; only a source that fails outright fails the routing.
 4. Keep a session only if it is in the item's project (an item with no project: any), is
    not the item's sender, and is working or idle with `warm_until` ahead. A session with
@@ -322,7 +372,8 @@ is paid for by `OPENCODE_API_KEY`.
   marker lines carrying a random number, marked as someone else's words; a reply to the
   router's question follows the same way. A goal is read with `meridian -C <root> work
   show <work> --json`, once per project root and work item, four at a time, 20 seconds
-  each; the root is the one the listing gave the candidate. It
+  each; the root is the folder the listing gave a session on this machine. A session on
+  another machine is listed without its goal. It
   is written to a 0600 file in the router directory and removed as soon as the launch
   command returns, whatever it returned. Files a killed daemon left are removed at the
   next start.
@@ -390,9 +441,9 @@ router's key, and then routes nothing: filed messages wait, and `meridian-comms 
 shows each as `off`. It starts with no `[sources.meridian]` too, on a machine without
 Meridian: threads are read and posted, nobody is woken, and every message waits and shows
 in `meridian-comms list`. A `[sources.meridian]` that is there is checked when the daemon
-starts: a Meridian older than 0.28.1 (`meridian --version`), a project key that is not its
-root's Meridian project ID, or a root or a `meridian` that can't be asked, stops it with
-an error that says which and what to do. 0.28.0 is the first Meridian with the machine
+starts: a Meridian older than 0.28.1 (`meridian --version`), a project key that is not
+shaped like a Meridian project ID, or a `meridian` that can't be asked, stops it with an
+error that says which and what to do. 0.28.0 is the first Meridian with the machine
 inbox, machine names and IDs, and a `kind` on every JSON error, and the source relies on
 all three; 0.28.1 is the first that ships the `inbox-router` profile the second step
 starts. One minimum covers both, so a daemon that passes the check can run every step it
@@ -418,8 +469,7 @@ agent = "maybe"
 
 [sources.meridian]
 # default = "product-lead"           # optional: primaries of this agent wake with no choice
-[sources.meridian.projects.mellow-hollow-brood]   # the root's Meridian project ID
-root = "/path/to/meridian-cli"
+[sources.meridian.projects.mellow-hollow-brood]   # a Meridian project ID
 # default = "tech-lead"              # optional, this project only
 
 [router]                             # optional: present, filed messages are routed
@@ -434,13 +484,26 @@ offers it the message without asking further. Under it, the second step decides.
 means fewer direct offers and more second steps. 0.6 is a placeholder until it has been
 measured against real messages.
 
-A project's key is the Meridian project ID of its root, the one `meridian -C <root>
-context` prints, and a channel's `project` is the same ID. One value then names the
-project in a channel, a candidate, a ref and a filed item, so a message filed for a
-channel's project is seen by that project's sessions. At start the Meridian source asks
-Meridian for each root's ID. If a key differs, or the root has no ID of its own (no
-`[project] id` in its `meridian.toml`), the daemon refuses to start and the error names
-the key and the ID to write.
+A project's key is a Meridian project ID, the one `meridian context` prints in the
+project, and a channel's `project` is the same ID. One value then names the project in a
+channel, a candidate, a ref and a filed item, so a message filed for a channel's project
+is seen by that project's sessions. A project is its ID alone, not a folder: its agents
+may run on any machine the bot reaches, in any checkout. A key no listing can check is
+caught by the first listing in which every machine answered: each key with no agent
+running anywhere is named in a warning, once per daemon. `root`, which older builds read,
+is ignored with a warning to remove it, for one minor release.
+
+**On another machine** the config is only where the bot is:
+
+```toml
+[bot]
+ssh = "jimmy@raspberrypi"        # any target `ssh` takes; a known host key and a key that signs in without a prompt
+# command = "meridian-comms"     # the program on the bot's machine, if not on its PATH
+```
+
+With `[bot]`, every client command reaches the daemon there through `bridge` (see
+[Client and daemon](#client-and-daemon)), and nothing else may be in the file. The
+daemon refuses to start with it: a `[bot]` machine runs no daemon.
 
 A channel the config doesn't list is ignored. A message counts only if its sender is
 under `[people]`. `agent` feeds the [loop limit](#loop-limit): a message from a person
@@ -468,9 +531,11 @@ so a redelivery is dropped. `authors` names the person each of the bot's posts m
 one (the form's) belongs to. A build older than the form drops `authors` the next time it
 saves the file, and that post then reads as the bot's.
 
-A `to:` line that names a word no answering source resolves while a source is down is
-neither text nor a miss yet. The daemon says once in the thread that a source did not
-answer and retries every 30 s (one loop per message, not per delivery). If a later
+A `to:` line that names a word no answering source resolves, while a machine that could
+have it is down, is neither text nor a miss yet. The daemon says once in the thread that
+a machine did not answer and retries every 30 s (one loop per message, not per
+delivery), for at most 5 minutes; then the word is a miss, and the answer names the
+machines that didn't answer. If a later
 message in the thread was handled by then, the choice is dropped with a post saying so
 rather than applied out of order.
 
@@ -549,11 +614,40 @@ opening the view to others means deciding what each may see.
 
 The client's commands are `read`, `send` and `list` for a session or a person, `deliver`
 for `meridian message @…` (below), `route` for a source's inbox hook, and `routes`, which reads
-the routing log itself. The client learns who is calling from the source (`identify`): a Meridian primary is a
-session of its project; a child spawn may read but not post; a session whose project is
-not in the config is refused; a process with no Meridian variables is the owner at a
-terminal. Requests go over a Unix socket (mode 0600, peer uid checked) as one JSON
-object each way (`src/proto.rs`). A session reads the channels of its own project and
+the routing log itself. The client says who is calling and the daemon checks it. The claim is
+made where the session runs, with no config (`source::claim`): a Meridian primary gives
+its project ID (`MERIDIAN_PROJECT_ID`, else `meridian context --json` in
+`MERIDIAN_PROJECT_DIR`), its spawn ID and depth, and its machine's ID
+(`MERIDIAN_MACHINE_ID`, else `meridian machine name --json`, cached per `MERIDIAN_HOME`
+in the state directory's `machine-ids.json`, written whole). Meridian sets both
+variables in every session it launches from 0.29.0 on; with an older Meridian they are
+unset and the two calls run. The daemon's source turns
+it into a session (`Source::session`): a ref, how it is shown, and the person. A child
+spawn may read but not post. A session whose project is not in the config is refused
+with what to add and where; one in an ad-hoc project (an ID that names a folder on one
+machine) is told to give the project an ID first, since no key can name it. The daemon
+looks the claimed machine up in the newest listing's machines, if that listing is under 5
+minutes old, and runs `machine list` (2.5 s on the Pi) only for an ID that isn't there,
+so a machine removed from Meridian's saved list is still accepted for at most 5 minutes. A machine that is neither this one
+nor saved is `unknown_machine`, and the client claims once more without its cache, in
+case the machine's ID changed. A process with no Meridian variables is the owner at a terminal.
+A claim from an older client, with no machine, is taken as this machine's. Requests go over a Unix socket (mode 0600, peer uid checked) as one JSON
+object each way (`src/proto.rs`). On a machine whose config has `[bot]`, the same
+request goes over SSH instead (`src/bridge.rs`): the client runs `ssh <options> --
+<target> <command> bridge`, with Meridian's options for a call nobody watches (no
+prompts, known host keys only, a dead connection noticed within a minute). `bridge`
+connects to the daemon's socket and prints `meridian-comms-ready {"v":1}`, or
+`meridian-comms-error {"text":…}` when it can't; lines a login prints before it are
+skipped. Only after the ready line does the client write the request, on stdin, so no
+text of it is ever on a command line, local or remote. Every failure before the ready
+line is `unreachable`, and says nothing was sent and which: no `ssh`, a sandbox that
+blocks it, an unknown or changed host key, a refused sign-in, a host that can't be
+reached, no `meridian-comms` there (exit 127), a build there older than `bridge`, a
+different handshake version, or the daemon down there. After it, a post with no whole
+answer is `maybe_sent`, and anything else says running it again is safe. `bridge` ends
+when the answer is out, when its stdin ends, and after 330 s, so a killed client never
+leaves it holding a connection. `route` and `routes` belong to the bot's machine and are
+refused on a `[bot]` one. A session reads the channels of its own project and
 those with no project. A channel with no project needs `post = true` before sessions
 may open threads there. `send` waits for the post and the wakes. A cold session the rule skips is reported and
 is not a failure; the command exits non-zero, with a retry line naming only the refs
@@ -564,14 +658,15 @@ directory exists, whatever `XDG_RUNTIME_DIR` the caller has, so a session starte
 without it finds the same path as the daemon.
 
 The daemon calls `meridian` with every `MERIDIAN_*` variable except `MERIDIAN_HOME`
-removed. Per project it uses `meridian -C <root> spawn list --primary --json --limit 200`,
-`message <spawn-id> <line> --wake --json` for a message notice (`--wake` because Meridian
+removed. A wake is `message <address> <line> --wake --json`, the address being the bare
+spawn ID here and `<saved name>/<spawn-id>` on a saved machine; a session here runs it
+with `-C` at the folder its row gave, a session elsewhere with none. That is for a message notice (`--wake` because Meridian
 holds a message to a cold session without it, and a message notice goes only to a session
 the rule or a person chose), and the same without `--wake` for a release notice, which
 nobody chose: Meridian refuses it for a cold session (kind `cold`, nothing sent), and
-that session simply gets no more of the thread's messages
-and, at start, `context --json`. A wake reads the error's kind: `not_running` or
-`not_found` is a session that is gone, `maybe_delivered` a notice that may have arrived
+that session simply gets no more of the thread's messages. A wake reads the error's kind: `not_running` or
+`not_found` is a session that is gone (on another machine, `not_found` may also be a
+session from before machine-wide IDs, and the text says so), `maybe_delivered` a notice that may have arrived
 (reported as not woken, so the message still waits), anything else a failed wake. For the machine it runs in the home
 directory with no `-C`: `--version` and `machine name --json` (once each, at start), `spawn list --global --json`,
 `message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
@@ -624,7 +719,8 @@ again is safe.
 | `ambiguous`, `no_channel` | Choosing the channel, above. |
 | `not_allowed` | A caller that may not post (a child spawn, an unlisted project), a channel of another project. |
 | `too_large` | Over Slack's 40,000 characters, checked before posting; a request over the socket's 4 MiB, checked by the client. |
-| `unreachable` | The client could not connect to the socket. |
+| `unreachable` | The client could not connect to the socket, or to the bot's machine before `bridge`'s ready line. |
+| `unknown_machine` | The claim names a machine that is neither the bot's nor saved there; the client claims again once without its cache. |
 | `not_sent` | Slack answered with an error, the request never had a connection, or the daemon refused before posting (another build reads `post` as a bad request). |
 | `maybe_sent` | The Slack request went out with no answer, or with a 5xx, unreadable JSON, `internal_error`/`fatal_error` (Slack says these may follow a partial success), or no `ts`; anything failing after the post; a panic in the request; the socket dropping after the request was written; the client's time limit. |
 
@@ -651,19 +747,24 @@ without `[message] people`.
 
 ## Saved machines
 
-A ref is `machine/project/spawn-id`. The machine is the name Meridian gives this one.
-`meridian machine name --json` is asked once when the daemon starts, for the name, the
-machine's ID and the names it had before (`was`), and the name is kept for the daemon's
-life, so a `meridian machine rename` while it runs changes no ref and stops no wake.
-When it can't answer, the daemon does not start and says why. Only the daemon composes
-refs: the client reports the project and spawn ID it reads from its environment.
+A ref is `<machine ID>/<project>/<spawn-id>`: the ID, not the name, so no rename on any
+machine changes a ref or orphans one stored in a thread. People see a ref as
+`p41 on jimyao-pop-os` (`Source::show`) and type a candidate's `names`: the spawn ID,
+`<machine name>/<spawn-id>` (the name it is saved under), and, for a session here, its
+old name-based ref, `<this machine's name or a name in was>/<project>/<spawn-id>`, so a
+picker click, a retry line or a `send --to` from an older build still resolves for one
+minor release. `meridian machine name --json` is asked once when the daemon starts, for
+the name, the machine's ID and the names it had before (`was`). When it can't answer,
+the daemon does not start and says why. Only the source composes refs: the client
+claims an ID, project and spawn ID, and the daemon checks them.
 
 At each start the daemon rewrites the refs in its thread files (`scope`, `woken` and
-`pending`) that start with a name in `was`, so a thread keeps the sessions it chose
-through a rename while the daemon was stopped, and threads a killed daemon left at an
-older name.
+`pending`) that start with this machine's name or a name in `was` to start with its ID,
+so threads an older build wrote keep the sessions they chose. Every such ref was this
+machine's: older builds stored no other. A ref that already starts with an ID is left
+alone, so the rewrite runs once.
 
-For an offer and the Home tab the Meridian source also lists the sessions of every
+The Meridian source lists the sessions of this machine and of every
 machine Meridian has saved (`meridian machine list`): one `spawn list --global --json
 --machine M` each, all at once, beside the local listing. `machine list` and then each
 machine have 12 seconds. A design review measured a Raspberry Pi (raspberry, Meridian
@@ -676,11 +777,10 @@ saved.
 
 That answer carries more than candidates. Each candidate has `wakeable`: whether `wake`
 from this daemon reaches it, which for Meridian is a running primary in a configured
-project on this machine. `groups` has one entry per `(machine, project, group)` with
+project, on any machine it lists. `groups` has one entry per `(machine, project, group)` with
 anything running, with how many of what runs there are not candidates (for Meridian,
 spawns, which is why this listing drops `--primary`) and the project's label. The label
-is the name of the project's folder: the configured root here; elsewhere the folder most
-of its primaries run in, since Meridian's rows give each session's own folder, which can
+is the name of the folder most of its primaries run in, since Meridian's rows give each session's own folder, which can
 be a worktree's, and no command gives a project's main checkout. A folder inside
 `<name>.worktrees/` is named `<name>`. A primary that is starting or ending is counted
 nowhere. The view adds the project ID to each of two projects whose labels are the
@@ -688,15 +788,16 @@ same. `machines` has each machine looked on, by ID and name, and whether it answ
 `machine list` that fails is one entry with no name. A row's `desc` (a spawn's prompt
 opening) is never read.
 
-Two machines can each have a `p41`. Their refs differ, the model's options are numbered,
-and the second step's agent names a session on another machine as `<machine>/p41`,
-which is also what `meridian inbox offer` takes. The offer always runs on this machine,
-where the item is.
+Two machines can each have a `p41`. Their refs differ, a bare `p41` is ambiguous and the
+bot lists `homebox/p41` and `raspberry/p41`, the model's options are numbered, and the
+second step's agent names a session on another machine as `<machine>/p41`, which is also
+what `meridian inbox offer` and `meridian message` take. The offer always runs on this
+machine, where the item is.
 
 A saved machine has two names: the one it is saved under here and the one it calls
 itself. They differ when Meridian could not take over a rename because the name is
-taken. Refs carry the saved name, because that is the one `--machine` and
-`<machine>/p41` resolve; what a row says its machine is called is not read.
+taken. Names and addresses carry the saved name, because that is the one `--machine`
+and `<machine>/p41` resolve; what a row says its machine is called is not read.
 
 A sender is left out of the candidates wherever it runs. Its machine is told by
 `from.machine_id`, which no rename changes. This machine's own ID: `spawn show <chat>`
@@ -732,23 +833,13 @@ final and is not repeated. Every other word means nothing was sent and the item 
 `unreachable`, and from a machine whose Meridian is too old for the inbox `refused`,
 `usage` or `version`.
 
-**Waking stays on this machine.** The picker, `to:` and `send --to` list only the
-configured projects' sessions here: the projects in the config are directories on this
-machine, and so are the rules about who may post. A session on a saved machine can be
-offered an item and nothing else; `to:` or `send --to` with its ref answers that it is
-on another machine and can be offered a message but not woken from Slack.
+**Who may be woken is the bot's config.** A session on any machine is woken, picked and
+named in `to:` when its project is configured here; the rules about who may post are
+checked here too, for a client on any machine. A session in an unconfigured project shows
+in the Home tab with no Message button, and the router may still offer it an item.
 
 ## Not built yet
 
-The Amp source, and waking a session on another machine. The client already talks to
-the daemon in JSON.
+The Amp source. The client already talks to the daemon in JSON.
 
-Waking across machines would be the first change to store another machine's ref in a
-thread (`scope`, `woken`, `pending.picks`). Every stored ref is this machine's today,
-and the start's rewrite depends on it: Meridian lets a machine be saved under a name
-this one used to have, and the rewrite would turn
-that machine's refs into this machine's at every start. That change must leave the
-saved machines' current names out of the old names, or store the machine ID beside
-each ref. A ref stored by a saved machine's name is also orphaned when that machine is
-renamed; `machine list --json` gives each saved machine's `was`, which can rewrite it
-the way this machine's refs are.
+A goal for a session on a saved machine, which needs `work show --machine` in Meridian.

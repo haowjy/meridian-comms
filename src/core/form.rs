@@ -13,7 +13,7 @@ use chrono::Utc;
 use tokio::sync::{mpsc, watch};
 
 use super::deliver::{How, Incoming};
-use super::online::{Online, Scope};
+use super::online::{By, Need, Online, Reader};
 use super::{Core, Listing, text, view};
 use crate::config::AgentMark;
 use crate::model::{
@@ -88,7 +88,9 @@ impl Core {
                     note: Some(why),
                 },
                 Ok(u) => {
-                    let online = self.online(u.project.as_deref(), ANSWER - Duration::from_millis(200)).await;
+                    let online = self
+                        .online(Reader::Project(u.project.as_deref()), ANSWER - Duration::from_millis(200))
+                        .await;
                     self.options(&online, &query)
                 }
             },
@@ -125,16 +127,16 @@ impl Core {
                 })
             })
             .collect();
-        let online = self.online(u.project.as_deref(), Duration::ZERO).await;
-        // The view's listing knows a session it offered before this one may.
-        let everywhere = self.newest(&Scope::Everywhere);
+        let online = self.online(Reader::Project(u.project.as_deref()), Duration::ZERO).await;
+        // The view's choice is a session the newest listing has.
+        let newest = self.newest();
         let chosen = session.map(|r| {
-            let found = [online.sessions.as_ref(), everywhere.as_ref()]
-                .into_iter()
-                .flatten()
-                .find_map(|l| l.resolve(&r).map(|(_, c)| c.clone()));
+            let found = newest.as_ref().and_then(|l| Some((l, l.find(&r)?.1.clone())));
             MenuOption {
-                label: found.map_or_else(|| text::clean(&r), |c| text::option_label(&c, Utc::now())),
+                label: found.map_or_else(
+                    || text::clean(&r),
+                    |(l, c)| text::option_label(&self.show(l, &c.ref_), &c, Utc::now()),
+                ),
                 value: r,
             }
         });
@@ -184,7 +186,7 @@ impl Core {
             })
             .collect();
         let note = groups.is_empty().then(|| {
-            if listing.failed {
+            if !listing.failed.is_empty() {
                 format!("The sessions on {on} could not all be listed: try again")
             } else if listing.for_person(&self.cfg.owner).next().is_none() {
                 format!("No sessions are running on {on}")
@@ -270,16 +272,20 @@ impl Core {
         let Some(r) = session else {
             return Err(bad("Choose a session.".into()));
         };
-        let online = self.online(u.project.as_deref(), SUBMIT_WAIT).await;
+        let online = self.online(Reader::Project(u.project.as_deref()), SUBMIT_WAIT).await;
         let on = machines(&online);
         let Some(listing) = online.sessions else {
             return Err(bad(format!("Still listing the sessions on {on}: send again in a moment.")));
         };
         let Some((_, c)) = listing.resolve(&r) else {
-            return Err(bad(if listing.failed {
-                format!("`{}` could not be checked: a source did not answer. Send again.", text::clean(&r))
+            // The form answers from the newest listing alone: a session that
+            // started since is in the next, which starts now.
+            drop(self.listing(Need::StartedAfter(Instant::now()), By::Form));
+            let shown = self.show(&listing, &r);
+            return Err(bad(if self.unchecked(&listing, &r) {
+                format!("{} Send again in a moment.", self.why_not(&listing, &r))
             } else {
-                format!("`{}` is no longer running on {on}: choose another.", text::clean(&r))
+                format!("`{shown}` isn't among the sessions running on {on}: send again in a moment, or choose another.")
             }));
         };
         Ok(Accepted {
@@ -327,9 +333,10 @@ impl Core {
                 // A post that may have gone out stays remembered: sending the form
                 // again must not post it twice.
                 let error = if Failure::kind_of(&e) == FailKind::MaybeSent {
+                    let typable = listing.find(&r).map_or(r.as_str(), |(_, c)| listing.typable(c));
                     format!(
                         "Slack may have posted the message without saying so ({why}), and nobody was woken. Look in the channel: if it is there, reply `to: {}` in its thread; if not, cancel and use the form again.",
-                        text::clean(&r)
+                        text::clean(typable)
                     )
                 } else {
                     self.forms.0.lock().unwrap().remove(form);
@@ -415,7 +422,7 @@ fn machines(online: &Online) -> String {
 fn where_(online: &Online) -> String {
     let on = machines(online);
     match &online.sessions {
-        Some(l) if !l.failed && l.candidates.is_empty() => format!("No sessions are running on {on}."),
+        Some(l) if l.failed.is_empty() && l.candidates.is_empty() => format!("No sessions are running on {on}."),
         _ => format!("Sessions on {on}. Sending opens a thread and wakes the one you choose."),
     }
 }

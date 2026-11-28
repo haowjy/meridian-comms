@@ -85,36 +85,26 @@ pub fn cold_reason(c: &Candidate, now: DateTime<Utc>) -> String {
     format!("cold ({since}cache cold since {cold_at})")
 }
 
-/// One line per candidate, for the picker and for `list`.
-pub fn candidate_line(c: &Candidate, now: DateTime<Utc>) -> String {
-    let mut parts = vec![format!("`{}`", c.ref_)];
-    if let Some(id) = &c.id {
-        parts.push(format!("({})", clean(id)));
-    }
+/// One line per candidate, after `head`: for the picker, how people see it;
+/// for `list`, the ref and short ID an agent passes back.
+pub fn candidate_line(head: &str, c: &Candidate, now: DateTime<Utc>) -> String {
     let facts: Vec<String> = [c.label.as_deref(), c.model.as_deref(), c.group.as_deref()]
         .into_iter()
         .flatten()
         .map(clean)
         .chain([activity(c.activity.as_ref(), now)])
         .collect();
-    format!("{} {}", parts.join(" "), facts.join(" · "))
+    format!("{head} {}", facts.join(" · "))
 }
 
-/// An option in a menu: short ID, label, model and activity. A surface cuts it to fit.
-pub fn option_label(c: &Candidate, now: DateTime<Utc>) -> String {
-    let short = c.id.as_deref().unwrap_or(&c.ref_);
+/// An option in a menu: how the session is shown, label, model and
+/// activity. A surface cuts it to fit.
+pub fn option_label(shown: &str, c: &Candidate, now: DateTime<Utc>) -> String {
     let facts: Vec<String> = [c.label.as_deref(), c.model.as_deref()]
         .into_iter()
         .flatten()
         .map(clean)
         .chain([activity(c.activity.as_ref(), now)])
         .collect();
-    format!("{} · {}", clean(short), facts.join(" · "))
-}
-
-pub fn label(c: &Candidate) -> String {
-    match &c.label {
-        Some(l) => format!("`{}` ({})", c.ref_, clean(l)),
-        None => format!("`{}`", c.ref_),
-    }
+    format!("{shown} · {}", facts.join(" · "))
 }

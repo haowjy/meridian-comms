@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::{Local, Utc};
 use tokio::sync::watch;
 
-use super::online::{By, Listed, Need, Reader, Scope, Shared};
+use super::online::{By, Listed, Need, Reader, Shared};
 use super::{Core, Listing, text};
 use crate::model::{Agents, FormFor, Sender, View, ViewAgent, ViewGroup, ViewProject};
 
@@ -44,8 +44,8 @@ impl Core {
             return;
         }
         let listing = match refresh {
-            true => self.listing(Scope::Everywhere, Need::YoungerThan(Duration::ZERO), Some(By::ViewRefresh)),
-            false => self.listing(Scope::Everywhere, Need::YoungerThan(REFRESH_AFTER), Some(By::ViewOpen)),
+            true => self.listing(Need::YoungerThan(Duration::ZERO), By::ViewRefresh),
+            false => self.listing(Need::YoungerThan(REFRESH_AFTER), By::ViewOpen),
         };
         let mut publisher = self.publisher.0.lock().unwrap();
         if let Some(again) = publisher.as_ref() {
@@ -94,7 +94,7 @@ impl Core {
             format!("{} ago", text::duration(age))
         };
         let mut status = vec![format!("as of {when}, {ago}")];
-        status.extend(listing.machines.iter().map(|m| {
+        status.extend(listing.machines.iter().map(|(_, m)| {
             let why = m.why.as_deref().unwrap_or("did not answer");
             match (&m.name, m.ok) {
                 (Some(name), true) => format!("{name} ✓"),
@@ -102,7 +102,7 @@ impl Core {
                 (None, _) => why.to_string(),
             }
         }));
-        if listing.failed {
+        if !listing.failed.is_empty() {
             status.push("a source did not answer".into());
         }
         Agents {
@@ -131,7 +131,8 @@ impl Core {
             let place = places.entry(Some(&g.project)).or_default().entry(g.group.as_deref()).or_default();
             place.others += g.others;
         }
-        for c in self.reach(listing, Reader::View) {
+        let owners = self.reach(listing, Reader::View);
+        for (_, c) in &owners.candidates {
             let conversations = self.form_conversations(c);
             let message = (!conversations.is_empty()).then(|| FormFor {
                 session: c.ref_.clone(),
@@ -143,7 +144,7 @@ impl Core {
                 .entry(c.group.as_deref())
                 .or_default();
             place.agents.push(ViewAgent {
-                line: text::option_label(c, now),
+                line: text::option_label(&self.show(listing, &c.ref_), c, now),
                 message,
             });
         }

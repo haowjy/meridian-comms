@@ -1,14 +1,17 @@
 //! The client's requests: `read`, `send`, `post` and `list`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use super::deliver::{Author, How, Incoming};
-use super::{Core, Listing};
+use super::online::{By, Reader};
+use super::{Core, Listing, text};
 use crate::config::Channel;
-use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, ListRequest, Msg, PostRequest, Posted};
+use crate::model::{CallerKind, FailKind, Failure, IdentifyResult, Msg, PostRequest, Posted};
 use crate::proto::{ListOut, MessageOut, PersonOut, PostTo, ReadOut, SendOut, Target, WaitingOut};
 use crate::state::{Pick, ThreadState};
 
@@ -29,6 +32,8 @@ struct Prepared {
 /// The caller after `identify`: a session, or the owner at a terminal.
 pub struct Who {
     ref_: Option<String>,
+    /// How people see `ref_`.
+    shown: String,
     person: String,
     project: Option<String>,
     may_post: bool,
@@ -37,7 +42,7 @@ pub struct Who {
 impl Who {
     fn label(&self) -> String {
         match &self.ref_ {
-            Some(r) => format!("{}'s session `{r}`", self.person),
+            Some(_) => format!("{}'s session `{}`", self.person, self.shown),
             None => format!("{} at a terminal", self.person),
         }
     }
@@ -52,34 +57,47 @@ fn ts_secs(id: &str) -> chrono::DateTime<Utc> {
 }
 
 impl Core {
-    pub fn who(&self, id: &IdentifyResult) -> Result<Who> {
+    /// The caller a client claimed, checked by the source that claimed it.
+    pub async fn who(&self, id: &IdentifyResult) -> Result<Who> {
         match id.caller {
             CallerKind::Unlisted => bail!(Failure::new(
                 FailKind::NotAllowed,
-                "this session's project is not in the config, so it cannot use meridian-comms"
+                "this agent session can't be named: its environment has no spawn ID or project, so it cannot use meridian-comms"
             )),
-            CallerKind::Session => Ok(Who {
-                ref_: Some(self.session_ref(id)?),
-                person: id.person.clone().unwrap_or_else(|| self.cfg.owner.clone()),
-                project: id.project.clone(),
-                may_post: id.may_post,
-            }),
+            CallerKind::Session => {
+                let source = self.sources.iter().position(|s| Some(s.name()) == id.source.as_deref());
+                let session = match source {
+                    Some(i) => {
+                        let machines = self.newest().map(|l| l.machines_of(i)).unwrap_or_default();
+                        self.sources[i].session(id, &machines).await?
+                    }
+                    None => None,
+                };
+                let Some(session) = session else {
+                    bail!(Failure::new(
+                        FailKind::NotAllowed,
+                        format!(
+                            "this session's source ({}) is not in the bot's config, so it cannot use meridian-comms",
+                            id.source.as_deref().unwrap_or("none named")
+                        )
+                    ))
+                };
+                Ok(Who {
+                    ref_: Some(session.ref_),
+                    shown: text::clean(&session.shown),
+                    person: session.person,
+                    project: id.project.clone(),
+                    may_post: id.may_post,
+                })
+            }
             CallerKind::None => Ok(Who {
                 ref_: None,
+                shown: String::new(),
                 person: self.cfg.owner.clone(),
                 project: None,
                 may_post: true,
             }),
         }
-    }
-
-    fn session_ref(&self, id: &IdentifyResult) -> Result<String> {
-        let source = self.sources.iter().find(|s| Some(s.name()) == id.source.as_deref());
-        let named = id.project.as_deref().zip(id.session.as_deref());
-        source
-            .zip(named)
-            .and_then(|(s, (project, session))| s.session_ref(project, session))
-            .context("the daemon cannot name this session: its project or source is not in the daemon's config, or the client and the daemon are different builds (restart the daemon)")
     }
 
     /// A session reads its own project's channels and the channels with no project.
@@ -179,7 +197,14 @@ impl Core {
     /// Posts `text` (naming `mention`, a person as the surface notifies them)
     /// and wakes whom `to` names. Everything is resolved before the post, and
     /// any error after it is `MaybeSent`.
-    pub async fn send(&self, who: &Who, target: Target, to: Vec<String>, text: Option<String>, mention: Option<String>) -> Result<SendOut> {
+    pub async fn send(
+        self: &Arc<Self>,
+        who: &Who,
+        target: Target,
+        to: Vec<String>,
+        text: Option<String>,
+        mention: Option<String>,
+    ) -> Result<SendOut> {
         let prep = self.prepare_send(who, target, to, text, mention).await?;
         let posted = match &prep.post {
             Some(req) => Some(self.surface.post(req.clone()).await?),
@@ -191,7 +216,7 @@ impl Core {
     }
 
     async fn prepare_send(
-        &self,
+        self: &Arc<Self>,
         who: &Who,
         target: Target,
         to: Vec<String>,
@@ -271,22 +296,24 @@ impl Core {
 
         let mut listing = Listing::default();
         if !to.is_empty() {
-            let refs: Vec<String> = st
-                .scope
-                .values()
-                .chain(st.woken.values())
-                .flatten()
-                .chain(&words)
-                .cloned()
-                .collect();
-            listing = self.list_for(&persons, project.clone(), refs).await;
+            let refs: Vec<String> = st.scope.values().chain(st.woken.values()).flatten().cloned().collect();
+            let reader = Reader::Thread {
+                project: project.as_deref(),
+                refs: &refs,
+            };
+            listing = self.reach(&*self.fresh(By::Client).await, reader);
+            // A word that names nothing is reported after one listing started
+            // since: a session may just have started.
+            if words.iter().any(|w| listing.resolve(w).is_none() && !self.unchecked(&listing, w)) {
+                listing = self.reach(&*self.listed_after(Instant::now(), By::Client).await, reader);
+            }
             for w in &words {
                 if listing.resolve(w).is_none() {
                     bail!(Failure::new(
                         FailKind::NotFound,
                         format!(
                             "{} Use a ref or short ID from `meridian-comms list`, or @person.",
-                            self.why_not(&listing, w).await
+                            self.why_not(&listing, w)
                         )
                     ));
                 }
@@ -430,7 +457,7 @@ impl Core {
 
     /// Posts `text` for a person or in a thread, and wakes nobody. For a
     /// person it opens a thread naming them in the caller's channel.
-    pub async fn post_to(&self, who: &Who, to: PostTo, text: String) -> Result<SendOut> {
+    pub async fn post_to(self: &Arc<Self>, who: &Who, to: PostTo, text: String) -> Result<SendOut> {
         Self::may_post(who)?;
         if text.trim().is_empty() {
             bail!(Failure::new(FailKind::Invalid, "nothing to send: the message text is empty"));
@@ -492,30 +519,30 @@ impl Core {
         }
     }
 
-    pub async fn list_people(&self, who: &Who, project: Option<String>) -> Result<ListOut> {
+    pub async fn list_people(self: &Arc<Self>, who: &Who, project: Option<String>) -> Result<ListOut> {
         let project = project.or_else(|| who.project.clone());
         if let (Some(mine), Some(asked)) = (&who.project, &project)
             && mine != asked
         {
             bail!("a session lists its own project ({mine}) only");
         }
+        let listing = self.reach(&*self.fresh(By::Client).await, Reader::Project(project.as_deref()));
+        let unreachable: Vec<String> = listing
+            .machines
+            .iter()
+            .filter(|(_, m)| !m.ok)
+            .map(|(_, m)| m.name.clone().unwrap_or_else(|| "the saved machines".into()))
+            .chain((!listing.failed.is_empty()).then(|| "a source".into()))
+            .collect();
         let mut people = vec![];
         for (name, p) in &self.cfg.people {
-            let l = self
-                .list(&ListRequest {
-                    person: Some(name.clone()),
-                    project: project.clone(),
-                    refs: vec![],
-                    offerable: false,
-                })
-                .await;
-            let mut candidates: Vec<_> = l.candidates.into_iter().map(|(_, c)| c).filter(|c| c.person == *name).collect();
+            let mut candidates: Vec<_> = listing.for_person(name).map(|(_, c)| c.clone()).collect();
             candidates.sort_by(|a, b| a.ref_.cmp(&b.ref_));
             people.push(PersonOut {
                 name: name.clone(),
                 note: p.note.clone(),
                 candidates,
-                unreachable: l.unreachable,
+                unreachable: unreachable.clone(),
             });
         }
         // Messages nobody was woken for and no source's inbox holds, in this

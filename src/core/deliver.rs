@@ -101,7 +101,7 @@ impl Core {
             } else {
                 out.failed.push(c.ref_.clone());
                 out.left_out
-                    .push(format!("{}: not woken ({})", text::label(&c), text::clean(&r.detail)));
+                    .push(format!("{}: not woken ({})", self.label(listing, &c), text::clean(&r.detail)));
             }
         }
 
@@ -202,14 +202,14 @@ impl Core {
             for r in scope.iter().filter(|r| Some(r.as_str()) != author) {
                 match listing.find(r) {
                     Some(found) => picked.push(found),
-                    None => left.push(missing(listing, r)),
+                    None => left.push(self.missing(listing, r)),
                 }
             }
         }
         let mut plan = Plan::new();
         for (i, c) in picked {
             if c.is_cold(now) {
-                left.push(format!("{}: {}", text::label(c), text::cold_reason(c, now)));
+                left.push(format!("{}: {}", self.label(listing, c), text::cold_reason(c, now)));
             } else {
                 plan.push((*i, c.clone()));
             }
@@ -224,7 +224,7 @@ impl Core {
         for r in refs {
             match listing.find(r) {
                 Some((i, c)) => plan.push((*i, c.clone())),
-                None => left.push(missing(listing, r)),
+                None => left.push(self.missing(listing, r)),
             }
         }
         (plan, left)
@@ -236,7 +236,7 @@ impl Core {
         join_all(plan.iter().map(|(i, c)| {
             let also = plan.iter().filter(|(_, o)| o.ref_ != c.ref_).map(|(_, o)| o.ref_.clone()).collect();
             let req = WakeRequest {
-                ref_: c.ref_.clone(),
+                to: c.clone(),
                 notice: Notice {
                     kind: NoticeKind::Message,
                     message: message.clone(),
@@ -263,7 +263,7 @@ impl Core {
         let released: Vec<&String> = prior.iter().filter(|r| !scope.contains(r)).collect();
         join_all(released.iter().filter_map(|r| listing.find(r)).map(|(i, c)| {
             let req = WakeRequest {
-                ref_: c.ref_.clone(),
+                to: c.clone(),
                 notice: Notice {
                     kind: NoticeKind::Released,
                     message: thread_message.clone(),
@@ -296,7 +296,7 @@ impl Core {
             };
             let option = MenuOption {
                 value: c.ref_.clone(),
-                label: text::option_label(c, now),
+                label: text::option_label(&self.show(listing, &c.ref_), c, now),
             };
             match groups.iter_mut().find(|g| g.label == label) {
                 Some(g) => g.options.push(option),
@@ -339,7 +339,11 @@ impl Core {
         } else {
             out.push_str(&format!(
                 "Woken for {person}: {}\n",
-                woken.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                woken
+                    .iter()
+                    .map(|r| format!("`{}`", self.show(listing, r)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         for l in left_out {
@@ -353,21 +357,29 @@ impl Core {
             } else {
                 out.push_str(&format!("Running sessions for {person}{place}:\n"));
                 for (_, c) in ours {
-                    out.push_str(&format!("• {}\n", text::candidate_line(c, now)));
+                    let shown = format!("`{}`", self.show(listing, &c.ref_));
+                    out.push_str(&format!("• {}\n", text::candidate_line(&shown, c, now)));
                 }
             }
         }
         out.push_str(
-            "Reply `to: <ref>` to wake a session (`to: p41` works when the short ID is unique), or `to: all` to go back to the defaults.",
+            "Reply `to: <session>` to wake a session (`to: p41` works when the short ID is unique, `to: <machine>/p41` when it isn't), or `to: all` to go back to the defaults.",
         );
         out
     }
 }
 
-fn missing(listing: &Listing, r: &str) -> String {
-    if listing.failed || listing.unreachable.iter().any(|u| u == r) {
-        format!("`{r}`: not checkable (unreachable)")
-    } else {
-        format!("`{r}`: no longer running")
+impl Core {
+    /// A ref the listing lacks: gone, unless its machine or source did not answer.
+    pub(super) fn missing(&self, listing: &Listing, r: &str) -> String {
+        let shown = self.show(listing, r);
+        if !listing.failed.is_empty() {
+            let failed: Vec<&str> = listing.failed.iter().map(|i| self.sources[*i].name()).collect();
+            format!("`{shown}`: not checked (listing {} sessions failed)", failed.join(" and "))
+        } else if self.unchecked(listing, r) {
+            format!("`{shown}`: not checked (its machine did not answer)")
+        } else {
+            format!("`{shown}`: no longer running")
+        }
     }
 }

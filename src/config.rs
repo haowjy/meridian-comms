@@ -10,7 +10,7 @@ use crate::paths;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub owner: String,
-    /// No longer read: refs start with Meridian's name for the machine. Kept
+    /// No longer read: Meridian names and identifies the machine. Kept
     /// so the daemon can say so to a config that still sets it.
     #[serde(default)]
     pub machine: Option<serde::de::IgnoredAny>,
@@ -108,9 +108,14 @@ pub struct MeridianConfig {
     pub projects: BTreeMap<String, MeridianProject>,
 }
 
+/// A project, by its Meridian project ID (the key): its agents may run on
+/// any machine the bot reaches.
 #[derive(Debug, Deserialize)]
 pub struct MeridianProject {
-    pub root: PathBuf,
+    /// Deprecated and unused: read so a config that sets it still loads,
+    /// with a warning, for one minor release.
+    #[serde(default)]
+    pub root: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub default: Option<String>,
 }
@@ -130,15 +135,99 @@ pub fn is_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) && !s.starts_with('-')
 }
 
+/// The whole config of a machine whose agents reach the bot on another
+/// machine: `[bot]`, and nothing else. The client reads it; the daemon
+/// refuses to start with it, since one bot keeps one daemon.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotConfig {
+    /// The `ssh` target of the bot's machine. It is this tool's own, beside
+    /// Meridian's saved machine: meridian-comms reads no Meridian state.
+    pub ssh: String,
+    /// The program on the bot's machine, when it is not `meridian-comms` on
+    /// the PATH its SSH login gets.
+    #[serde(default = "BotConfig::default_command")]
+    pub command: String,
+}
+
+impl BotConfig {
+    fn default_command() -> String {
+        "meridian-comms".into()
+    }
+}
+
+/// Where the client finds the daemon.
+pub enum Reach {
+    /// The socket on this machine: the bot's machine, or no config here.
+    Socket,
+    Bot(BotConfig),
+}
+
+/// The config file's table, or `None` when there is no file.
+fn read_table(path: &Path) -> Result<Option<(String, toml::Table)>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let table = text.parse::<toml::Table>().with_context(|| format!("invalid {}", path.display()))?;
+    Ok(Some((text, table)))
+}
+
+/// Where this machine's client reaches the daemon. Only a `[bot]` config is
+/// read here: the rest is the daemon's to check.
+pub fn reach() -> Result<Reach> {
+    let path = config_path();
+    let Some((_, table)) = read_table(&path)? else {
+        return Ok(Reach::Socket);
+    };
+    let Some(bot) = table.get("bot") else {
+        return Ok(Reach::Socket);
+    };
+    if table.len() > 1 {
+        bail!(
+            "{}: a [bot] config holds [bot] alone; the bot's own config is on the bot's machine",
+            path.display()
+        );
+    }
+    let bot: BotConfig = bot
+        .clone()
+        .try_into()
+        .with_context(|| format!("invalid [bot] in {}", path.display()))?;
+    // Both go on ssh's command line, and the command on the far side's too.
+    if bot.ssh.is_empty() || bot.ssh.starts_with('-') || bot.ssh.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("bot.ssh in {}: {:?} is not an ssh target", path.display(), bot.ssh);
+    }
+    if bot.command.is_empty()
+        || !bot
+            .command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+'))
+    {
+        bail!(
+            "bot.command in {}: {:?} must be a program name or path of letters, digits and / . _ - ~ +",
+            path.display(),
+            bot.command
+        );
+    }
+    Ok(Reach::Bot(bot))
+}
+
 impl Config {
     pub fn load() -> Result<Config> {
         let path = config_path();
-        let text = std::fs::read_to_string(&path).with_context(|| {
-            format!(
+        let Some((text, table)) = read_table(&path)? else {
+            bail!(
                 "cannot read {} (create it from the config example in the design docs)",
                 path.display()
-            )
-        })?;
+            );
+        };
+        if table.contains_key("bot") {
+            bail!(
+                "{} is a [bot] config, for a machine whose agents reach the bot on another machine over SSH: the daemon runs on the bot's machine, with the bot's config",
+                path.display()
+            );
+        }
         let mut cfg: Config = toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
         cfg.finish()?;
         Ok(cfg)

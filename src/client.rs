@@ -1,7 +1,9 @@
 //! The client a session runs: `read`, `send` and `list`. It learns who is calling
-//! from the sources, asks the daemon over its socket, and prints the answer.
-//! `post` is what a source's people command calls. `route` is what a source's
-//! inbox runs for a new message, and `routes` prints the routing log.
+//! from the sources, asks the daemon over its socket, or on a machine with a
+//! `[bot]` config through `bridge` over SSH, and prints the answer. `post` is
+//! what a source's people command calls. `route` is what a source's inbox
+//! runs for a new message, and `routes` prints the routing log: both only on
+//! the bot's machine.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -9,39 +11,27 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{Local, Utc};
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::config::Config;
-use crate::daemon;
-use crate::model::{CallerKind, FailKind, Failure, IdentifyRequest, IdentifyResult};
-use crate::paths;
+use crate::bridge;
+use crate::config::{Reach, reach};
+
+use crate::model::{FailKind, Failure, IdentifyRequest, IdentifyResult};
 use crate::proto::{ListOut, MAX_REQUEST, PostTo, ReadOut, Reply, Request, RouteOut, SendOut, Target};
-use crate::routes;
+use crate::{paths, routes, source};
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Who is calling: the first source that claims the environment, else the
-/// owner at a terminal. A session never falls through to the owner.
-fn identify() -> Result<IdentifyResult> {
-    let cfg = Config::load()?;
-    let req = environment();
-    for s in daemon::sources(&cfg)? {
-        let id = s.identify(&req);
-        match id.caller {
-            CallerKind::None => continue,
-            CallerKind::Unlisted => bail!(Failure::new(
-                FailKind::NotAllowed,
-                format!(
-                    "this session's project is not listed in {}: add it under [sources.{}.projects] to let this session use meridian-comms",
-                    crate::config::config_path().display(),
-                    s.name()
-                )
-            )),
-            CallerKind::Session => return Ok(id),
-        }
+/// Asks the daemon `make(caller)` for the caller this environment is. A
+/// claim whose machine the daemon doesn't know is made once more without what
+/// it cached: the daemon refused it before doing anything.
+async fn ask<T: DeserializeOwned>(make: impl Fn(IdentifyResult) -> Request, wait: Duration) -> Result<T> {
+    let env = environment();
+    match call(&make(source::claim(&env, false).await?), wait).await {
+        Err(e) if Failure::kind_of(&e) == FailKind::UnknownMachine => call(&make(source::claim(&env, true).await?), wait).await,
+        answered => answered,
     }
-    Ok(IdentifyResult::none())
 }
 
 /// What a source reads to learn who, or what, the client was run for.
@@ -54,10 +44,10 @@ fn environment() -> IdentifyRequest {
     }
 }
 
-/// One request and its answer. Every error is a `Failure`: from the moment a
-/// request that posts is written, one without a clear answer is `MaybeSent`.
+/// One request and its answer, over the socket or the bridge. Every error is
+/// a `Failure`: from the moment a request that posts is written, one without
+/// a clear answer is `MaybeSent`.
 async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
-    let fail = |kind, text: String| anyhow::Error::from(Failure::new(kind, text));
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     if line.len() > MAX_REQUEST {
@@ -66,22 +56,44 @@ async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
             format!("the request is over the daemon's {} MiB; nothing was sent", MAX_REQUEST >> 20)
         ));
     }
-    let path = paths::socket_path();
-    let conn = UnixStream::connect(&path).await.map_err(|e| {
-        fail(
-            FailKind::Unreachable,
-            format!(
-                "cannot reach the meridian-comms daemon at {} ({e}); nothing was sent. Is it running (`meridian-comms daemon`)? A sandboxed session may block Unix sockets: allow connecting to that path",
-                path.display()
-            ),
-        )
-    })?;
+    match reach()? {
+        Reach::Socket => {
+            let path = paths::socket_path();
+            let conn = UnixStream::connect(&path).await.map_err(|e| {
+                Failure::new(
+                    FailKind::Unreachable,
+                    format!(
+                        "cannot reach the meridian-comms daemon at {} ({e}); nothing was sent. Is it running (`meridian-comms daemon`)? A sandboxed session may block Unix sockets: allow connecting to that path. On a machine whose agents reach the bot on another machine, the config is `[bot] ssh = \"<its ssh target>\"`",
+                        path.display()
+                    ),
+                )
+            })?;
+            let (rd, mut wr) = conn.into_split();
+            exchange(req, &line, &mut BufReader::new(rd), &mut wr, wait).await
+        }
+        Reach::Bot(bot) => {
+            let mut b = bridge::open(&bot).await?;
+            // The bridge's stdin stays open until the answer: its end is the client's.
+            exchange(req, &line, &mut b.reader, &mut b.writer, wait).await
+        }
+    }
+}
+
+/// Writes the request line and reads the answer line.
+async fn exchange<T: DeserializeOwned>(
+    req: &Request,
+    line: &str,
+    rd: &mut (impl AsyncBufRead + Unpin),
+    wr: &mut (impl AsyncWrite + Unpin),
+    wait: Duration,
+) -> Result<T> {
+    let fail = |kind, text: String| anyhow::Error::from(Failure::new(kind, text));
     let posts = req.posts();
     let unanswered = |what: String| match posts {
         true => fail(
             FailKind::MaybeSent,
             format!(
-                "{what}. The daemon may have finished the request: `meridian-comms read` shows whether the message was posted before you send again"
+                "{what}. It may have reached the bot: `meridian-comms read` shows whether the message was posted before you send again"
             ),
         ),
         false => fail(
@@ -89,13 +101,15 @@ async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
             format!("{what}. This request posts nothing: running it again is safe"),
         ),
     };
-    let (rd, mut wr) = conn.into_split();
-    wr.write_all(line.as_bytes())
-        .await
-        .map_err(|e| unanswered(format!("the request to the daemon broke off ({e})")))?;
+    async {
+        wr.write_all(line.as_bytes()).await?;
+        wr.flush().await
+    }
+    .await
+    .map_err(|e| unanswered(format!("the request to the daemon broke off ({e})")))?;
     let mut answer = String::new();
     // Only this side gives up: the daemon finishes the request either way.
-    match tokio::time::timeout(wait, BufReader::new(rd).read_line(&mut answer)).await {
+    match tokio::time::timeout(wait, rd.read_line(&mut answer)).await {
         Err(_) => return Err(unanswered(format!("no answer from the daemon after {} s", wait.as_secs()))),
         Ok(Err(e)) => return Err(unanswered(format!("the daemon's answer broke off ({e})"))),
         Ok(Ok(_)) if answer.is_empty() => return Err(unanswered("the daemon closed the connection without answering".into())),
@@ -113,6 +127,15 @@ async fn call<T: DeserializeOwned>(req: &Request, wait: Duration) -> Result<T> {
         (None, Some(r)) => Ok(r),
         (None, None) => Err(unanswered("the daemon answered with nothing".into())),
     }
+}
+
+/// `route` and `routes` belong to the bot's machine, where the inbox and the
+/// routing log are: `why(ssh, command)` says so.
+fn on_bot_machine(why: impl Fn(&str, &str) -> String) -> Result<()> {
+    if let Reach::Bot(bot) = reach()? {
+        bail!(why(&bot.ssh, &bot.command));
+    }
+    Ok(())
 }
 
 fn target(message: Option<String>, channel: Option<String>) -> Result<Target> {
@@ -133,10 +156,11 @@ fn json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 pub async fn read(message: Option<String>, channel: Option<String>, limit: Option<usize>, as_json: bool) -> Result<()> {
-    let out: ReadOut = call(
-        &Request::Read {
-            caller: identify()?,
-            target: target(message, channel)?,
+    let target = target(message, channel)?;
+    let out: ReadOut = ask(
+        |caller| Request::Read {
+            caller,
+            target: target.clone(),
             limit,
         },
         ANSWER_TIMEOUT,
@@ -189,12 +213,13 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
         }
         _ => text,
     };
-    let out: SendOut = call(
-        &Request::Send {
-            caller: identify()?,
-            target: target(message, channel)?,
+    let target = target(message, channel)?;
+    let out: SendOut = ask(
+        |caller| Request::Send {
+            caller,
+            target: target.clone(),
             to: to.clone(),
-            text,
+            text: text.clone(),
         },
         ANSWER_TIMEOUT,
     )
@@ -233,15 +258,22 @@ pub async fn send(message: Option<String>, channel: Option<String>, to: Vec<Stri
 /// Posts `text` for a person or in a thread and wakes nobody. Every error is
 /// a `Failure`.
 pub async fn post(to: PostTo, text: String, wait: Duration) -> Result<SendOut> {
-    let caller = identify()?;
-    call(&Request::Post { caller, to, text }, wait).await
+    ask(
+        |caller| Request::Post {
+            caller,
+            to: to.clone(),
+            text: text.clone(),
+        },
+        wait,
+    )
+    .await
 }
 
 pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
-    let out: ListOut = call(
-        &Request::List {
-            caller: identify()?,
-            project,
+    let out: ListOut = ask(
+        |caller| Request::List {
+            caller,
+            project: project.clone(),
         },
         ANSWER_TIMEOUT,
     )
@@ -260,7 +292,11 @@ pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
             println!("  no running sessions");
         }
         for c in &p.candidates {
-            println!("  {}", crate::core::candidate_line(c, now).replace('`', ""));
+            let head = match &c.id {
+                Some(id) => format!("{} ({id})", c.ref_),
+                None => c.ref_.clone(),
+            };
+            println!("  {}", crate::core::candidate_line(&head, c, now).replace('`', ""));
         }
         for u in &p.unreachable {
             println!("  {u}: not checkable");
@@ -287,15 +323,16 @@ pub async fn list(project: Option<String>, as_json: bool) -> Result<()> {
 /// Hands one inbox item to the daemon and returns once it is accepted: the
 /// routing itself can take minutes, and a hook that runs this has a deadline.
 pub async fn route(item: Option<String>) -> Result<()> {
+    on_bot_machine(|ssh, cmd| {
+        format!(
+            "route takes an item in the bot's machine's inbox, and an item ID names one in its own machine's inbox only: run `ssh {ssh} {cmd} route <item>` for one there"
+        )
+    })?;
     let (source, item) = match item {
         Some(item) => (None, item),
-        None => {
-            let env = environment();
-            daemon::sources(&Config::load()?)?
-                .iter()
-                .find_map(|s| Some((Some(s.name().to_string()), s.routed_item(&env)?)))
-                .context("no item to route: name one, or run this as a source's hook for a new inbox message")?
-        }
+        None => source::routed_item(&environment())
+            .map(|(source, item)| (Some(source.to_string()), item))
+            .context("no item to route: name one, or run this as a source's hook for a new inbox message")?,
     };
     let out: RouteOut = call(&Request::Route { source, item }, ANSWER_TIMEOUT).await?;
     println!("{}", out.detail);
@@ -305,6 +342,7 @@ pub async fn route(item: Option<String>) -> Result<()> {
 /// Prints the routing log, or the routings of one item or thread message. It
 /// reads the file itself: the log is on the daemon's machine, like the socket.
 pub fn routes(of: Option<String>, as_json: bool) -> Result<()> {
+    on_bot_machine(|ssh, cmd| format!("the routing log is on the bot's machine: read it with `ssh {ssh} {cmd} routes`"))?;
     let path = routes::path(&paths::state_dir());
     let mut log = routes::read(&path)?;
     if let Some(of) = &of {
