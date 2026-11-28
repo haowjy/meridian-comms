@@ -87,7 +87,13 @@ pub(super) fn parse(envelope: &Value) -> Option<(Kind, Interaction)> {
                         [only] => Some(only.clone()),
                         many => picked(CHANNEL_BLOCK, CHANNEL).filter(|c| many.contains(c)),
                     };
-                    let session = picked(SESSION_BLOCK, SESSION).filter(|v| v != NOTE).or(meta.session);
+                    // The preset only when the field has no selection at all, in case
+                    // Slack leaves an untouched `initial_option` out of the state;
+                    // the note option is never a session.
+                    let session = match picked(SESSION_BLOCK, SESSION) {
+                        Some(v) => Some(v).filter(|v| v != NOTE),
+                        None => meta.session,
+                    };
                     Some((
                         Kind::Submit {
                             choice: meta.conversations.len() > 1,

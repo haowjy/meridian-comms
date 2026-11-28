@@ -226,12 +226,23 @@ impl Core {
         };
         let mut outcome = outcome;
         let bad = |e: String| (FormField::Session, e);
-        match tokio::time::timeout_at(deadline.into(), outcome.wait_for(Option::is_some)).await {
-            Ok(Ok(v)) => match v.as_ref() {
-                Some(Err(e)) => Err(bad(e.clone())),
-                _ => Ok(()),
-            },
-            _ => Err(bad("Still posting the message: wait a moment, then send again.".into())),
+        let waited = tokio::time::timeout_at(deadline.into(), outcome.wait_for(Option::is_some))
+            .await
+            .map(|r| r.map(|v| v.clone()));
+        match waited {
+            Ok(Ok(Some(Err(e)))) => Err(bad(e)),
+            Ok(Ok(_)) => Ok(()),
+            // The post's task ended (a panic) before it said how the post went.
+            // Forgotten, so the form doesn't wait on an answer that never comes.
+            Ok(Err(_)) => {
+                self.forms
+                    .0
+                    .lock()
+                    .unwrap()
+                    .retain(|f, (_, o)| f != form || !o.same_channel(&outcome));
+                Err(bad("The message could not be posted. Send again.".into()))
+            }
+            Err(_) => Err(bad("Still posting the message: wait a moment, then send again.".into())),
         }
     }
 
