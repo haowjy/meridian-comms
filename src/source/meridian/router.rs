@@ -58,27 +58,45 @@ pub async fn setup() -> Result<()> {
     if !init.status.success() {
         bail!("`meridian init {at}` failed: {}{}", tail(&init.stdout), tail(&init.stderr));
     }
-    let path = resolve_profile(&dir)
+    let launch = resolve_profile(&dir)
         .await
         .map_err(|why| anyhow::anyhow!("Meridian can't start the {PROFILE} agent in the router directory: {why}"))?;
     println!(
-        "The router directory is {}: Meridian finds the {PROFILE} profile at {path}.",
-        dir.display()
+        "The router directory is {}: Meridian finds the {PROFILE} profile at {}.",
+        dir.display(),
+        launch.path
     );
-    if Path::new(&path).starts_with(shadow_dir(&dir)) {
+    if Path::new(&launch.path).starts_with(shadow_dir(&dir)) {
         println!(
             "That is a package's copy from the router directory's own mars.toml, which an earlier setup did not write, so it was left: it replaces the profile Meridian ships."
         );
     }
-    println!(
-        "It needs OpenCode on this machine, signed in for the model the profile names, unless [inbox.router] in ~/.meridian/config.toml names another."
-    );
+    println!("It runs on {} with model {}.", launch.harness, launch.model);
+    if launch.chosen_by != "profile" {
+        println!(
+            "Meridian chose that harness by {}, not by the profile's preference.",
+            launch.chosen_by
+        );
+    }
+    println!("To choose its harness, model or effort, set them in [inbox.router] in ~/.meridian/config.toml.");
     Ok(())
 }
 
-/// The profile's path as this Meridian resolves it from `dir`, from a dry run
-/// that composes the launch and starts nothing; else Meridian's reason.
-async fn resolve_profile(dir: &Path) -> Result<String, String> {
+/// What a dry run in the router directory says a launch would use.
+struct Launch {
+    path: String,
+    harness: String,
+    model: String,
+    /// Meridian's name for where the harness came from; `profile` when the
+    /// profile's preferred harness was usable.
+    chosen_by: String,
+}
+
+/// The launch this Meridian composes from `dir` for the profile, from a dry
+/// run that starts nothing; else Meridian's reason. The profile's harness is a
+/// preference: when it isn't usable, Meridian falls back to the user's harness
+/// order.
+async fn resolve_profile(dir: &Path) -> Result<Launch, String> {
     let out = run(Some(dir), &["spawn", "-a", PROFILE, "--dry-run", "-p", "setup check", "--json"])
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -86,7 +104,13 @@ async fn resolve_profile(dir: &Path) -> Result<String, String> {
     if shown["status"] == "dry-run"
         && let Some(path) = field(&shown["agent_path"])
     {
-        return Ok(path);
+        let text = |v: &Value| field(v).unwrap_or_else(|| "unknown".to_string());
+        return Ok(Launch {
+            path,
+            harness: text(&shown["harness_id"]),
+            model: text(&shown["model"]),
+            chosen_by: text(&shown["model_selection"]["harness_provenance"]),
+        });
     }
     Err(shown["message"]
         .as_str()
@@ -315,10 +339,12 @@ impl Meridian {
                 dir.display()
             );
         }
-        if shadow_dir(&dir).join(format!("{PROFILE}.md")).exists() {
+        // Only the dependency an earlier setup wrote: setup removes it. A
+        // mars.toml the user wrote is their choice, which setup reported.
+        if std::fs::read_to_string(dir.join("mars.toml")).is_ok_and(|t| setup_dependency(&t).is_some()) {
             tracing::warn!(
-                "a package's {PROFILE} in {} replaces the profile Meridian ships: run `{PROGRAM} setup router`",
-                shadow_dir(&dir).display()
+                "an earlier setup's Mars dependency in {} installs a package's {PROFILE}, which replaces the profile Meridian ships: run `{PROGRAM} setup router`",
+                dir.display()
             );
         }
         let goals = self.goals(&req.candidates).await;

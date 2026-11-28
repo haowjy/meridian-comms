@@ -81,15 +81,26 @@ Without these steps the bot works as above and a message nobody was woken for wa
    their defaults are in [docs/design.md](docs/design.md#config).
 4. Run `meridian-comms setup router`. It first checks that Meridian is 0.28.1 or later,
    the first to ship the agent the router asks when the model is unsure, and changes
-   nothing if not. Then it makes the router's directory and checks that Meridian can start
-   the agent there. The agent runs on OpenCode by default, which must be installed and
-   signed in on this machine; to change its model, harness or effort, set them in
-   `[inbox.router]` in `~/.meridian/config.toml`. If you set up the router with any
-   earlier version of meridian-comms, run setup again: it removes the package copy of the
-   agent the earlier setup installed, which would otherwise replace Meridian's. The
-   daemon's log warns while that copy is there.
+   nothing if not. Then it makes the router's directory, checks that Meridian can start
+   the agent there, and prints the harness and model Meridian chose for it. The agent
+   prefers OpenCode; when OpenCode isn't usable there, Meridian falls back to your Mars
+   harness order, so it may run on another harness you have, such as Pi, paid for by
+   that harness's account. To choose its model, harness or effort, set them in
+   `[inbox.router]` in `~/.meridian/config.toml`.
 5. Restart the daemon.
 6. Send a message that wakes nobody, then run `meridian-comms routes`: it shows what the
    router did with it.
 
 How it works and why: [docs/design.md](docs/design.md).
+
+## Upgrading
+
+The daemon refuses to start with a Meridian older than the one it needs, so upgrade in
+this order:
+
+1. Meridian (`uv tool install --upgrade meridian-cli`).
+2. meridian-comms (`cargo install --path .`).
+3. If the router is on, `meridian-comms setup router`. A router set up by an earlier
+   meridian-comms installed its own copy of the agent through Mars, which would replace
+   Meridian's; setup removes it.
+4. Restart the daemon.
