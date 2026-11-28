@@ -21,6 +21,7 @@ invited to.
     "description": "Hands Slack messages to Jimmy's running agent sessions, and posts their answers."
   },
   "features": {
+    "app_home": { "home_tab_enabled": true },
     "bot_user": { "display_name": "jimmy-agents", "always_online": true },
     "slash_commands": [
       {
@@ -45,7 +46,7 @@ invited to.
   },
   "settings": {
     "event_subscriptions": {
-      "bot_events": ["message.channels", "message.groups"]
+      "bot_events": ["app_home_opened", "message.channels", "message.groups"]
     },
     "interactivity": { "is_enabled": true },
     "org_deploy_enabled": false,
@@ -68,17 +69,24 @@ What each scope is for:
 Under Socket Mode the command has no request URL, and the form's session list needs no
 options URL: both arrive over the same connection, with interactivity on.
 
-### An app made before `/agent`
+The Home tab (`app_home`) is the bot's view of the owner's agents, and `app_home_opened`
+tells the daemon someone opened it. Neither needs a scope; without the Home tab on, the
+daemon can't publish the view (Slack answers `not_enabled`).
 
-The manifest above adds the `commands` scope and the `/agent` command. For an app that
-already exists:
+### An app made before `/agent` or the Home tab
+
+The manifest above adds the `commands` scope, the `/agent` command, the Home tab and the
+`app_home_opened` event. For an app that already exists:
 
 1. Open the app at <https://api.slack.com/apps>, choose **App Manifest**, and replace it
-   with what `meridian-comms setup` prints now; or add the `commands` scope under
-   **OAuth & Permissions** and create `/agent` under **Slash Commands** by hand.
-2. Slack asks to reinstall the app for the new scope: under **Install App**, reinstall it.
-   The bot token normally stays the same; if Slack shows a new one, put it in `slack.env`.
-3. Restart the daemon with a build that has the form.
+   with what `meridian-comms setup` prints now. By hand instead: add the `commands` scope
+   under **OAuth & Permissions**, create `/agent` under **Slash Commands**, switch on the
+   **Home Tab** under **App Home**, and add `app_home_opened` under **Event
+   Subscriptions**, **Subscribe to bot events**.
+2. Slack asks to reinstall the app for the changes: under **Install App**, reinstall it
+   once for all of them. The bot token normally stays the same; if Slack shows a new
+   one, put it in `slack.env`.
+3. Restart the daemon with a build that has the form and the Home tab.
 
 ## 2. Make the app-level token
 

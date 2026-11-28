@@ -90,8 +90,8 @@ channel; anyone else gets a reply only they see, never a post. Replies in the th
 
 The form is opened for one channel or for several to choose from, all of one project, and
 optionally with a session already chosen. `/agent` passes the channel it was typed in and
-no session. A later "Message" button on the Home tab, whose click names no channel, passes
-the channels configured for the session's project (with exactly one, that one; with
+no session. The Message button on the [Home tab](#the-home-tab), whose click names no
+channel, passes the channels configured for the session's project (with exactly one, that one; with
 several, the form offers them; with none, there is no button). On Slack the modal carries
 its channels and that session to the submission in `private_metadata`, and the submission
 checks the channel and the person again and the session against the listing.
@@ -139,7 +139,19 @@ and is named in the thread as left out. On a `disconnect` frame the socket sends
 acknowledgements it holds before it reconnects. Waking stays
 on this machine (below), so the form lists this machine's sessions only; `online` takes
 the machines from the sources, so a source that reaches more machines adds them without a
-change to its callers. A status view of who is online would call `online` too.
+change to its callers.
+
+**One listing across machines.** Beside the per-project listings, `online.rs` keeps one
+listing of everything the sources reach on every machine (`ListRequest.offerable`), for
+the router and the Home tab, so the bot's machine never runs two such listings at once.
+Each caller says what it needs (`Need`): the Home tab takes the newest at once and starts
+a new one only when that is over a minute old (or always, for Refresh), and joins one
+that runs; the router needs one that started after its attempt began, so it joins the
+running one only if it started after that, and otherwise the next starts as soon as the
+running one ends. Which candidates each caller uses is written once (`Core::reach`), as
+is which channels a form may open a thread for a candidate in
+(`Core::form_conversations`: its project's, for a candidate its source marks
+`wakeable`). The core's limit for this listing is 30 s; the per-project one keeps 15.
 
 **A choice always wakes**, cold or not: a message opening `to: p41 desk/x/p7` (or
 `to: all` for the defaults), or `send --to`. A short ID stands for its ref when exactly
@@ -212,7 +224,9 @@ The daemon routes each accepted item in its own task (`src/core/route.rs`):
    item's `via`: anyone can file an item that claims to come from here.
 3. List every session the item could be offered to (`ListRequest.offerable`): the
    owner's running sessions in every project, on this machine and on each
-   [saved machine](#saved-machines).
+   [saved machine](#saved-machines). The listing is the one across machines the Home tab
+   shares (above), started after this routing began. A machine that didn't answer is
+   left out and named in the log; only a source that fails outright fails the routing.
 4. Keep a session only if it is in the item's project (an item with no project: any), is
    not the item's sender, and is working or idle with `warm_until` ahead. A session with
    no activity is dropped. None kept, or more than 253: stop, the item waits.
@@ -246,6 +260,7 @@ No thread lock is held while a source or the model is asked.
 - **The routing log** is `~/.local/state/meridian-comms/routes.jsonl` (`src/routes.rs`): one JSON
   line per routing with the time, source, item, the thread message ref if any, the refs
   the model chose among, its choice and probabilities, the second step's spawn ID, the
+  machines that didn't answer the listing (`missing`, each with its ID, name and why), the
   outcome (`offered`, `not_offered`, `maybe_offered`, `none`, `asked`, `off`, `capped`,
   `failed`), the outcome in words, and the error. It never holds message text.
   A line is appended in one `write` on an `O_APPEND` file and fsynced; a reader skips a
@@ -492,11 +507,43 @@ own refresh briefly overlaps the old connection with the new one. After a crash,
 may count the dead connection for a while, so a restart can be refused until Slack
 drops it; run the service with a restart delay. Web API calls: `chat.postMessage`,
 `reactions.add`, `conversations.replies`, `conversations.history`, `auth.test`,
-`conversations.info`, `views.open`; a 429 waits out `Retry-After`. A post replaces `<!` with
+`conversations.info`, `views.open`, `views.publish`; a 429 waits out `Retry-After`. A post replaces `<!` with
 `&lt;!` so text from a session can't ping a channel. A post over Slack's 40,000 characters,
 which Slack would cut, is refused before it is sent, for `send` as for `deliver`. A
 channel shared with another
 organization is refused at start unless its entry says `external = true`.
+
+## The Home tab
+
+The bot's Home tab shows the owner's agents: the listing across machines (`online.rs`),
+grouped by project (its label) and group, each candidate in the picker's words (short
+ID, label, model, activity), what else runs in each group as a count, and a line saying
+when it was listed, which machines answered (and why not), and whether a new listing
+runs. Only the owner sees it: `src/core/view.rs` compares the Slack user on every open
+and every click with `people.<owner>.slack`, and anyone else is shown "This shows the
+owner's agents." Statuses and group names are the owner's agents' own words, and
+opening the view to others means deciding what each may see.
+
+- **Events:** Slack's `app_home_opened` with `tab` `home` (the Messages tab sends the
+  same event, and is dropped), and the Refresh click, come in as events. A Message click
+  must open a modal within Slack's 3 s, so it is an interaction of its own
+  (`ViewMessage`), answered like the form's command: the core checks the owner and
+  answers with the form, and the socket opens it with the click's `trigger_id` before
+  acknowledging. An answer in words (someone not the owner) opens as a modal of its own,
+  since a Home click has no channel. A click the core didn't answer by the socket's
+  2.5 s is only logged: the half second left of the trigger's life is too little to open
+  a modal.
+- **Freshness:** opening shows the newest listing at once, with its age, and starts a
+  new one when it is over 60 s old; Refresh always starts one, or joins the one running.
+  Nothing polls. One task publishes the owner's view (`views.publish`), again whenever
+  the listing changes or the owner opens it, always from the newest, so two publishes
+  never land out of order.
+- **Message** is a button on a candidate whose source marks it `wakeable` and whose
+  project has a configured channel. Its value carries the session and the project's
+  channels, and opens the `/agent` form with them; the form checks them again.
+- **Layout:** every text is `plain_text`, so nothing a source wrote becomes a mention, a
+  link or formatting. Slack shows at most 100 blocks: the view is cut at the end, with a
+  line counting the groups not shown in full.
 
 ## Client and daemon
 
@@ -526,7 +573,7 @@ that session simply gets no more of the thread's messages
 and, at start, `context --json`. A wake reads the error's kind: `not_running` or
 `not_found` is a session that is gone, `maybe_delivered` a notice that may have arrived
 (reported as not woken, so the message still waits), anything else a failed wake. For the machine it runs in the home
-directory with no `-C`: `--version` and `machine name --json` (once each, at start), `spawn list --global --primary --json`,
+directory with no `-C`: `--version` and `machine name --json` (once each, at start), `spawn list --global --json`,
 `message inbox`, `inbox read`, `inbox take`, `inbox offer`, and `spawn show` to turn an
 item's sender (a chat ID) into the spawn ID a candidate carries. For saved machines it
 adds `machine list --json` and `--machine <name>` on that listing and that `spawn show`. The second step adds `work show` in a
@@ -616,12 +663,30 @@ At each start the daemon rewrites the refs in its thread files (`scope`, `woken`
 through a rename while the daemon was stopped, and threads a killed daemon left at an
 older name.
 
-For an offer the Meridian source also lists the primaries of every machine Meridian has
-saved (`meridian machine list`): one `spawn list --global --primary --json --machine M`
-each, all at once, beside the local listing. Each has 8 seconds. One that answers takes
-about 2; one that is down, too old or slow contributes no sessions, is logged, and
-fails nothing. The whole listing stays under the core's 15-second limit however many
-machines are saved.
+For an offer and the Home tab the Meridian source also lists the sessions of every
+machine Meridian has saved (`meridian machine list`): one `spawn list --global --json
+--machine M` each, all at once, beside the local listing. `machine list` and then each
+machine have 12 seconds. A design review measured a Raspberry Pi (raspberry, Meridian
+0.28.3) asking a desktop (homebox): about 4.9 s alone, 9.5 s beside five local listings.
+One that is down, too old or slow contributes no sessions, and is named in the answer's
+`machines` with why. Each listing logs at info who started and joined it, how long it
+took, and how long `machine list` and each saved machine took and whether it answered.
+The whole listing stays under the core's 30-second limit however many machines are
+saved.
+
+That answer carries more than candidates. Each candidate has `wakeable`: whether `wake`
+from this daemon reaches it, which for Meridian is a running primary in a configured
+project on this machine. `groups` has one entry per `(machine, project, group)` with
+anything running, with how many of what runs there are not candidates (for Meridian,
+spawns, which is why this listing drops `--primary`) and the project's label. The label
+is the name of the project's folder: the configured root here; elsewhere the folder most
+of its primaries run in, since Meridian's rows give each session's own folder, which can
+be a worktree's, and no command gives a project's main checkout. A folder inside
+`<name>.worktrees/` is named `<name>`. A primary that is starting or ending is counted
+nowhere. The view adds the project ID to each of two projects whose labels are the
+same. `machines` has each machine looked on, by ID and name, and whether it answered; a
+`machine list` that fails is one entry with no name. A row's `desc` (a spawn's prompt
+opening) is never read.
 
 Two machines can each have a `p41`. Their refs differ, the model's options are numbered,
 and the second step's agent names a session on another machine as `<machine>/p41`,

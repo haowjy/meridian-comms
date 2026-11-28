@@ -11,6 +11,7 @@ mod form;
 mod online;
 mod route;
 mod text;
+mod view;
 
 pub use text::candidate_line;
 
@@ -24,7 +25,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use crate::config::Config;
 use crate::jev::Jev;
-use crate::model::{Candidate, FailKind, Failure, ListRequest, Msg, SurfaceEvent, WakeRequest, WakeResult};
+use crate::model::{Candidate, FailKind, Failure, Group, ListRequest, Machine, Msg, SurfaceEvent, WakeRequest, WakeResult};
 use crate::routes;
 use crate::source::Source;
 use crate::state::Store;
@@ -33,6 +34,9 @@ use cursor::Cursor;
 use events::Job;
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
+/// For a listing across machines (`offerable`): a source asks each one in turn
+/// for its list of machines, then all of them at once.
+const EVERYWHERE_TIMEOUT: Duration = Duration::from_secs(30);
 const WAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ThreadKey = (String, String);
@@ -66,6 +70,7 @@ pub struct Core {
     second: tokio::sync::Semaphore,
     snapshots: online::Snapshots,
     forms: form::Sent,
+    publisher: view::Publisher,
 }
 
 /// What the sources answered, with the index of the source that listed each candidate.
@@ -73,6 +78,9 @@ pub struct Core {
 pub struct Listing {
     pub candidates: Vec<(usize, Candidate)>,
     pub unreachable: Vec<String>,
+    /// Only in a listing across machines.
+    pub groups: Vec<Group>,
+    pub machines: Vec<Machine>,
     /// A source failed or timed out: what is missing may only be unchecked.
     pub failed: bool,
 }
@@ -85,6 +93,8 @@ impl Listing {
             }
         }
         self.unreachable.extend(r.unreachable);
+        self.groups.extend(r.groups);
+        self.machines.extend(r.machines);
     }
 
     pub fn absorb(&mut self, other: Listing) {
@@ -178,6 +188,7 @@ impl Core {
             second: tokio::sync::Semaphore::new(1),
             snapshots: online::Snapshots::default(),
             forms: form::Sent::default(),
+            publisher: view::Publisher::default(),
         }))
     }
 
@@ -200,17 +211,19 @@ impl Core {
     }
 
     /// Asks every source, side by side. A source that fails or times out
-    /// returns nothing and sets `failed`.
+    /// returns nothing and sets `failed`. A listing across machines is
+    /// `everywhere`'s to start.
     async fn list(&self, req: &ListRequest) -> Listing {
+        let limit = if req.offerable { EVERYWHERE_TIMEOUT } else { LIST_TIMEOUT };
         let answers = join_all(self.sources.iter().enumerate().map(|(i, s)| async move {
-            match tokio::time::timeout(LIST_TIMEOUT, s.list(req)).await {
+            match tokio::time::timeout(limit, s.list(req)).await {
                 Ok(Ok(r)) => (i, Some(r)),
                 Ok(Err(e)) => {
                     tracing::warn!("{} list failed: {e:#}", s.name());
                     (i, None)
                 }
                 Err(_) => {
-                    tracing::warn!("{} list timed out", s.name());
+                    tracing::warn!("{} list timed out after {} s", s.name(), limit.as_secs());
                     (i, None)
                 }
             }

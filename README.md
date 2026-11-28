@@ -16,6 +16,15 @@ bot opens a thread in the channel with your message, under your name, and wakes 
 session you chose. Reply in that thread as usual, `to:` included: Slack doesn't allow
 slash commands in threads, so the form only starts one.
 
+The bot's **Home tab** (in Slack's sidebar under Apps, click the bot, then Home) shows
+the owner's agents on every machine Meridian has saved: grouped by project and work
+item, each with its model and whether it is working, idle or cold, which machines
+answered, and how many other sessions run beside them. It shows the newest listing at
+once, with its age, and lists again when that is over a minute old or you press Refresh.
+An agent the bot can wake, in a project with a configured channel, has a Message button
+that opens the `/agent` form with it chosen. Only the owner sees it; anyone else who
+opens the tab sees one line saying so.
+
 It is built for [Meridian](https://github.com/haowjy/meridian-cli) sessions (Claude Code,
 Codex, OpenCode, Pi) and wraps Meridian's public CLI; it changes nothing in Meridian. It
 needs Meridian 0.28.1 or later (`meridian --version`): the daemon and `setup router`

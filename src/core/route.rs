@@ -12,9 +12,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 
 use super::filing::INBOX_TIMEOUT;
+use super::online::Reader;
 use super::{Core, WAKE_TIMEOUT, text};
 use crate::jev;
-use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision, InboxItem, ListRequest, Offered, PostRequest};
+use crate::model::{Activity, ActivityState, Candidate, DecideRequest, Decision, InboxItem, Offered, PostRequest};
 use crate::proto::RouteOut;
 use crate::routes::{Outcome, Route};
 use crate::state::{Question, ThreadState};
@@ -187,6 +188,7 @@ impl Core {
                 probabilities: BTreeMap::new(),
                 again: reply.is_some(),
                 record: None,
+                missing: vec![],
                 outcome: Outcome::Failed,
                 done: "nothing: the run failed".into(),
                 error: None,
@@ -235,7 +237,9 @@ impl Core {
     /// One routing, start to end: the decision and what was done. `route`
     /// gathers what the log keeps as the steps learn it. An error is a failed
     /// run: nothing was offered and the item waits.
-    async fn run_route(&self, src: usize, route: &mut Route, reply: Option<&str>) -> Result<(Outcome, String)> {
+    async fn run_route(self: &Arc<Self>, src: usize, route: &mut Route, reply: Option<&str>) -> Result<(Outcome, String)> {
+        // The sessions offered among are listed after this attempt began.
+        let attempt = Instant::now();
         let Some(jev) = &self.jev else {
             return Ok((
                 Outcome::Off,
@@ -271,28 +275,24 @@ impl Core {
             return Ok((Outcome::None, "nothing: it was already taken".into()));
         }
 
-        let owner = &self.cfg.owner;
+        // Shared with the Home view, so the two never list across machines at once.
         let listing = self
-            .list(&ListRequest {
-                person: Some(owner.clone()),
-                offerable: true,
-                ..Default::default()
-            })
-            .await;
+            .everywhere(attempt)
+            .await
+            .context("listing the running sessions did not finish")?;
+        route.missing = listing.machines.iter().filter(|m| !m.ok).cloned().collect();
         if listing.failed {
             bail!("a source could not list the running sessions");
         }
         let now = Utc::now();
         // A guess never carries a message out of its project, to its own
         // sender, or to a session that would pay to re-read its context.
-        let kept: Vec<Candidate> = listing
-            .candidates
-            .into_iter()
-            .filter(|(i, c)| *i == src && c.person == *owner)
-            .map(|(_, c)| c)
+        let kept: Vec<Candidate> = self
+            .reach(&listing, Reader::Router(src))
             .filter(|c| item.project.is_none() || c.project == item.project)
             .filter(|c| item.from.as_ref() != Some(&c.ref_))
             .filter(|c| awake(c, now))
+            .cloned()
             .collect();
         if kept.is_empty() {
             return Ok((Outcome::None, "nothing: no working or warm session to offer it to".into()));

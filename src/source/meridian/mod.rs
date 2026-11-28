@@ -1,5 +1,5 @@
 //! The Meridian source. It uses only Meridian's public CLI: `spawn list
-//! --primary --json` for the running primaries, `message --wake` to wake one,
+//! --json` for the running sessions, `message --wake` to wake one,
 //! `message inbox` and `inbox read/take/offer` for the machine's inbox, and
 //! `context` for a root's project ID.
 
@@ -23,14 +23,16 @@ use tokio::process::Command;
 use super::{RefStart, Source};
 use crate::config::{Config, MeridianConfig, is_id};
 use crate::model::{
-    Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decision, FileRequest, Filed, IdentifyRequest, IdentifyResult,
-    InboxItem, ListRequest, ListResponse, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
+    Activity, ActivityState, CallerKind, Candidate, DecideRequest, Decision, FileRequest, Filed, Group, IdentifyRequest, IdentifyResult,
+    InboxItem, ListRequest, ListResponse, Machine, NoticeKind, OfferResult, Offered, WakeRequest, WakeResult,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long one saved machine may take to list its sessions. Measured: about
-/// 2 s for one that answers; `ssh` itself gives up connecting after 10.
-const MACHINE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long `machine list`, and then each saved machine's listing, may take:
+/// together under the core's 30 s for a listing across machines. Measured on
+/// raspberry asking homebox: 4.9 s alone, 9.5 s beside five other listings;
+/// `ssh` itself gives up connecting after 10.
+const MACHINE_TIMEOUT: Duration = Duration::from_secs(12);
 /// What this program calls itself in an inbox item's `via` and in a claim.
 const PROGRAM: &str = "meridian-comms";
 
@@ -244,9 +246,10 @@ impl Meridian {
         rows(run(Some(root), &["spawn", "list", "--primary", "--json", "--limit", "200"]).await?)
     }
 
-    /// Every project's running primaries, on this machine or a saved one.
+    /// Every project's running sessions, primaries and spawns, on this
+    /// machine or a saved one.
     async fn everywhere(&self, machine: Option<&str>) -> Result<Rows> {
-        let mut args = vec!["spawn", "list", "--global", "--primary", "--json"];
+        let mut args = vec!["spawn", "list", "--global", "--json"];
         if let Some(m) = machine {
             args.extend(["--machine", m]);
         }
@@ -276,6 +279,137 @@ impl Meridian {
                 })
             })
             .collect())
+    }
+
+    /// Every running primary on this machine and each saved one, with the
+    /// groups their sessions run in and how each machine answered. Every
+    /// machine is asked at once, and each saved one has its own limit: one that
+    /// is down or slow contributes nothing, holds the listing no longer than
+    /// that, and is named in `machines`.
+    async fn offerable(&self) -> Result<ListResponse> {
+        let mut out = ListResponse::default();
+        let elsewhere = async {
+            // The sessions here are still worth listing without the others.
+            let asked = Instant::now();
+            let saved = self.saved_machines().await;
+            let took = asked.elapsed().as_secs_f32();
+            let saved = match saved {
+                Ok(saved) => {
+                    tracing::info!("machine list answered in {took:.1} s: {} saved", saved.len());
+                    saved
+                }
+                Err(e) => {
+                    tracing::warn!("no saved machine's sessions are listed: machine list failed after {took:.1} s: {e:#}");
+                    return Err(());
+                }
+            };
+            Ok(join_all(saved.into_iter().map(|Saved { id, name: m }| async move {
+                let asked = Instant::now();
+                let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
+                    Ok(rows) => rows,
+                    Err(_) => Err(anyhow::anyhow!("no answer in {} s", MACHINE_TIMEOUT.as_secs())),
+                };
+                let took = asked.elapsed().as_secs_f32();
+                match &rows {
+                    Ok(r) => tracing::info!("{m} answered in {took:.1} s: {} session(s)", r.spawns.len()),
+                    Err(e) => tracing::warn!("no sessions listed from {m} after {took:.1} s: {e:#}"),
+                }
+                (id, m, rows)
+            }))
+            .await)
+        };
+        let (here, there) = tokio::join!(self.everywhere(None), elsewhere);
+        let mut listed = vec![(self.machine.to_string(), here?)];
+        out.machines.push(Machine {
+            id: Some(self.id.clone()),
+            name: Some(self.machine.to_string()),
+            ok: true,
+            why: None,
+        });
+        match there {
+            Ok(there) => {
+                for (id, m, rows) in there {
+                    out.machines.push(Machine {
+                        id: Some(id),
+                        name: Some(m.clone()),
+                        ok: rows.is_ok(),
+                        why: rows.as_ref().err().map(|e| format!("{e:#}")),
+                    });
+                    listed.extend(rows.ok().map(|r| (m, r)));
+                }
+            }
+            Err(()) => out.machines.push(Machine {
+                id: None,
+                name: None,
+                ok: false,
+                why: Some("saved machines unreadable".into()),
+            }),
+        }
+        for (machine, rows) in listed {
+            // Per project on this machine: its groups, and the folders its rows run in.
+            #[derive(Default)]
+            struct Seen {
+                groups: BTreeMap<Option<String>, u32>,
+                roots: Vec<(bool, String)>,
+            }
+            let mut projects: BTreeMap<String, Seen> = BTreeMap::new();
+            for mut row in rows.spawns {
+                let Some(project) = row.project_id.take() else { continue };
+                let Seen { groups, roots } = projects.entry(project.clone()).or_default();
+                let candidate = row.kind == "primary";
+                // A primary that is starting or ending can't take a message
+                // and is no other session either: it is not counted.
+                if candidate && row.status != "running" {
+                    continue;
+                }
+                *groups.entry(row.work_id.clone()).or_default() += u32::from(!candidate);
+                roots.extend(row.project_root.clone().map(|r| (candidate, r)));
+                if candidate {
+                    out.candidates.push(self.candidate(&machine, &project, row));
+                }
+            }
+            for (project, Seen { groups, roots }) in projects {
+                let project_label = self.project_label(&machine, &project, &roots);
+                out.groups.extend(groups.into_iter().map(|(group, others)| Group {
+                    machine: machine.clone(),
+                    project: project.clone(),
+                    project_label: project_label.clone(),
+                    group,
+                    others,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The name of the folder a project lives in. Meridian's rows give only
+    /// the folder each session runs in, which can be a worktree's, so the
+    /// configured root wins; for another project, the folder most of its
+    /// primaries run in (people start those in the main checkout), else most
+    /// of its sessions. A worktree in `<name>.worktrees/` (worktrunk's layout)
+    /// is named for `<name>`; one elsewhere can't be told from a checkout.
+    fn project_label(&self, machine: &str, project: &str, roots: &[(bool, String)]) -> Option<String> {
+        let last = |p: &Path| {
+            let worktrees = p
+                .ancestors()
+                .filter_map(|a| a.file_name()?.to_str()?.strip_suffix(".worktrees"))
+                .find(|n| !n.is_empty());
+            worktrees
+                .map(String::from)
+                .or_else(|| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
+        if machine == self.machine
+            && let Some(p) = self.projects.get(project)
+        {
+            return last(&p.root);
+        }
+        let primaries = roots.iter().any(|(primary, _)| *primary);
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, r) in roots.iter().filter(|(primary, _)| *primary || !primaries) {
+            *counts.entry(r).or_default() += 1;
+        }
+        let most = counts.into_iter().max_by_key(|(_, n)| *n)?.0;
+        last(Path::new(most))
     }
 
     /// `machine` is the name the listing was asked by: this machine's, or the
@@ -312,6 +446,8 @@ impl Meridian {
             label: row.agent,
             model: row.model,
             default,
+            // What `parse_ref` takes: this machine, a configured project.
+            wakeable: configured.is_some(),
             activity,
             // A path on another machine is no use to a command run here.
             root: row
@@ -403,7 +539,13 @@ fn not_found(out: &std::process::Output) -> bool {
 
 fn rows(out: std::process::Output) -> Result<Rows> {
     if !out.status.success() {
-        bail!("meridian spawn list failed: {}{}", tail(&out.stdout), tail(&out.stderr));
+        // Meridian's own words when it gave them: through `--machine`, why the
+        // machine could not be asked.
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        match field(&v["error"]["text"]) {
+            Some(text) => bail!("meridian spawn list failed: {}", tail(text.as_bytes())),
+            None => bail!("meridian spawn list failed: {}{}", tail(&out.stdout), tail(&out.stderr)),
+        }
     }
     serde_json::from_slice(&out.stdout).context("meridian spawn list: unexpected JSON")
 }
@@ -491,45 +633,11 @@ impl Source for Meridian {
     async fn list(&self, req: &ListRequest) -> Result<ListResponse> {
         let for_owner = req.person.as_deref() == Some(self.owner.as_str());
         if req.offerable {
-            let mut out = ListResponse::default();
-            if !for_owner {
-                return Ok(out);
-            }
-            // Every machine is asked at once, and each saved one has its own
-            // limit: one that is down or slow contributes none, and holds the
-            // listing no longer than that.
-            let elsewhere = async {
-                // The sessions here are still worth listing without the others.
-                let saved = self.saved_machines().await.unwrap_or_else(|e| {
-                    tracing::warn!("no saved machine's sessions are listed: {e:#}");
-                    vec![]
-                });
-                join_all(saved.into_iter().map(|Saved { name: m, .. }| async move {
-                    let asked = Instant::now();
-                    let rows = match tokio::time::timeout(MACHINE_TIMEOUT, self.everywhere(Some(&m))).await {
-                        Ok(rows) => rows,
-                        Err(_) => Err(anyhow::anyhow!("no answer")),
-                    };
-                    let took = asked.elapsed().as_secs_f32();
-                    match &rows {
-                        Ok(r) => tracing::debug!("{m} listed {} session(s) in {took:.1} s", r.spawns.len()),
-                        Err(e) => tracing::warn!("no sessions listed from {m} after {took:.1} s: {e:#}"),
-                    }
-                    Some((m, rows.ok()?))
-                }))
-                .await
+            return if for_owner {
+                self.offerable().await
+            } else {
+                Ok(ListResponse::default())
             };
-            let (here, there) = tokio::join!(self.everywhere(None), elsewhere);
-            let mut listed = vec![(self.machine.to_string(), here?)];
-            listed.extend(there.into_iter().flatten());
-            for (machine, rows) in listed {
-                for mut row in rows.spawns.into_iter().filter(|r| r.kind == "primary" && r.status == "running") {
-                    if let Some(project) = row.project_id.take() {
-                        out.candidates.push(self.candidate(&machine, &project, row));
-                    }
-                }
-            }
-            return Ok(out);
         }
         let own: BTreeSet<&str> = req
             .refs

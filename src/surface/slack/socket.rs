@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{BUTTON, MENU, MENU_BLOCK, Slack, form, web::Token};
+use super::{BUTTON, MENU, MENU_BLOCK, Slack, form, home, web::Token};
 use crate::model::{Action, Interacted, Sender, SurfaceEvent};
 
 /// Slack pings about every 30 s; no frame for this long means a dead link.
@@ -74,7 +74,7 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, asks: &mpsc::Se
                 continue;
             }
         };
-        if let (Some(id), Some((kind, interaction))) = (v["envelope_id"].as_str(), form::parse(&v)) {
+        if let (Some(id), Some((kind, interaction))) = (v["envelope_id"].as_str(), form::parse(&v).or_else(|| home::message(&v))) {
             answers.push(answer(slack, asks, id.to_string(), kind, interaction));
             continue;
         }
@@ -114,15 +114,18 @@ async fn session(slack: &Slack, tx: &mpsc::Sender<SurfaceEvent>, asks: &mpsc::Se
                 return Ok(hello);
             }
             Some("events_api") => {
-                if let Some(msg) = slack.event_message(&v["payload"]["event"])
-                    && tx.send(SurfaceEvent::Message(msg)).await.is_err()
+                let event = &v["payload"]["event"];
+                let ev = home::opened(event).or_else(|| slack.event_message(event).map(SurfaceEvent::Message));
+                if let Some(ev) = ev
+                    && tx.send(ev).await.is_err()
                 {
                     return Ok(hello);
                 }
             }
             Some("interactive") => {
-                if let Some(a) = action(&v["payload"])
-                    && tx.send(SurfaceEvent::Action(a)).await.is_err()
+                let p = &v["payload"];
+                if let Some(ev) = home::refresh(p).or_else(|| action(p).map(SurfaceEvent::Action))
+                    && tx.send(ev).await.is_err()
                 {
                     return Ok(hello);
                 }
